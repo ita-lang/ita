@@ -1,0 +1,17 @@
+# Build artifacts
+build/
+*.dill
+
+# Dart tooling
+.dart_tool/
+.packages
+pubspec.lock
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp

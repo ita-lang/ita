@@ -1,0 +1,12 @@
+name: ita_compiler
+description: Itá language compiler
+version: 0.1.0
+
+environment:
+  sdk: '>=3.0.0 <4.0.0'
+
+dependencies:
+  kernel:
+    path: /Users/gabriel_aderaldo/Desktop/dev/google_tools/dart-sdk-source/sdk/pkg/kernel
+  _fe_analyzer_shared:
+    path: /Users/gabriel_aderaldo/Desktop/dev/google_tools/dart-sdk-source/sdk/pkg/_fe_analyzer_shared

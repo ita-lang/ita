@@ -1,8 +1,8 @@
-# Glu Language — Manifesto
+# Itá Language — Manifesto
 
-## O que é o Glu
+## O que é o Itá
 
-Glu é uma linguagem de programação fortemente tipada, funcional-first, projetada para frontend web e backend. Compila para Dart Kernel (.dill) e roda na Dart VM.
+Itá ("pedra" em Tupi antigo) é uma linguagem de programação fortemente tipada, funcional-first, projetada para frontend web e backend. Compila para Dart Kernel (.dill) e roda na Dart VM.
 
 ## Por que a Dart VM (agora)
 
@@ -13,17 +13,17 @@ A Dart VM foi escolhida como runtime inicial por razões estratégicas:
 3. **dart2js** — possibilidade de compilar pra browser (JavaScript)
 4. **dart2wasm** — possibilidade de compilar pra WebAssembly
 5. **Velocidade de prototipação** — focamos em desenhar a linguagem e a standard library, não em escrever um runtime do zero
-6. **Dart AOT** — `dart compile exe` já gera binários nativos a partir dos .dill que o Glu produz
+6. **Dart AOT** — `dart compile exe` já gera binários nativos a partir dos .dill que o Itá produz
 
-A Dart VM é o **bootstrap** do Glu. Não é o destino final.
+A Dart VM é o **bootstrap** do Itá. Não é o destino final.
 
 ## Pra onde vamos (LLVM)
 
-O objetivo de longo prazo é migrar o backend do Glu para **LLVM IR**, usando um compilador escrito em **Swift**:
+O objetivo de longo prazo é migrar o backend do Itá para **LLVM IR**, usando um compilador escrito em **Swift**:
 
 ```
-Fase atual:   .glu → [Dart compiler] → .dill → Dart VM (JIT/AOT)
-Futuro:       .glu → [Swift compiler] → LLVM IR → binário nativo (qualquer arch)
+Fase atual:   .tu → [Dart compiler] → .dill → Dart VM (JIT/AOT)
+Futuro:       .tu → [Swift compiler] → LLVM IR → binário nativo (qualquer arch)
 ```
 
 ### Por que LLVM
@@ -36,9 +36,9 @@ Futuro:       .glu → [Swift compiler] → LLVM IR → binário nativo (qualque
 
 ### Por que Swift como linguagem do compilador
 
-- Swift é a linguagem que mais **inspirou** o Glu (guard let, extensions, optionals, POP, value types vs reference types)
+- Swift é a linguagem que mais **inspirou** o Itá (guard let, extensions, optionals, POP, value types vs reference types)
 - Swift já usa LLVM — a integração é nativa e madura
-- Swift tem ARC (Automatic Reference Counting) que pode inspirar o memory model do Glu nativo
+- Swift tem ARC (Automatic Reference Counting) que pode inspirar o memory model do Itá nativo
 - A Apple mantém ativamente tanto Swift quanto LLVM
 - A experiência de escrever compiladores em Swift é excelente (enums, pattern matching, protocols)
 
@@ -46,15 +46,15 @@ Futuro:       .glu → [Swift compiler] → LLVM IR → binário nativo (qualque
 
 A transição será **gradual**, não uma reescrita total:
 
-1. **Fase atual** — Glu compila pra Dart Kernel, roda na Dart VM. Foco: linguagem, standard library, ecossistema
+1. **Fase atual** — Itá compila pra Dart Kernel, roda na Dart VM. Foco: linguagem, standard library, ecossistema
 2. **Fase intermediária** — Dart AOT pra binários nativos. Foco: performance de produção sem mudar o compilador
 3. **Fase LLVM** — Novo backend em Swift que gera LLVM IR. Foco: performance máxima, zero runtime overhead
 4. **Fase madura** — Ambos os backends coexistem. Dart VM pra desenvolvimento rápido, LLVM pra produção
 
 ### O que NÃO muda na transição
 
-- **A linguagem Glu** — sintaxe, semântica, standard library ficam iguais
-- **O código do usuário** — zero mudança, mesmo .glu compila em ambos os backends
+- **A linguagem Itá** — sintaxe, semântica, standard library ficam iguais
+- **O código do usuário** — zero mudança, mesmo .tu compila em ambos os backends
 - **A filosofia** — imutável por padrão, Result ao invés de exceptions, zero annotations
 
 ## Princípios permanentes
