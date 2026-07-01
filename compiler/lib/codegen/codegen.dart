@@ -4181,6 +4181,11 @@ class CodeGenerator {
           _ensureTomlStringifyHelper();
           return k.StaticInvocation(_tomlStringifyFn!, k.Arguments([args[0]]));
         }
+        // YAML.stringify → helper real (indentacao por nivel). Antes null (P0).
+        if (format == 'yaml' && args.isNotEmpty) {
+          _ensureYamlStringifyHelper();
+          return k.StaticInvocation(_yamlStringifyFn!, k.Arguments([args[0]]));
+        }
         _ensureFormatStringifier(format);
         final fn = _formatStringifiers[format];
         if (fn != null && args.isNotEmpty) {
@@ -4723,10 +4728,338 @@ class CodeGenerator {
     _library.addProcedure(_tomlStringifyFn!);
   }
 
-  /// YAML básico: key: value (flat, sem nesting profundo)
+  // ============================================================
+  // YAML parser real: Map/List TIPADO e ANINHADO por INDENTACAO (stack).
+  // TODO(yaml): anchors/aliases (&/*), multi-doc ---, block scalars |/>,
+  //             flow inline {}/[]/, tags, listas no root, mapa dentro de item.
+  // ============================================================
+  k.Procedure? _yamlStripFn;
+  k.Procedure? _yamlIndentFn;
+  k.Procedure? _yamlValueFn;
+  k.Procedure? _yamlPeekFn;
+  k.Procedure? _yamlScalarFn;
+  k.Procedure? _yamlEmitFn;
+  k.Procedure? _yamlStringifyFn;
+
+  /// Bloco reutilizavel: unescape de string basica "..." em [sVar] → retorna o
+  /// miolo (com \n \t \" \\). Termina em ReturnStatement.
+  k.Statement _basicStringUnescapeBlock(k.VariableDeclaration sVar) {
+    k.Expression sl(String s) => k.StringLiteral(s);
+    k.Expression il(int i) => k.IntLiteral(i);
+    k.Expression len() => _dg(_vg(sVar), 'length');
+    k.Expression charAt(k.Expression i) => _di(_vg(sVar), '[]', [i]);
+    final inV = _dv('_in', sl(''));
+    final biV = _dv('_bi', il(1));
+    final beV = _dv('_be', _dynamicOp(len(), '-', il(1)), isFinal: true);
+    final bcV = _dv('_bc', charAt(_vg(biV)), isFinal: true);
+    final nchV = _dv('_nc', charAt(_dynamicOp(_vg(biV), '+', il(1))), isFinal: true);
+    final mapped = k.ConditionalExpression(_eqc(_vg(nchV), sl('n')), sl('\n'),
+      k.ConditionalExpression(_eqc(_vg(nchV), sl('t')), sl('\t'),
+        k.ConditionalExpression(_eqc(_vg(nchV), sl('"')), sl('"'),
+          k.ConditionalExpression(_eqc(_vg(nchV), sl('\\')), sl('\\'),
+            _vg(nchV), const k.DynamicType()),
+          const k.DynamicType()),
+        const k.DynamicType()),
+      const k.DynamicType());
+    final loop = k.WhileStatement(_dynamicOp(_vg(biV), '<', _vg(beV)),
+      k.Block([bcV,
+        k.IfStatement(
+          _andc(_eqc(_vg(bcV), sl('\\')),
+            _dynamicOp(_dynamicOp(_vg(biV), '+', il(1)), '<', _vg(beV))),
+          k.Block([nchV, _setv(inV, _dynamicOp(_vg(inV), '+', mapped)), _addn(biV, 2)]),
+          k.Block([_setv(inV, _dynamicOp(_vg(inV), '+', _vg(bcV))), _addn(biV, 1)]))]));
+    return k.Block([inV, biV, beV, loop, k.ReturnStatement(_vg(inV))]);
+  }
+
+  /// Cria um Procedure sincrono simples (1..N params dinamicos, retorno dyn).
+  k.Procedure _mkProc(String name, List<k.VariableDeclaration> params, k.Statement body) {
+    final p = k.Procedure(k.Name(name), k.ProcedureKind.Method,
+      k.FunctionNode(body, positionalParameters: params, returnType: const k.DynamicType()),
+      isStatic: true, fileUri: _fileUri);
+    _library.addProcedure(p);
+    return p;
+  }
+
+  /// ita_yamlStrip(line) → linha sem comentario `#` (string-aware; preserva
+  /// indentacao inicial). `#` dentro de "..."/'...' nao conta.
+  void _ensureYamlStripHelper() {
+    if (_yamlStripFn != null) return;
+    k.Expression sl(String s) => k.StringLiteral(s);
+    k.Expression il(int i) => k.IntLiteral(i);
+    final lineP = k.VariableDeclaration('line', type: const k.DynamicType(), isFinal: true);
+    final outV = _dv('_o', sl(''));
+    final iV = _dv('_i', il(0));
+    final nV = _dv('_n', _dg(_vg(lineP), 'length'), isFinal: true);
+    final inSV = _dv('_is', k.BoolLiteral(false));
+    final qV = _dv('_q', sl(''));
+    final dnV = _dv('_dn', k.BoolLiteral(false));
+    final cV = _dv('_c', _di(_vg(lineP), '[]', [_vg(iV)]), isFinal: true);
+    final inStr = k.Block([
+      _setv(outV, _dynamicOp(_vg(outV), '+', _vg(cV))),
+      k.IfStatement(_eqc(_vg(cV), _vg(qV)),
+        k.Block([_setv(inSV, k.BoolLiteral(false)), _addn(iV, 1)]),
+        k.Block([_addn(iV, 1)]))]);
+    final outStr = k.IfStatement(
+      _orc(_eqc(_vg(cV), sl('"')), _eqc(_vg(cV), sl('\''))),
+      k.Block([_setv(inSV, k.BoolLiteral(true)), _setv(qV, _vg(cV)),
+        _setv(outV, _dynamicOp(_vg(outV), '+', _vg(cV))), _addn(iV, 1)]),
+      k.IfStatement(_eqc(_vg(cV), sl('#')),
+        _setv(dnV, k.BoolLiteral(true)),
+        k.Block([_setv(outV, _dynamicOp(_vg(outV), '+', _vg(cV))), _addn(iV, 1)])));
+    final loop = k.WhileStatement(
+      _andc(_dynamicOp(_vg(iV), '<', _vg(nV)), k.Not(_vg(dnV))),
+      k.Block([cV, k.IfStatement(_vg(inSV), inStr, outStr)]));
+    _yamlStripFn = _mkProc('ita_yamlStrip', [lineP],
+      k.Block([outV, iV, nV, inSV, qV, dnV, loop, k.ReturnStatement(_vg(outV))]));
+  }
+
+  /// ita_yamlIndent(line) → nº de espacos iniciais (largura da indentacao).
+  void _ensureYamlIndentHelper() {
+    if (_yamlIndentFn != null) return;
+    final lineP = k.VariableDeclaration('line', type: const k.DynamicType(), isFinal: true);
+    final iV = _dv('_i', k.IntLiteral(0));
+    final nV = _dv('_n', _dg(_vg(lineP), 'length'), isFinal: true);
+    final loop = k.WhileStatement(
+      _andc(_dynamicOp(_vg(iV), '<', _vg(nV)),
+        _eqc(_di(_vg(lineP), '[]', [_vg(iV)]), k.StringLiteral(' '))),
+      k.Block([_addn(iV, 1)]));
+    _yamlIndentFn = _mkProc('ita_yamlIndent', [lineP],
+      k.Block([iV, nV, loop, k.ReturnStatement(_vg(iV))]));
+  }
+
+  /// ita_yamlValue(raw) → valor TIPADO. Norway (YAML 1.2): SO true/false sao
+  /// bool; yes/no/on/off ficam STRING. null/~/vazio → null. int/float tryParse.
+  void _ensureYamlValueHelper() {
+    if (_yamlValueFn != null) return;
+    final intTP = _coreTypes.intClass.procedures.firstWhere((p) => p.name.text == 'tryParse');
+    final dblTP = _coreTypes.doubleClass.procedures.firstWhere((p) => p.name.text == 'tryParse');
+    k.Expression sl(String s) => k.StringLiteral(s);
+    k.Expression il(int i) => k.IntLiteral(i);
+    final rawP = k.VariableDeclaration('raw', type: const k.DynamicType(), isFinal: true);
+    final sV = _dv('_s', _di(_vg(rawP), 'trim'));
+    k.Expression len() => _dg(_vg(sV), 'length');
+    final c0 = _dv('_c0', _di(_vg(sV), '[]', [il(0)]), isFinal: true);
+    final cleanedV = _dv('_cl', _di(_vg(sV), 'replaceAll', [sl('_'), sl('')]), isFinal: true);
+    final ivV = _dv('_iv', k.StaticInvocation(intTP, k.Arguments([_vg(cleanedV)])), isFinal: true);
+    final dvV = _dv('_dvl', k.StaticInvocation(dblTP, k.Arguments([_vg(cleanedV)])), isFinal: true);
+    _yamlValueFn = _mkProc('ita_yamlValue', [rawP], k.Block([
+      sV,
+      k.IfStatement(_eqc(len(), il(0)), k.ReturnStatement(k.NullLiteral()), null),
+      k.IfStatement(_eqc(_vg(sV), sl('null')), k.ReturnStatement(k.NullLiteral()), null),
+      k.IfStatement(_eqc(_vg(sV), sl('~')), k.ReturnStatement(k.NullLiteral()), null),
+      k.IfStatement(_eqc(_vg(sV), sl('true')), k.ReturnStatement(k.BoolLiteral(true)), null),
+      k.IfStatement(_eqc(_vg(sV), sl('false')), k.ReturnStatement(k.BoolLiteral(false)), null),
+      c0,
+      k.IfStatement(_eqc(_vg(c0), sl('"')), _basicStringUnescapeBlock(sV), null),
+      k.IfStatement(_eqc(_vg(c0), sl('\'')),
+        k.ReturnStatement(_di(_vg(sV), 'substring', [il(1), _dynamicOp(len(), '-', il(1))])), null),
+      cleanedV, ivV,
+      k.IfStatement(k.Not(_eqc(_vg(ivV), k.NullLiteral())), k.ReturnStatement(_vg(ivV)), null),
+      dvV,
+      k.IfStatement(k.Not(_eqc(_vg(dvV), k.NullLiteral())), k.ReturnStatement(_vg(dvV)), null),
+      k.ReturnStatement(_vg(sV)),   // bare string (incl. no/yes/on/off — Norway)
+    ]));
+  }
+
+  /// ita_yamlPeek(lines, from, curIndent) → bool: a proxima linha de conteudo
+  /// esta mais indentada E comeca com "- " (→ o bloco filho e uma List).
+  void _ensureYamlPeekHelper() {
+    if (_yamlPeekFn != null) return;
+    _ensureYamlStripHelper();
+    _ensureYamlIndentHelper();
+    k.Expression sl(String s) => k.StringLiteral(s);
+    k.Expression il(int i) => k.IntLiteral(i);
+    final linesP = k.VariableDeclaration('lines', type: const k.DynamicType(), isFinal: true);
+    final fromP = k.VariableDeclaration('from', type: const k.DynamicType(), isFinal: true);
+    final ciP = k.VariableDeclaration('curInd', type: const k.DynamicType(), isFinal: true);
+    final jV = _dv('_j', _vg(fromP));
+    final nV = _dv('_n', _dg(_vg(linesP), 'length'), isFinal: true);
+    final retV = _dv('_r', k.BoolLiteral(false));
+    final doneV = _dv('_d', k.BoolLiteral(false));
+    final sV = _dv('_s', k.StaticInvocation(_yamlStripFn!,
+      k.Arguments([_di(_vg(linesP), '[]', [_vg(jV)])])), isFinal: true);
+    final tV = _dv('_t', _di(_vg(sV), 'trim'), isFinal: true);
+    final indV = _dv('_ind', k.StaticInvocation(_yamlIndentFn!, k.Arguments([_vg(sV)])), isFinal: true);
+    final loop = k.WhileStatement(
+      _andc(_dynamicOp(_vg(jV), '<', _vg(nV)), k.Not(_vg(doneV))),
+      k.Block([sV, tV,
+        k.IfStatement(_dynamicOp(_dg(_vg(tV), 'length'), '>', il(0)),
+          k.Block([indV,
+            k.IfStatement(_dynamicOp(_vg(indV), '>', _vg(ciP)),
+              k.Block([_setv(retV, _di(_vg(tV), 'startsWith', [sl('- ')])), _setv(doneV, k.BoolLiteral(true))]),
+              _setv(doneV, k.BoolLiteral(true)))]),
+          _addn(jV, 1))]));
+    _yamlPeekFn = _mkProc('ita_yamlPeek', [linesP, fromP, ciP],
+      k.Block([jV, nV, retV, doneV, loop, k.ReturnStatement(_vg(retV))]));
+  }
+
+  /// Parser YAML principal: Map/List aninhado por indentacao (stack).
   k.Statement _buildYamlParser(k.VariableDeclaration inputParam) {
-    // Reusar KV parser mas com ":" como separador e trim de "-" pra lists
-    return _buildKvParser(inputParam, ':');
+    _ensureYamlStripHelper();
+    _ensureYamlIndentHelper();
+    _ensureYamlValueHelper();
+    _ensureYamlPeekHelper();
+    k.Expression sl(String s) => k.StringLiteral(s);
+    k.Expression il(int i) => k.IntLiteral(i);
+    k.Expression strip(k.Expression e) => k.StaticInvocation(_yamlStripFn!, k.Arguments([e]));
+    k.Expression indentOf(k.Expression e) => k.StaticInvocation(_yamlIndentFn!, k.Arguments([e]));
+    k.Expression valOf(k.Expression e) => k.StaticInvocation(_yamlValueFn!, k.Arguments([e]));
+
+    final rootV = _dv('_root',
+      k.MapLiteral([], keyType: const k.DynamicType(), valueType: const k.DynamicType()));
+    final stkIndV = _dv('_si', k.ListLiteral([il(-1)], typeArgument: const k.DynamicType()));
+    final stkConV = _dv('_sc', k.ListLiteral([_vg(rootV)], typeArgument: const k.DynamicType()));
+    final linesV = _dv('_lns', _di(_vg(inputParam), 'split', [sl('\n')]), isFinal: true);
+    final liV = _dv('_li', il(0));
+    final nLinesV = _dv('_nl', _dg(_vg(linesV), 'length'), isFinal: true);
+
+    // por iteracao
+    final strippedV = _dv('_st', strip(_di(_vg(linesV), '[]', [_vg(liV)])), isFinal: true);
+    final trimmedV = _dv('_tr', _di(_vg(strippedV), 'trim'), isFinal: true);
+    final indentV = _dv('_ind', indentOf(_vg(strippedV)), isFinal: true);
+    final contV = _dv('_cont', _dg(_vg(stkConV), 'last'));
+    // pop loop
+    final popLoop = k.WhileStatement(
+      _andc(_dynamicOp(_dg(_vg(stkIndV), 'length'), '>', il(1)),
+        _dynamicOp(_vg(indentV), '<=', _dg(_vg(stkIndV), 'last'))),
+      k.Block([
+        k.ExpressionStatement(_di(_vg(stkIndV), 'removeLast')),
+        k.ExpressionStatement(_di(_vg(stkConV), 'removeLast')),
+      ]));
+
+    // list item "- x"
+    final itemStrV = _dv('_it', _di(_di(_vg(trimmedV), 'substring', [il(2)]), 'trim'), isFinal: true);
+    final listItemBlock = k.Block([itemStrV,
+      k.IfStatement(_dynamicOp(_dg(_vg(itemStrV), 'length'), '>', il(0)),
+        k.ExpressionStatement(_di(_vg(contV), 'add', [valOf(_vg(itemStrV))])), null)]);
+
+    // key: value
+    final ciV = _dv('_ci', _di(_vg(trimmedV), 'indexOf', [sl(':')]), isFinal: true);
+    final keyV = _dv('_key', _di(_di(_vg(trimmedV), 'substring', [il(0), _vg(ciV)]), 'trim'), isFinal: true);
+    final vsV = _dv('_vs', _di(_di(_vg(trimmedV), 'substring', [_dynamicOp(_vg(ciV), '+', il(1))]), 'trim'), isFinal: true);
+    final isListV = _dv('_isl', k.StaticInvocation(_yamlPeekFn!,
+      k.Arguments([_vg(linesV), _vg(liV), _vg(indentV)])), isFinal: true);
+    final childV = _dv('_child', k.ConditionalExpression(_vg(isListV),
+      k.ListLiteral([], typeArgument: const k.DynamicType()),
+      k.MapLiteral([], keyType: const k.DynamicType(), valueType: const k.DynamicType()),
+      const k.DynamicType()), isFinal: true);
+    final emptyValBlock = k.Block([isListV, childV,
+      k.ExpressionStatement(_di(_vg(contV), '[]=', [_vg(keyV), _vg(childV)])),
+      k.ExpressionStatement(_di(_vg(stkIndV), 'add', [_vg(indentV)])),
+      k.ExpressionStatement(_di(_vg(stkConV), 'add', [_vg(childV)]))]);
+    final kvBlock = k.Block([ciV,
+      k.IfStatement(_dynamicOp(_vg(ciV), '>=', il(0)),
+        k.Block([keyV, vsV,
+          k.IfStatement(_eqc(_dg(_vg(vsV), 'length'), il(0)),
+            emptyValBlock,
+            k.ExpressionStatement(_di(_vg(contV), '[]=', [_vg(keyV), valOf(_vg(vsV))])))]),
+        null)]);
+
+    final mainLoop = k.WhileStatement(_dynamicOp(_vg(liV), '<', _vg(nLinesV)),
+      k.Block([
+        strippedV, trimmedV,
+        _addn(liV, 1),
+        k.IfStatement(_dynamicOp(_dg(_vg(trimmedV), 'length'), '>', il(0)),
+          k.Block([indentV, popLoop, contV,
+            k.IfStatement(_di(_vg(trimmedV), 'startsWith', [sl('- ')]),
+              listItemBlock, kvBlock)]),
+          null)]));
+
+    return k.Block([rootV, stkIndV, stkConV, linesV, liV, nLinesV, mainLoop,
+      k.ReturnStatement(_vg(rootV))]);
+  }
+
+  /// ita_yamlScalar(v) → String: null→null, String→"...", bool→true/false,
+  /// int/double crus. Strings sempre quotadas (round-trip seguro: "3"/"no"
+  /// voltam como string).
+  void _ensureYamlScalarHelper() {
+    if (_yamlScalarFn != null) return;
+    k.Expression sl(String s) => k.StringLiteral(s);
+    final vP = k.VariableDeclaration('v', type: const k.DynamicType(), isFinal: true);
+    final strExpr = _dynamicOp(_dynamicOp(sl('"'), '+',
+      _di(_di(_vg(vP), 'replaceAll', [sl('\\'), sl('\\\\')]),
+        'replaceAll', [sl('"'), sl('\\"')])), '+', sl('"'));
+    _yamlScalarFn = _mkProc('ita_yamlScalar', [vP], k.Block([
+      k.IfStatement(_eqc(_vg(vP), k.NullLiteral()), k.ReturnStatement(sl('null')), null),
+      k.IfStatement(k.IsExpression(_vg(vP), _coreTypes.stringNonNullableRawType),
+        k.ReturnStatement(strExpr), null),
+      k.IfStatement(k.IsExpression(_vg(vP), _coreTypes.boolNonNullableRawType),
+        k.ReturnStatement(k.ConditionalExpression(_vg(vP), sl('true'), sl('false'),
+          const k.DynamicType())), null),
+      k.ReturnStatement(_di(_vg(vP), 'toString')),
+    ]));
+  }
+
+  /// ita_yamlEmit(m, ind) → String: emite um Map com indentacao [ind].
+  /// Sub-Map → "key:\n" + emit(sub, ind+"  "); List → "key:\n" + "  - item";
+  /// scalar → "key: value". Auto-recursivo (nesting arbitrario).
+  void _ensureYamlEmitHelper() {
+    if (_yamlEmitFn != null) return;
+    _ensureYamlScalarHelper();
+    k.Expression sl(String s) => k.StringLiteral(s);
+    k.Expression il(int i) => k.IntLiteral(i);
+    final mP = k.VariableDeclaration('m', type: const k.DynamicType(), isFinal: true);
+    final indP = k.VariableDeclaration('ind', type: const k.DynamicType(), isFinal: true);
+    final proc = k.Procedure(k.Name('ita_yamlEmit'), k.ProcedureKind.Method,
+      k.FunctionNode(k.ReturnStatement(k.NullLiteral()),
+        positionalParameters: [mP, indP], returnType: const k.DynamicType()),
+      isStatic: true, fileUri: _fileUri);
+    _yamlEmitFn = proc;
+    _library.addProcedure(proc);
+
+    k.Expression scalar(k.Expression e) => k.StaticInvocation(_yamlScalarFn!, k.Arguments([e]));
+    k.Expression selfEmit(k.Expression m, k.Expression ind) =>
+      k.StaticInvocation(_yamlEmitFn!, k.Arguments([m, ind]));
+    final mapType = k.InterfaceType(_coreTypes.mapClass, k.Nullability.nonNullable,
+      const [k.DynamicType(), k.DynamicType()]);
+    final listType = k.InterfaceType(_coreTypes.listClass, k.Nullability.nonNullable,
+      const [k.DynamicType()]);
+    // concat helper
+    k.Expression cat(List<k.Expression> parts) {
+      var e = parts.first;
+      for (var i = 1; i < parts.length; i++) { e = _dynamicOp(e, '+', parts[i]); }
+      return e;
+    }
+
+    final outV = _dv('_out', sl(''));
+    final keysV = _dv('_ks', _di(_dg(_vg(mP), 'keys'), 'toList'), isFinal: true);
+    final iV = _dv('_i', il(0));
+    final kV = _dv('_k', _di(_vg(keysV), '[]', [_vg(iV)]), isFinal: true);
+    final vV = _dv('_v', _di(_vg(mP), '[]', [_vg(kV)]), isFinal: true);
+    // list branch
+    final jV = _dv('_j', il(0));
+    final childIndV = _dv('_ci2', _dynamicOp(_vg(indP), '+', sl('  ')), isFinal: true);
+    final listLoop = k.WhileStatement(_dynamicOp(_vg(jV), '<', _dg(_vg(vV), 'length')),
+      k.Block([
+        _setv(outV, cat([_vg(outV), _vg(indP), sl('  - '),
+          scalar(_di(_vg(vV), '[]', [_vg(jV)])), sl('\n')])),
+        _addn(jV, 1)]));
+    final loop = k.WhileStatement(_dynamicOp(_vg(iV), '<', _dg(_vg(keysV), 'length')),
+      k.Block([kV, vV,
+        k.IfStatement(k.IsExpression(_vg(vV), mapType),
+          k.Block([childIndV,
+            _setv(outV, cat([_vg(outV), _vg(indP), _vg(kV), sl(':\n'),
+              selfEmit(_vg(vV), _vg(childIndV))]))]),
+          k.IfStatement(k.IsExpression(_vg(vV), listType),
+            k.Block([
+              _setv(outV, cat([_vg(outV), _vg(indP), _vg(kV), sl(':\n')])),
+              jV, listLoop]),
+            _setv(outV, cat([_vg(outV), _vg(indP), _vg(kV), sl(': '),
+              scalar(_vg(vV)), sl('\n')])))),
+        _addn(iV, 1)]));
+    final body = k.Block([outV, keysV, iV, loop, k.ReturnStatement(_vg(outV))]);
+    proc.function.body = body;
+    body.parent = proc.function;
+  }
+
+  /// ita_yamlStringify(data) → String YAML (emit com indentacao "").
+  void _ensureYamlStringifyHelper() {
+    if (_yamlStringifyFn != null) return;
+    _ensureYamlEmitHelper();
+    final dataP = k.VariableDeclaration('data', type: const k.DynamicType(), isFinal: true);
+    _yamlStringifyFn = _mkProc('ita_yamlStringify', [dataP],
+      k.ReturnStatement(k.StaticInvocation(_yamlEmitFn!,
+        k.Arguments([_vg(dataP), k.StringLiteral('')]))));
   }
 
   /// XML parser simplificado: extrai texto entre tags como Map
