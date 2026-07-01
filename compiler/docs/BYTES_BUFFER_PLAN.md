@@ -14,8 +14,32 @@
 toString, toHex, toBase64, fromBase64, concat, slice, readFile, writeFile,
 length, get, set, equals`.
 
-**Falta o miolo de driver:** leitura/escrita com largura+endianness, acesso a
-bits, e o modo *reader* com bounds-check → `Result`.
+**Fase 1 CONCLUÍDA (2026-06-30)** — branch `feat/bytes-buffer-foundation`:
+- 1A — `readU8/16/32(BE/LE)`, `writeU8/16/32(BE/LE)`, `writeString`.
+- 1B — namespace `Bits` (`and/or/xor/not/shl/shr/bit/bits`).
+- 1C — namespace `Bytes`: `reader/remaining/readU8/16BE/32BE` → `Result` (OOB→err, sem panic/OOB read).
+Provado por `examples/{bytes,bits,reader}.tu` e — geração de binário — `wav.tu`.
+
+## ⚠️ Critério de fechamento (Definition of Done) — BINÁRIO **NÃO FECHADO**
+
+A escrita de campos existe, mas **"gerar binário" só é considerado FECHADO quando
+VÁRIOS formatos reais forem gerados corretamente e validados externamente** (por
+`file(1)`, abertura em ferramenta real, ou round-trip parse). **O WAV sozinho não
+fecha.** Cada case = um `examples/<fmt>.tu` que gera o arquivo + validação externa
++ golden do stdout.
+
+| Formato | Tipo | Pré-requisito | Status |
+|---|---|---|---|
+| WAV (PCM) | áudio | — | ✅ `wav.tu`, validado por `file(1)` |
+| BMP (24-bit) | imagem | — (LE, sem compressão) | ⬜ |
+| TAR | arquivo | — (ASCII/octal, checksum simples) | ⬜ |
+| PNG | imagem | **CRC32** (→ `Checksum`) | ⬜ |
+| MessagePack | dados | varint + `Bytes` reader (round-trip encode/decode) | ⬜ |
+| GIF / ZIP | img/arquivo | LZW / deflate | ⬜ (avançado, opcional) |
+
+**Binário fecha quando WAV + BMP + TAR + PNG + MessagePack passarem** (validados
+externamente, com golden). Até lá, `Bytes/Buffer` é "fundação pronta", não "binário
+fechado".
 
 ## Modelo de tipos (respeita P1/P2 — imutável por default, valor vs referência)
 
