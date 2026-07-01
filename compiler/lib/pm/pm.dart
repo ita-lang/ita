@@ -413,44 +413,49 @@ Map<String, Map<String, String>> _readDependencies() {
 Map<String, Map<String, String>> _parseDependenciesFromContent(String content) {
   final deps = <String, Map<String, String>>{};
   final lines = content.split('\n');
-  var inDeps = false;
-  var inDevDeps = false;
+  var section = '';   // header atual (ex: "dependencies", "dependencies.foo")
+  var subDep = '';    // nome da dep se a secao for dependencies.<nome> (sub-tabela)
+  var lineNo = 0;
 
-  for (final line in lines) {
-    final trimmed = line.trim();
-    if (trimmed.isEmpty || trimmed.startsWith('#')) continue;
+  for (final rawLine in lines) {
+    lineNo++;
+    final line = _stripTomlComment(rawLine).trim(); // remove # fora de string
+    if (line.isEmpty) continue;
 
-    if (trimmed == '[dependencies]') {
-      inDeps = true;
-      inDevDeps = false;
+    if (line.startsWith('[')) {
+      final close = line.indexOf(']');
+      final header = (close > 0 ? line.substring(1, close) : line.substring(1)).trim();
+      section = header;
+      subDep = '';
+      // Sub-tabela: [dependencies.foo] / [dev-dependencies.foo] -> dep "foo".
+      // (Antes eram DROPADAS silenciosamente.)
+      if (header.startsWith('dependencies.') || header.startsWith('dev-dependencies.')) {
+        subDep = header.substring(header.indexOf('.') + 1).trim();
+        deps.putIfAbsent(subDep, () => <String, String>{});
+      }
       continue;
     }
-    if (trimmed == '[dev-dependencies]') {
-      inDeps = false;
-      inDevDeps = true;
+
+    final inDeps = section == 'dependencies' || section == 'dev-dependencies';
+    if (!inDeps && subDep.isEmpty) continue;
+
+    final eqIdx = line.indexOf('=');
+    if (eqIdx < 0) {
+      // Linha em secao de deps que nao e key = value: avisa em vez de sumir.
+      stderr.writeln('Warning: ita.toml linha $lineNo ignorada (nao e key = value): $line');
       continue;
     }
-    if (trimmed.startsWith('[')) {
-      inDeps = false;
-      inDevDeps = false;
-      continue;
-    }
 
-    if (!inDeps && !inDevDeps) continue;
+    final name = line.substring(0, eqIdx).trim();
+    final value = line.substring(eqIdx + 1).trim();
 
-    final eqIdx = trimmed.indexOf('=');
-    if (eqIdx < 0) continue;
-
-    final name = trimmed.substring(0, eqIdx).trim();
-    var value = trimmed.substring(eqIdx + 1).trim();
-
-    if (value.startsWith('{')) {
+    if (subDep.isNotEmpty) {
+      // Dentro de [dependencies.<subDep>]: cada key = value vira campo da dep.
+      deps[subDep]![name] = _unquoteToml(value);
+    } else if (value.startsWith('{')) {
       deps[name] = _parseInlineTable(value);
     } else {
-      if (value.startsWith('"') && value.endsWith('"')) {
-        value = value.substring(1, value.length - 1);
-      }
-      deps[name] = {'version': value};
+      deps[name] = {'version': _unquoteToml(value)};
     }
   }
 
@@ -463,19 +468,74 @@ Map<String, String> _parseInlineTable(String input) {
   if (s.startsWith('{')) s = s.substring(1);
   if (s.endsWith('}')) s = s.substring(0, s.length - 1);
 
-  for (final part in s.split(',')) {
+  // Split por virgula no TOP-LEVEL (nao dentro de "" '' ou [] {}) -> nao
+  // estracalha mais `features = ["a", "b"]`.
+  for (final part in _splitTopLevel(s, ',')) {
     final trimmed = part.trim();
     if (trimmed.isEmpty) continue;
     final eqIdx = trimmed.indexOf('=');
     if (eqIdx < 0) continue;
     final key = trimmed.substring(0, eqIdx).trim();
-    var val = trimmed.substring(eqIdx + 1).trim();
-    if (val.startsWith('"') && val.endsWith('"')) {
-      val = val.substring(1, val.length - 1);
-    }
-    result[key] = val;
+    result[key] = _unquoteToml(trimmed.substring(eqIdx + 1).trim());
   }
   return result;
+}
+
+/// Remove um comentario `#` fora de string (aspas `"` ou `'`).
+String _stripTomlComment(String line) {
+  var inString = false;
+  var quote = '';
+  for (var i = 0; i < line.length; i++) {
+    final c = line[i];
+    if (inString) {
+      if (c == quote) inString = false;
+    } else if (c == '"' || c == "'") {
+      inString = true;
+      quote = c;
+    } else if (c == '#') {
+      return line.substring(0, i);
+    }
+  }
+  return line;
+}
+
+/// Split por `delim` no top-level: ignora o delim dentro de strings e de
+/// `[]`/`{}` (evita quebrar arrays/inline-tables aninhados).
+List<String> _splitTopLevel(String s, String delim) {
+  final parts = <String>[];
+  var depth = 0;
+  var inString = false;
+  var quote = '';
+  var start = 0;
+  for (var i = 0; i < s.length; i++) {
+    final c = s[i];
+    if (inString) {
+      if (c == quote) inString = false;
+    } else if (c == '"' || c == "'") {
+      inString = true;
+      quote = c;
+    } else if (c == '[' || c == '{') {
+      depth++;
+    } else if (c == ']' || c == '}') {
+      if (depth > 0) depth--;
+    } else if (c == delim && depth == 0) {
+      parts.add(s.substring(start, i));
+      start = i + 1;
+    }
+  }
+  parts.add(s.substring(start));
+  return parts;
+}
+
+/// Remove aspas circundantes (basica `"..."` ou literal `'...'`).
+String _unquoteToml(String v) {
+  final t = v.trim();
+  if (t.length >= 2 &&
+      ((t.startsWith('"') && t.endsWith('"')) ||
+          (t.startsWith("'") && t.endsWith("'")))) {
+    return t.substring(1, t.length - 1);
+  }
+  return t;
 }
 
 // =============================================================================
