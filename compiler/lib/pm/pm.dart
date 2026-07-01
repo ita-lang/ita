@@ -38,6 +38,8 @@
 
 import 'dart:io';
 
+import '../toml/toml.dart';
+
 // =============================================================================
 // Configuracao de paths
 // =============================================================================
@@ -410,132 +412,56 @@ Map<String, Map<String, String>> _readDependencies() {
   return _parseDependenciesFromContent(tomlFile.readAsStringSync());
 }
 
+/// Extrai `[dependencies]` + `[dev-dependencies]` de um ita.toml.
+///
+/// O parsing agora usa o parser TOML 1.0 robusto (`../toml/toml.dart`) em vez
+/// do scanner ad-hoc line-based que existia aqui. O documento INTEIRO é
+/// parseado com [parseToml]; daí extraímos as duas seções e adaptamos para a
+/// forma histórica `Map<String, Map<String, String>>` que install/deps/add
+/// consomem:
+///   - dep = "1.2.3"                 -> { version: "1.2.3" }
+///   - dep = { git = "...", rev="x" } -> { git: "...", rev: "x" }   (inline table)
+///   - [dependencies.dep] com campos  -> { campo: valor, ... }       (sub-tabela)
+/// Valores não-string (int/bool/array) são convertidos para String.
 Map<String, Map<String, String>> _parseDependenciesFromContent(String content) {
   final deps = <String, Map<String, String>>{};
-  final lines = content.split('\n');
-  var section = '';   // header atual (ex: "dependencies", "dependencies.foo")
-  var subDep = '';    // nome da dep se a secao for dependencies.<nome> (sub-tabela)
-  var lineNo = 0;
 
-  for (final rawLine in lines) {
-    lineNo++;
-    final line = _stripTomlComment(rawLine).trim(); // remove # fora de string
-    if (line.isEmpty) continue;
+  Map<String, dynamic> toml;
+  try {
+    toml = parseToml(content);
+  } on FormatException catch (e) {
+    stderr.writeln('Warning: ita.toml parse error: ${e.message}');
+    return deps;
+  }
 
-    if (line.startsWith('[')) {
-      final close = line.indexOf(']');
-      final header = (close > 0 ? line.substring(1, close) : line.substring(1)).trim();
-      section = header;
-      subDep = '';
-      // Sub-tabela: [dependencies.foo] / [dev-dependencies.foo] -> dep "foo".
-      // (Antes eram DROPADAS silenciosamente.)
-      if (header.startsWith('dependencies.') || header.startsWith('dev-dependencies.')) {
-        subDep = header.substring(header.indexOf('.') + 1).trim();
-        deps.putIfAbsent(subDep, () => <String, String>{});
-      }
-      continue;
-    }
-
-    final inDeps = section == 'dependencies' || section == 'dev-dependencies';
-    if (!inDeps && subDep.isEmpty) continue;
-
-    final eqIdx = line.indexOf('=');
-    if (eqIdx < 0) {
-      // Linha em secao de deps que nao e key = value: avisa em vez de sumir.
-      stderr.writeln('Warning: ita.toml linha $lineNo ignorada (nao e key = value): $line');
-      continue;
-    }
-
-    final name = line.substring(0, eqIdx).trim();
-    final value = line.substring(eqIdx + 1).trim();
-
-    if (subDep.isNotEmpty) {
-      // Dentro de [dependencies.<subDep>]: cada key = value vira campo da dep.
-      deps[subDep]![name] = _unquoteToml(value);
-    } else if (value.startsWith('{')) {
-      deps[name] = _parseInlineTable(value);
-    } else {
-      deps[name] = {'version': _unquoteToml(value)};
-    }
+  for (final section in const ['dependencies', 'dev-dependencies']) {
+    final tbl = toml[section];
+    if (tbl is! Map) continue;
+    tbl.forEach((name, value) {
+      deps[name as String] = _depToStringMap(value);
+    });
   }
 
   return deps;
 }
 
-Map<String, String> _parseInlineTable(String input) {
-  final result = <String, String>{};
-  var s = input.trim();
-  if (s.startsWith('{')) s = s.substring(1);
-  if (s.endsWith('}')) s = s.substring(0, s.length - 1);
-
-  // Split por virgula no TOP-LEVEL (nao dentro de "" '' ou [] {}) -> nao
-  // estracalha mais `features = ["a", "b"]`.
-  for (final part in _splitTopLevel(s, ',')) {
-    final trimmed = part.trim();
-    if (trimmed.isEmpty) continue;
-    final eqIdx = trimmed.indexOf('=');
-    if (eqIdx < 0) continue;
-    final key = trimmed.substring(0, eqIdx).trim();
-    result[key] = _unquoteToml(trimmed.substring(eqIdx + 1).trim());
+/// Converte o valor de uma dependência (String de versão OU tabela) num
+/// `Map<String, String>`.
+Map<String, String> _depToStringMap(dynamic value) {
+  if (value is Map) {
+    final m = <String, String>{};
+    value.forEach((k, v) => m[k as String] = _stringifyTomlValue(v));
+    return m;
   }
-  return result;
+  // Versão simples: "1.2.3" (ou int/bool solto viram String).
+  return {'version': _stringifyTomlValue(value)};
 }
 
-/// Remove um comentario `#` fora de string (aspas `"` ou `'`).
-String _stripTomlComment(String line) {
-  var inString = false;
-  var quote = '';
-  for (var i = 0; i < line.length; i++) {
-    final c = line[i];
-    if (inString) {
-      if (c == quote) inString = false;
-    } else if (c == '"' || c == "'") {
-      inString = true;
-      quote = c;
-    } else if (c == '#') {
-      return line.substring(0, i);
-    }
-  }
-  return line;
-}
-
-/// Split por `delim` no top-level: ignora o delim dentro de strings e de
-/// `[]`/`{}` (evita quebrar arrays/inline-tables aninhados).
-List<String> _splitTopLevel(String s, String delim) {
-  final parts = <String>[];
-  var depth = 0;
-  var inString = false;
-  var quote = '';
-  var start = 0;
-  for (var i = 0; i < s.length; i++) {
-    final c = s[i];
-    if (inString) {
-      if (c == quote) inString = false;
-    } else if (c == '"' || c == "'") {
-      inString = true;
-      quote = c;
-    } else if (c == '[' || c == '{') {
-      depth++;
-    } else if (c == ']' || c == '}') {
-      if (depth > 0) depth--;
-    } else if (c == delim && depth == 0) {
-      parts.add(s.substring(start, i));
-      start = i + 1;
-    }
-  }
-  parts.add(s.substring(start));
-  return parts;
-}
-
-/// Remove aspas circundantes (basica `"..."` ou literal `'...'`).
-String _unquoteToml(String v) {
-  final t = v.trim();
-  if (t.length >= 2 &&
-      ((t.startsWith('"') && t.endsWith('"')) ||
-          (t.startsWith("'") && t.endsWith("'")))) {
-    return t.substring(1, t.length - 1);
-  }
-  return t;
+/// Achata um valor TOML tipado para String (para caber em Map<String,String>).
+String _stringifyTomlValue(dynamic v) {
+  if (v is String) return v;
+  if (v is List) return v.map(_stringifyTomlValue).join(',');
+  return v.toString(); // int, double, bool, TomlDateTime
 }
 
 // =============================================================================
