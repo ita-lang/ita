@@ -4171,6 +4171,11 @@ class CodeGenerator {
         return k.NullLiteral();
 
       case 'stringify':
+        // JSON5.stringify → jsonEncode (JSON e um subconjunto valido de JSON5).
+        // Antes retornava null silenciosamente (P0).
+        if (format == 'json5' && args.isNotEmpty) {
+          return k.StaticInvocation(_jsonEncode, k.Arguments([args[0]]));
+        }
         _ensureFormatStringifier(format);
         final fn = _formatStringifiers[format];
         if (fn != null && args.isNotEmpty) {
@@ -4369,50 +4374,136 @@ class CodeGenerator {
     return k.ReturnStatement(k.VariableGet(inputParam));
   }
 
-  /// JSON5: strip // comments, /* */ comments, trailing commas, then jsonDecode
+  /// JSON5: passe char-a-char STRING-AWARE que remove comentarios e trailing
+  /// commas SEM tocar no conteudo de strings, depois jsonDecode.
+  ///
+  /// O antigo strip por regex (`//[^\n]*`, `/*...*/`, `,\s*}`) NAO tinha
+  /// consciencia de string e corrompia JSON valido: `"http://x"` virava
+  /// `"http:` e qualquer `//`/`/*`/`,}` dentro de uma string era destruido.
+  ///
+  /// TODO: JSON5 full (single-quote, unquoted keys, hex, +/-Infinity).
   k.Statement _buildJson5Parser(k.VariableDeclaration inputParam) {
-    // Strip // line comments
-    final step1 = k.VariableDeclaration('_s1',
-      initializer: k.DynamicInvocation(k.DynamicAccessKind.Dynamic,
-        k.VariableGet(inputParam), k.Name('replaceAll'),
-        k.Arguments([
-          k.StaticInvocation(
-            _regExpClass.procedures.firstWhere((p) => p.isFactory && p.name.text == ''),
-            k.Arguments([k.StringLiteral(r'//[^\n]*')])),
-          k.StringLiteral('')])),
-      type: const k.DynamicType(), isFinal: true);
+    // --- idiomas locais ---
+    k.Expression vg(k.VariableDeclaration v) => k.VariableGet(v);
+    k.Expression charAt(k.Expression s, k.Expression i) =>
+      k.DynamicInvocation(k.DynamicAccessKind.Dynamic, s, k.Name('[]'), k.Arguments([i]));
+    k.Expression lenOf(k.Expression e) =>
+      k.DynamicGet(k.DynamicAccessKind.Dynamic, e, k.Name('length'));
+    k.Expression eq(k.Expression l, k.Expression r) => k.EqualsCall(l, r,
+      functionType: k.FunctionType([const k.DynamicType()],
+        const k.DynamicType(), k.Nullability.nonNullable),
+      interfaceTarget: _coreTypes.objectEquals);
+    k.Expression and(k.Expression l, k.Expression r) =>
+      k.LogicalExpression(l, k.LogicalExpressionOperator.AND, r);
+    k.Expression or(k.Expression l, k.Expression r) =>
+      k.LogicalExpression(l, k.LogicalExpressionOperator.OR, r);
+    k.Statement addI(k.VariableDeclaration v, int by) => k.ExpressionStatement(
+      k.VariableSet(v, _dynamicOp(k.VariableGet(v), '+', k.IntLiteral(by))));
+    k.Statement setV(k.VariableDeclaration v, k.Expression e) =>
+      k.ExpressionStatement(k.VariableSet(v, e));
 
-    // Strip /* */ block comments
-    final step2 = k.VariableDeclaration('_s2',
-      initializer: k.DynamicInvocation(k.DynamicAccessKind.Dynamic,
-        k.VariableGet(step1), k.Name('replaceAll'),
-        k.Arguments([
-          k.StaticInvocation(
-            _regExpClass.procedures.firstWhere((p) => p.isFactory && p.name.text == ''),
-            k.Arguments([k.StringLiteral(r'/\*[\s\S]*?\*/')])),
-          k.StringLiteral('')])),
-      type: const k.DynamicType(), isFinal: true);
+    final inp = vg(inputParam);
+    // char em input[expr]
+    k.Expression cAt(k.Expression i) => charAt(inp, i);
+    // i + k
+    k.Expression iPlus(k.VariableDeclaration i, int by) =>
+      _dynamicOp(vg(i), '+', k.IntLiteral(by));
 
-    // Strip trailing commas before } or ]
-    final reFactory = _regExpClass.procedures.firstWhere((p) => p.isFactory && p.name.text == '');
-    final step3a = k.VariableDeclaration('_s3a',
-      initializer: k.DynamicInvocation(k.DynamicAccessKind.Dynamic,
-        k.VariableGet(step2), k.Name('replaceAll'),
-        k.Arguments([
-          k.StaticInvocation(reFactory, k.Arguments([k.StringLiteral(r',\s*\}')])),
-          k.StringLiteral('}')])),
-      type: const k.DynamicType(), isFinal: true);
-    final step3 = k.VariableDeclaration('_s3',
-      initializer: k.DynamicInvocation(k.DynamicAccessKind.Dynamic,
-        k.VariableGet(step3a), k.Name('replaceAll'),
-        k.Arguments([
-          k.StaticInvocation(reFactory, k.Arguments([k.StringLiteral(r',\s*\]')])),
-          k.StringLiteral(']')])),
-      type: const k.DynamicType(), isFinal: true);
+    final outVar = k.VariableDeclaration('_o',
+      initializer: k.StringLiteral(''), type: const k.DynamicType(), isFinal: false);
+    final iVar = k.VariableDeclaration('_i',
+      initializer: k.IntLiteral(0), type: const k.DynamicType(), isFinal: false);
+    final nVar = k.VariableDeclaration('_n',
+      initializer: lenOf(inp), type: const k.DynamicType(), isFinal: true);
+    final inStrVar = k.VariableDeclaration('_inS',
+      initializer: k.BoolLiteral(false), type: const k.DynamicType(), isFinal: false);
+    final quoteVar = k.VariableDeclaration('_q',
+      initializer: k.StringLiteral(''), type: const k.DynamicType(), isFinal: false);
+    final cVar = k.VariableDeclaration('_c',
+      initializer: cAt(vg(iVar)), type: const k.DynamicType(), isFinal: true);
 
-    // jsonDecode
-    return k.Block([step1, step2, step3a, step3,
-      k.ReturnStatement(k.StaticInvocation(_jsonDecode, k.Arguments([k.VariableGet(step3)])))]);
+    // out = out + expr
+    k.Statement appendOut(k.Expression e) =>
+      setV(outVar, _dynamicOp(vg(outVar), '+', e));
+
+    // --- Dentro de string: copia literal; \ escapa; a aspa fecha ---
+    final inStringBody = k.Block([
+      appendOut(vg(cVar)),
+      k.IfStatement(eq(vg(cVar), k.StringLiteral('\\')),
+        // escape: copia o proximo char literal, avanca 2
+        k.IfStatement(_dynamicOp(iPlus(iVar, 1), '<', vg(nVar)),
+          k.Block([appendOut(cAt(iPlus(iVar, 1))), addI(iVar, 2)]),
+          k.Block([addI(iVar, 1)])),
+        // else: aspa correspondente fecha; senao segue na string
+        k.IfStatement(eq(vg(cVar), vg(quoteVar)),
+          k.Block([setV(inStrVar, k.BoolLiteral(false)), addI(iVar, 1)]),
+          k.Block([addI(iVar, 1)]))),
+    ]);
+
+    // --- Skip loops (fora de string) ---
+    // line comment: pula ate \n (deixa o \n pra copia normal)
+    final lineSkip = k.WhileStatement(
+      and(_dynamicOp(vg(iVar), '<', vg(nVar)),
+        k.Not(eq(cAt(vg(iVar)), k.StringLiteral('\n')))),
+      k.Block([addI(iVar, 1)]));
+    // block comment: pula ate */
+    final blockSkip = k.WhileStatement(
+      and(_dynamicOp(iPlus(iVar, 1), '<', vg(nVar)),
+        k.Not(and(eq(cAt(vg(iVar)), k.StringLiteral('*')),
+          eq(cAt(iPlus(iVar, 1)), k.StringLiteral('/'))))),
+      k.Block([addI(iVar, 1)]));
+
+    // trailing comma: olha adiante passando whitespace ate } ou ]
+    final jVar = k.VariableDeclaration('_j',
+      initializer: iPlus(iVar, 1), type: const k.DynamicType(), isFinal: false);
+    k.Expression isWs(k.Expression ch) => or(eq(ch, k.StringLiteral(' ')),
+      or(eq(ch, k.StringLiteral('\t')),
+        or(eq(ch, k.StringLiteral('\n')), eq(ch, k.StringLiteral('\r')))));
+    final wsSkip = k.WhileStatement(
+      and(_dynamicOp(vg(jVar), '<', vg(nVar)), isWs(cAt(vg(jVar)))),
+      k.Block([addI(jVar, 1)]));
+    final commaBranch = k.Block([
+      jVar, wsSkip,
+      k.IfStatement(
+        and(_dynamicOp(vg(jVar), '<', vg(nVar)),
+          or(eq(cAt(vg(jVar)), k.StringLiteral('}')),
+            eq(cAt(vg(jVar)), k.StringLiteral(']')))),
+        // trailing comma → dropa a virgula (nao copia), avanca 1
+        k.Block([addI(iVar, 1)]),
+        // senao copia a virgula
+        k.Block([appendOut(vg(cVar)), addI(iVar, 1)])),
+    ]);
+
+    // --- Fora de string ---
+    final outStringBody = k.IfStatement(
+      or(eq(vg(cVar), k.StringLiteral('"')), eq(vg(cVar), k.StringLiteral('\''))),
+      // abre string
+      k.Block([setV(inStrVar, k.BoolLiteral(true)), setV(quoteVar, vg(cVar)),
+        appendOut(vg(cVar)), addI(iVar, 1)]),
+      k.IfStatement(
+        // c == '/' && s[i+1] == '/'  → comentario de linha
+        and(eq(vg(cVar), k.StringLiteral('/')),
+          and(_dynamicOp(iPlus(iVar, 1), '<', vg(nVar)),
+            eq(cAt(iPlus(iVar, 1)), k.StringLiteral('/')))),
+        k.Block([addI(iVar, 2), lineSkip]),
+        k.IfStatement(
+          // c == '/' && s[i+1] == '*'  → comentario de bloco
+          and(eq(vg(cVar), k.StringLiteral('/')),
+            and(_dynamicOp(iPlus(iVar, 1), '<', vg(nVar)),
+              eq(cAt(iPlus(iVar, 1)), k.StringLiteral('*')))),
+          k.Block([addI(iVar, 2), blockSkip, addI(iVar, 2)]),
+          k.IfStatement(
+            eq(vg(cVar), k.StringLiteral(',')),
+            commaBranch,
+            // resto: copia
+            k.Block([appendOut(vg(cVar)), addI(iVar, 1)])))));
+
+    final loop = k.WhileStatement(
+      _dynamicOp(vg(iVar), '<', vg(nVar)),
+      k.Block([cVar, k.IfStatement(vg(inStrVar), inStringBody, outStringBody)]));
+
+    return k.Block([outVar, iVar, nVar, inStrVar, quoteVar, loop,
+      k.ReturnStatement(k.StaticInvocation(_jsonDecode, k.Arguments([vg(outVar)])))]);
   }
 
   // ============================================================
