@@ -1,0 +1,6 @@
+=== BMP 24-bit gerado ===
+header (54B): 424d760100000000000036000000280000000a0000000a000000010018000000000040010000130b0000130b00000000000000000000
+dimensoes: 10x10, padding/linha: 2
+total bytes: 374
+arquivo: /tmp/ita_demo.bmp
+=== Done! ===

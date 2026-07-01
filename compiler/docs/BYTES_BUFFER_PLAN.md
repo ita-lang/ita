@@ -31,7 +31,7 @@ fecha.** Cada case = um `examples/<fmt>.tu` que gera o arquivo + validação ext
 | Formato | Tipo | Pré-requisito | Status |
 |---|---|---|---|
 | WAV (PCM) | áudio | — | ✅ `wav.tu`, validado por `file(1)` |
-| BMP (24-bit) | imagem | — (LE, sem compressão) | ⬜ |
+| BMP (24-bit) | imagem | — (LE, sem compressão) | ✅ `bmp.tu`, validado por `file(1)` (PC bitmap 10×10×24, com padding de linha a 4 bytes) |
 | TAR | arquivo | — (ASCII/octal, checksum simples) | ⬜ |
 | PNG | imagem | **CRC32** (→ `Checksum`) | ⬜ |
 | MessagePack | dados | varint + `Bytes` reader (round-trip encode/decode) | ⬜ |
