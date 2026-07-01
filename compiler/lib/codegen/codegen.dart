@@ -4224,6 +4224,11 @@ class CodeGenerator {
           _ensureYamlStringifyHelper();
           return k.StaticInvocation(_yamlStringifyFn!, k.Arguments([args[0]]));
         }
+        // XML.stringify → helper real (tree → tags, escape). Antes null (P0).
+        if (format == 'xml' && args.isNotEmpty) {
+          _ensureXmlStringifyHelper();
+          return k.StaticInvocation(_xmlStringifyFn!, k.Arguments([args[0]]));
+        }
         _ensureFormatStringifier(format);
         final fn = _formatStringifiers[format];
         if (fn != null && args.isNotEmpty) {
@@ -5101,10 +5106,276 @@ class CodeGenerator {
   }
 
   /// XML parser simplificado: extrai texto entre tags como Map
+  // ============================================================
+  // XML parser real: arvore de nos {tag, attrs, children, text}.
+  // SECURITY: sem DTD/custom entities -> sem XXE/billion-laughs (imune por
+  // omissao). So as 5 entidades predefinidas (&lt; &gt; &amp; &quot; &apos;).
+  // TODO(xml): CDATA, PIs <?...?> (puladas), namespaces (prefixo literal no
+  //            tag), <?xml?> decl (pulada), nuances de mixed content, matching
+  //            de nome no fecha-tag, atributos sem valor.
+  // ============================================================
+  k.Procedure? _xmlUnescapeFn;
+  k.Procedure? _xmlParseTagFn;
+  k.Procedure? _xmlEmitFn;
+  k.Procedure? _xmlStringifyFn;
+
+  /// ita_xmlUnescape(s) → resolve as 5 entidades XML predefinidas. `&amp;` por
+  /// ultimo (senao re-expandiria as outras).
+  void _ensureXmlUnescapeHelper() {
+    if (_xmlUnescapeFn != null) return;
+    final sP = k.VariableDeclaration('s', type: const k.DynamicType(), isFinal: true);
+    k.Expression rep(k.Expression e, String from, String to) =>
+      _di(e, 'replaceAll', [k.StringLiteral(from), k.StringLiteral(to)]);
+    _xmlUnescapeFn = _mkProc('ita_xmlUnescape', [sP], k.ReturnStatement(
+      rep(rep(rep(rep(rep(_vg(sP), '&lt;', '<'), '&gt;', '>'),
+        '&quot;', '"'), '&apos;', '\''), '&amp;', '&')));
+  }
+
+  /// ita_xmlParseTag(content) → no {tag, attrs, children:[], text:""} a partir
+  /// do interior de uma tag de abertura ("tag attr=\"x\" y='z'").
+  void _ensureXmlParseTagHelper() {
+    if (_xmlParseTagFn != null) return;
+    _ensureXmlUnescapeHelper();
+    k.Expression sl(String s) => k.StringLiteral(s);
+    k.Expression il(int i) => k.IntLiteral(i);
+    final contentP = k.VariableDeclaration('content', type: const k.DynamicType(), isFinal: true);
+    final cV = _dv('_c', _di(_vg(contentP), 'trim'), isFinal: true);
+    k.Expression len() => _dg(_vg(cV), 'length');
+    final iV = _dv('_i', il(0));
+    final nV = _dv('_n', len(), isFinal: true);
+    final tagV = _dv('_tag', sl(''));
+    final attrsV = _dv('_attrs',
+      k.MapLiteral([], keyType: const k.DynamicType(), valueType: const k.DynamicType()), isFinal: true);
+    k.Expression at(k.Expression idx) => _di(_vg(cV), '[]', [idx]);
+    k.Expression ch() => at(_vg(iV));
+    k.Expression isWs(k.Expression c) => _orc(_eqc(c, sl(' ')),
+      _orc(_eqc(c, sl('\t')), _orc(_eqc(c, sl('\n')), _eqc(c, sl('\r')))));
+    k.Statement skipWs() => k.WhileStatement(
+      _andc(_dynamicOp(_vg(iV), '<', _vg(nV)), isWs(ch())), k.Block([_addn(iV, 1)]));
+    k.Expression unesc(k.Expression e) => k.StaticInvocation(_xmlUnescapeFn!, k.Arguments([e]));
+
+    // tag name: ate whitespace
+    final tagLoop = k.WhileStatement(
+      _andc(_dynamicOp(_vg(iV), '<', _vg(nV)), k.Not(isWs(ch()))),
+      k.Block([_setv(tagV, _dynamicOp(_vg(tagV), '+', ch())), _addn(iV, 1)]));
+
+    // attrs
+    final nameV = _dv('_name', sl(''));
+    // q = char de aspa corrente (inicializa lendo ch() no inicio do valueBranch)
+    final qV = _dv('_q', ch(), isFinal: true);
+    final valV = _dv('_val', sl(''));
+    final nameLoop = k.WhileStatement(
+      _andc(_dynamicOp(_vg(iV), '<', _vg(nV)),
+        _andc(k.Not(_eqc(ch(), sl('='))), k.Not(isWs(ch())))),
+      k.Block([_setv(nameV, _dynamicOp(_vg(nameV), '+', ch())), _addn(iV, 1)]));
+    final valLoop = k.WhileStatement(
+      _andc(_dynamicOp(_vg(iV), '<', _vg(nV)), k.Not(_eqc(ch(), _vg(qV)))),
+      k.Block([_setv(valV, _dynamicOp(_vg(valV), '+', ch())), _addn(iV, 1)]));
+    final valueBranch = k.Block([
+      qV, _addn(iV, 1),           // q = quote; skip open quote
+      valV, valLoop, _addn(iV, 1), // read até quote; skip close quote
+      k.IfStatement(_dynamicOp(_dg(_vg(nameV), 'length'), '>', il(0)),
+        k.ExpressionStatement(_di(_vg(attrsV), '[]=', [_vg(nameV), unesc(_vg(valV))])), null),
+    ]);
+    // qV/valV são declarados dentro de valueBranch; mas qV é setado após decl.
+    final attrLoop = k.WhileStatement(_dynamicOp(_vg(iV), '<', _vg(nV)),
+      k.Block([
+        skipWs(),
+        nameV, _setv(nameV, sl('')),
+        nameLoop,
+        skipWs(),
+        k.IfStatement(_andc(_dynamicOp(_vg(iV), '<', _vg(nV)), _eqc(ch(), sl('='))),
+          k.Block([
+            _addn(iV, 1), skipWs(),   // skip '=' e ws
+            k.IfStatement(_andc(_dynamicOp(_vg(iV), '<', _vg(nV)),
+              _orc(_eqc(ch(), sl('"')), _eqc(ch(), sl('\'')))),
+              valueBranch, null),
+          ]),
+          null),
+      ]));
+
+    // return {tag, attrs, children:[], text:""}
+    final node = k.MapLiteral([
+      k.MapLiteralEntry(sl('tag'), _vg(tagV)),
+      k.MapLiteralEntry(sl('attrs'), _vg(attrsV)),
+      k.MapLiteralEntry(sl('children'), k.ListLiteral([], typeArgument: const k.DynamicType())),
+      k.MapLiteralEntry(sl('text'), sl('')),
+    ], keyType: const k.DynamicType(), valueType: const k.DynamicType());
+
+    _xmlParseTagFn = _mkProc('ita_xmlParseTag', [contentP],
+      k.Block([cV, iV, nV, tagV, attrsV, tagLoop, attrLoop, k.ReturnStatement(node)]));
+  }
+
+  /// Parser XML principal: arvore via stack de elementos abertos.
   k.Statement _buildXmlParser(k.VariableDeclaration inputParam) {
-    // XML completo é muito complexo. Retorna o JSON do resultado do parse via shell
-    // Fallback: retornar a string raw (o dev usa regex/string ops pra extrair)
-    return k.ReturnStatement(k.VariableGet(inputParam));
+    _ensureXmlUnescapeHelper();
+    _ensureXmlParseTagHelper();
+    k.Expression sl(String s) => k.StringLiteral(s);
+    k.Expression il(int i) => k.IntLiteral(i);
+    final inp = _vg(inputParam);
+    k.Expression at(k.Expression idx) => _di(inp, '[]', [idx]);
+    k.Expression parseTag(k.Expression e) => k.StaticInvocation(_xmlParseTagFn!, k.Arguments([e]));
+    k.Expression unesc(k.Expression e) => k.StaticInvocation(_xmlUnescapeFn!, k.Arguments([e]));
+    k.Expression indexOf(k.Expression needle, k.Expression from) =>
+      _di(inp, 'indexOf', [needle, from]);
+
+    final rootV = _dv('_root',
+      k.MapLiteral([], keyType: const k.DynamicType(), valueType: const k.DynamicType()));
+    final hasRootV = _dv('_hr', k.BoolLiteral(false));
+    final stackV = _dv('_stk', k.ListLiteral([], typeArgument: const k.DynamicType()), isFinal: true);
+    final iV = _dv('_i', il(0));
+    final nV = _dv('_n', _dg(inp, 'length'), isFinal: true);
+    k.Expression cur() => at(_vg(iV));
+    k.Expression stkTop() => _dg(_vg(stackV), 'last');
+
+    // --- tag: acha o fim (respeitando aspas) ---
+    final jV = _dv('_j', _dynamicOp(_vg(iV), '+', il(1)));
+    final tqV = _dv('_tq', sl(''));
+    final tinqV = _dv('_tinq', k.BoolLiteral(false));
+    final tfoundV = _dv('_tf', k.BoolLiteral(false));
+    final cjV = _dv('_cj', at(_vg(jV)), isFinal: true);
+    final tagEndLoop = k.WhileStatement(
+      _andc(_dynamicOp(_vg(jV), '<', _vg(nV)), k.Not(_vg(tfoundV))),
+      k.Block([cjV,
+        k.IfStatement(_vg(tinqV),
+          k.Block([k.IfStatement(_eqc(_vg(cjV), _vg(tqV)),
+            _setv(tinqV, k.BoolLiteral(false)), null), _addn(jV, 1)]),
+          k.IfStatement(_orc(_eqc(_vg(cjV), sl('"')), _eqc(_vg(cjV), sl('\''))),
+            k.Block([_setv(tinqV, k.BoolLiteral(true)), _setv(tqV, _vg(cjV)), _addn(jV, 1)]),
+            k.IfStatement(_eqc(_vg(cjV), sl('>')),
+              _setv(tfoundV, k.BoolLiteral(true)),
+              _addn(jV, 1))))]));
+    final contentV = _dv('_ct', _di(inp, 'substring', [_dynamicOp(_vg(iV), '+', il(1)), _vg(jV)]), isFinal: true);
+    // no de abertura/self-close
+    final scV = _dv('_sc', _di(_vg(contentV), 'endsWith', [sl('/')]), isFinal: true);
+    final ctrimV = _dv('_ctr', k.ConditionalExpression(_vg(scV),
+      _di(_vg(contentV), 'substring', [il(0), _dynamicOp(_dg(_vg(contentV), 'length'), '-', il(1))]),
+      _vg(contentV), const k.DynamicType()), isFinal: true);
+    final nodeV = _dv('_nd', parseTag(_vg(ctrimV)), isFinal: true);
+    final openTagBlock = k.Block([scV, ctrimV, nodeV,
+      k.IfStatement(_dg(_vg(stackV), 'isNotEmpty'),
+        k.ExpressionStatement(_di(_di(stkTop(), '[]', [sl('children')]), 'add', [_vg(nodeV)])),
+        k.IfStatement(k.Not(_vg(hasRootV)),
+          k.Block([_setv(rootV, _vg(nodeV)), _setv(hasRootV, k.BoolLiteral(true))]), null)),
+      k.IfStatement(k.Not(_vg(scV)),
+        k.ExpressionStatement(_di(_vg(stackV), 'add', [_vg(nodeV)])), null)]);
+    final tagBlock = k.Block([jV, tqV, tinqV, tfoundV, tagEndLoop, contentV,
+      _setv(iV, _dynamicOp(_vg(jV), '+', il(1))),
+      k.IfStatement(_di(_vg(contentV), 'startsWith', [sl('/')]),
+        // fecha tag → pop
+        k.IfStatement(_dg(_vg(stackV), 'isNotEmpty'),
+          k.ExpressionStatement(_di(_vg(stackV), 'removeLast')), null),
+        openTagBlock)]);
+
+    // --- comentario / PI ---
+    final ceV = _dv('_ce', indexOf(sl('-->'), _vg(iV)), isFinal: true);
+    final commentBlock = k.Block([ceV,
+      _setv(iV, k.ConditionalExpression(_dynamicOp(_vg(ceV), '<', il(0)),
+        _vg(nV), _dynamicOp(_vg(ceV), '+', il(3)), const k.DynamicType()))]);
+    final peV = _dv('_pe', indexOf(sl('?>'), _vg(iV)), isFinal: true);
+    final piBlock = k.Block([peV,
+      _setv(iV, k.ConditionalExpression(_dynamicOp(_vg(peV), '<', il(0)),
+        _vg(nV), _dynamicOp(_vg(peV), '+', il(2)), const k.DynamicType()))]);
+
+    // dispatch em '<'
+    final ltBlock = k.IfStatement(
+      _di(inp, 'startsWith', [sl('<!--'), _vg(iV)]),
+      commentBlock,
+      k.IfStatement(
+        _andc(_dynamicOp(_dynamicOp(_vg(iV), '+', il(1)), '<', _vg(nV)),
+          _eqc(at(_dynamicOp(_vg(iV), '+', il(1))), sl('?'))),
+        piBlock,
+        tagBlock));
+
+    // --- texto ate '<' ---
+    final tsV = _dv('_ts', _vg(iV), isFinal: true);
+    final txtV = _dv('_txt', sl(''), isFinal: false);
+    final trimmedV = _dv('_tm', sl(''));
+    final textScan = k.WhileStatement(
+      _andc(_dynamicOp(_vg(iV), '<', _vg(nV)), k.Not(_eqc(cur(), sl('<')))),
+      k.Block([_addn(iV, 1)]));
+    final textBlock = k.Block([tsV, textScan,
+      txtV, _setv(txtV, _di(inp, 'substring', [_vg(tsV), _vg(iV)])),
+      trimmedV, _setv(trimmedV, _di(_vg(txtV), 'trim')),
+      k.IfStatement(_andc(_dynamicOp(_dg(_vg(trimmedV), 'length'), '>', il(0)),
+        _dg(_vg(stackV), 'isNotEmpty')),
+        k.ExpressionStatement(_di(stkTop(), '[]=', [sl('text'),
+          _dynamicOp(_di(stkTop(), '[]', [sl('text')]), '+', unesc(_vg(trimmedV)))])),
+        null)]);
+
+    final mainLoop = k.WhileStatement(_dynamicOp(_vg(iV), '<', _vg(nV)),
+      k.Block([k.IfStatement(_eqc(cur(), sl('<')), ltBlock, textBlock)]));
+
+    return k.Block([rootV, hasRootV, stackV, iV, nV, mainLoop,
+      k.ReturnStatement(_vg(rootV))]);
+  }
+
+  /// ita_xmlEmit(node) → String XML. Self-close se sem filhos/texto.
+  /// ESCAPE XML no texto (& < >) e nos attrs (& < > "). Auto-recursivo.
+  void _ensureXmlEmitHelper() {
+    if (_xmlEmitFn != null) return;
+    k.Expression sl(String s) => k.StringLiteral(s);
+    k.Expression il(int i) => k.IntLiteral(i);
+    final nodeP = k.VariableDeclaration('node', type: const k.DynamicType(), isFinal: true);
+    final proc = k.Procedure(k.Name('ita_xmlEmit'), k.ProcedureKind.Method,
+      k.FunctionNode(k.ReturnStatement(k.NullLiteral()),
+        positionalParameters: [nodeP], returnType: const k.DynamicType()),
+      isStatic: true, fileUri: _fileUri);
+    _xmlEmitFn = proc;
+    _library.addProcedure(proc);
+
+    k.Expression get(String key) => _di(_vg(nodeP), '[]', [sl(key)]);
+    k.Expression escText(k.Expression e) => _di(_di(_di(e, 'replaceAll', [sl('&'), sl('&amp;')]),
+      'replaceAll', [sl('<'), sl('&lt;')]), 'replaceAll', [sl('>'), sl('&gt;')]);
+    k.Expression escAttr(k.Expression e) => _di(escText(e), 'replaceAll', [sl('"'), sl('&quot;')]);
+    k.Expression cat(List<k.Expression> parts) {
+      var e = parts.first;
+      for (var i = 1; i < parts.length; i++) { e = _dynamicOp(e, '+', parts[i]); }
+      return e;
+    }
+    k.Expression selfEmit(k.Expression n) => k.StaticInvocation(_xmlEmitFn!, k.Arguments([n]));
+
+    final tagV = _dv('_tag', get('tag'), isFinal: true);
+    final attrsV = _dv('_at', get('attrs'), isFinal: true);
+    final childV = _dv('_ch', get('children'), isFinal: true);
+    final textV = _dv('_tx', get('text'), isFinal: true);
+    final outV = _dv('_out', _dynamicOp(sl('<'), '+', _vg(tagV)));
+    // attrs
+    final akV = _dv('_ak', _di(_dg(_vg(attrsV), 'keys'), 'toList'), isFinal: true);
+    final aiV = _dv('_ai', il(0));
+    final kV = _dv('_k', _di(_vg(akV), '[]', [_vg(aiV)]), isFinal: true);
+    final attrLoop = k.WhileStatement(_dynamicOp(_vg(aiV), '<', _dg(_vg(akV), 'length')),
+      k.Block([kV,
+        _setv(outV, cat([_vg(outV), sl(' '), _vg(kV), sl('="'),
+          escAttr(_di(_vg(attrsV), '[]', [_vg(kV)])), sl('"')])),
+        _addn(aiV, 1)]));
+    // body: self-close ou children/text
+    final jV = _dv('_j', il(0));
+    final childLoop = k.WhileStatement(_dynamicOp(_vg(jV), '<', _dg(_vg(childV), 'length')),
+      k.Block([
+        _setv(outV, _dynamicOp(_vg(outV), '+', selfEmit(_di(_vg(childV), '[]', [_vg(jV)])))),
+        _addn(jV, 1)]));
+    final bodyBranch = k.IfStatement(
+      _andc(_eqc(_dg(_vg(childV), 'length'), il(0)), _eqc(_dg(_vg(textV), 'length'), il(0))),
+      _setv(outV, _dynamicOp(_vg(outV), '+', sl('/>'))),
+      k.Block([
+        _setv(outV, cat([_vg(outV), sl('>'), escText(_vg(textV))])),
+        jV, childLoop,
+        _setv(outV, cat([_vg(outV), sl('</'), _vg(tagV), sl('>')]))]));
+
+    final body = k.Block([tagV, attrsV, childV, textV, outV, akV, aiV, attrLoop,
+      bodyBranch, k.ReturnStatement(_vg(outV))]);
+    proc.function.body = body;
+    body.parent = proc.function;
+  }
+
+  /// ita_xmlStringify(node) → String XML (= emit do no raiz).
+  void _ensureXmlStringifyHelper() {
+    if (_xmlStringifyFn != null) return;
+    _ensureXmlEmitHelper();
+    final nodeP = k.VariableDeclaration('node', type: const k.DynamicType(), isFinal: true);
+    _xmlStringifyFn = _mkProc('ita_xmlStringify', [nodeP],
+      k.ReturnStatement(k.StaticInvocation(_xmlEmitFn!, k.Arguments([_vg(nodeP)]))));
   }
 
   /// JSON5: passe char-a-char STRING-AWARE que remove comentarios e trailing
