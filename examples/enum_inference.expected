@@ -1,0 +1,13 @@
+=== let annotation ===
+Color.red
+Direction.north
+=== function args ===
+Painting wall:
+Color.green
+Moving:
+Direction.south
+=== return inference ===
+Color.blue
+Direction.west
+Color.green
+=== Done! ===

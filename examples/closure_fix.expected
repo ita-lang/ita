@@ -1,0 +1,19 @@
+=== Arrow closure single expr ===
+10
+42
+=== Arrow closure with block ===
+Processing: test!
+=== Callback with block ===
+[hello]
+[world]
+=== Transform with block ===
+2
+5
+10
+17
+26
+=== Server-style callback ===
+a-processed
+b-processed
+c-processed
+=== Done! ===

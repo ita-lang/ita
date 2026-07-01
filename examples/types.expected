@@ -1,0 +1,17 @@
+=== Structs ===
+Point(x: 3.0, y: 4.0)
+3.0
+4.0
+Color(r: 255, g: 128, b: 0)
+=== Enums ===
+Shape.circle(radius: 5.0)
+Shape.rect(width: 10.0, height: 20.0)
+Shape.point
+=== Pattern Matching ===
+78.53975
+200.0
+0.0
+Circle with radius 5.0
+Just a point
+other
+=== Done! ===

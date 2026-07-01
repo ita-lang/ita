@@ -1,0 +1,18 @@
+=== Bits: and/or/xor/not ===
+and(0xFF, 0x0F): 15
+or(0xF0, 0x0F): 255
+xor(0xFF, 0x0F): 240
+not(0): -1
+not(0x0F) & 0xFF: 240
+=== Bits: shl/shr ===
+shl(1, 4): 16
+shr(0x80, 4): 8
+=== Bits: bit (i-esimo bit -> Bool) ===
+bit(0x80, 7): true
+bit(0x80, 0): false
+=== Bits: bits (campo de bits) ===
+bits(0xAB, 0, 4): 11
+bits(0xAB, 4, 4): 10
+=== Buffer.writeString: magic tag RIFF/WAVE ===
+hex: 524946460000000057415645
+=== Done! ===

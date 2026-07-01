@@ -1,0 +1,14 @@
+=== Point Extensions ===
+Point at (3.0, 4.0)
+25.0
+Point at (13.0, 24.0)
+true
+=== Size Extension ===
+Size(1920.0x1080.0)
+2073600.0
+=== Enum Extension ===
+Direction.north
+true
+Direction.south
+false
+=== Done! ===

@@ -1,0 +1,12 @@
+=== Buffer int read/write (Fase 1A) ===
+hex: 0102030404030201abcdcdab7f000000
+=== Read back (mesma endianness) ===
+readU32BE(0): 16909060
+readU32LE(4): 16909060
+readU16BE(8): 43981
+readU16LE(10): 43981
+readU8(12): 127
+=== BE vs LE nos MESMOS bytes (01 02 03 04) ===
+readU32BE(0): 16909060
+readU32LE(0): 67305985
+=== Done! ===

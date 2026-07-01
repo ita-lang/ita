@@ -1,0 +1,23 @@
+=== Destructuring (TS-style) ===
+Alice
+30
+SP
+10
+20
+30
+10
+[20, 30, 40, 50]
+=== Currying ===
+8
+15
+21
+Hello, World!
+Hello, Itá!
+=== Composição >> ===
+11
+Result: 21
+=== Where clause ===
+22
+normal
+25.0
+=== Done! ===

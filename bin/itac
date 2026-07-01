@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+# ===========================================================================
+# itac — Ita Compiler CLI
+# ===========================================================================
+# Usage:
+#   itac run file.tu          Compile and execute
+#   itac build                Compile project (reads ita.toml)
+#   itac init --name myapp    Create new project
+#   itac test                 Run tests
+#   itac add <pkg> --git url  Add dependency
+#   itac deps                 List dependencies
+#   itac clean                Remove build/
+#   itac help                 Show help
+# ===========================================================================
+
+# Ita SDK location
+ITA_HOME="${ITA_HOME:-$(dirname "$(dirname "$(realpath "$0")")")}"
+
+# Dart SDK
+ITA_DART_BIN="${ITA_DART_BIN:-/Users/gabriel_aderaldo/Desktop/Projetos/dev/google_tools/dart-sdk-source/sdk/xcodebuild/ReleaseARM64/dart}"
+ITA_PLATFORM_DILL="${ITA_PLATFORM_DILL:-/Users/gabriel_aderaldo/Desktop/Projetos/dev/google_tools/dart-sdk-source/sdk/xcodebuild/ReleaseARM64/vm_platform.dill}"
+ITA_PACKAGES="${ITA_PACKAGES:-/Users/gabriel_aderaldo/Desktop/Projetos/dev/google_tools/dart-sdk-source/sdk/.dart_tool/package_config.json}"
+
+# Compiler entry point
+COMPILER="${ITA_HOME}/compiler/bin/itac.dart"
+
+# Export for the compiler to use
+export ITA_DART_BIN ITA_PLATFORM_DILL ITA_PACKAGES
+
+exec "$ITA_DART_BIN" --packages="$ITA_PACKAGES" "$COMPILER" "$@"

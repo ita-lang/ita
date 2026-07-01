@@ -1,0 +1,9 @@
+=== BytesReader little-endian ===
+hex: 04030201cdab785634120000
+readU32LE(0): 16909060
+readU16LE(4): 43981
+readU32LE(6): 305419896
+remaining: 2
+mesmos bytes readU32LE: 16909060
+mesmos bytes readU32BE: 67305985
+=== Done! ===
