@@ -2652,11 +2652,14 @@ class CodeGenerator {
         return _compileGlob(compiledArgs);
 
       // === UUID (shortcut pra Id.uuid4) ===
-      // === Fetch (alias pra Http.get) ===
+      // === Fetch (async, seguro por default → Future<Result<Response>>) ===
       case 'fetch':
+        // fetch(url) → await para obter Result<Response>. Erro-como-valor:
+        // rede/DNS/timeout viram Result.err, nunca panic. TLS nativo LIGADO,
+        // followRedirects=false, connectionTimeout=30s (ver _ensureFetchHelper).
         if (compiledArgs.isNotEmpty) {
-          return _shellExecTrim(k.StringConcatenation([
-            k.StringLiteral('curl -s "'), compiledArgs[0], k.StringLiteral('"')]));
+          _ensureFetchHelper();
+          return k.StaticInvocation(_fetchHelper!, k.Arguments([compiledArgs[0]]));
         }
         return null;
 
@@ -5485,6 +5488,132 @@ class CodeGenerator {
   // HTTP Module (dart:_http HttpClient/HttpServer)
   // ============================================================
 
+  k.Procedure? _fetchHelper;
+
+  /// Gera (lazy) o helper async top-level `ita_fetch(url) -> Future<Result>`.
+  ///
+  /// Combina async + Result: `fetch` e uma expressao (nao pode ser async por
+  /// si so), entao delega a este Procedure async (padrao do ita_callActor).
+  /// `fetch(url)` compila para StaticInvocation(ita_fetch, [url]); o usuario
+  /// faz `await fetch(url)` para obter o Result.
+  ///
+  /// Secure-by-default (NETWORKING_PLAN):
+  ///  - `followRedirects = false` — redirect e opt-in (bypass de SSRF e
+  ///    comportamento surpresa); nao seguimos por default.
+  ///  - TLS: validacao nativa do HttpClient LIGADA (cert + hostname). NAO
+  ///    setamos badCertificateCallback — nunca trust-all.
+  ///  - `connectionTimeout = 30s`.
+  ///  - Falha de rede/DNS/timeout → `Result.err("<motivo>")` via try/catch no
+  ///    Kernel gerado — nunca panic/crash. (Bloqueio de IP privado/localhost
+  ///    NAO e default; fica como guard opt-in reusando Security.allowedUrl.)
+  ///
+  /// Response e representado como List `[statusCode, bytes(Uint8List)]`; os
+  /// accessors Http.status/text/bytes leem desses campos (text = utf8.decode).
+  void _ensureFetchHelper() {
+    if (_fetchHelper != null) return;
+
+    final durationCtor = _coreTypes.coreLibrary.classes
+      .firstWhere((c) => c.name == 'Duration').constructors.first;
+    final httpClientCtor = _httpClientClass.procedures
+      .firstWhere((p) => p.isFactory && p.name.text == '');
+
+    final urlParam = k.VariableDeclaration('url',
+      type: const k.DynamicType(), isFinal: true);
+
+    // final _c = HttpClient()
+    final clientVar = k.VariableDeclaration('_c',
+      initializer: k.StaticInvocation(httpClientCtor, k.Arguments([])),
+      type: const k.DynamicType(), isFinal: true);
+    // _c.connectionTimeout = Duration(seconds: 30)   🔒
+    final setTimeout = k.ExpressionStatement(k.DynamicSet(
+      k.DynamicAccessKind.Dynamic, k.VariableGet(clientVar),
+      k.Name('connectionTimeout'),
+      k.ConstructorInvocation(durationCtor,
+        k.Arguments([], named: [k.NamedExpression('seconds', k.IntLiteral(30))]))));
+
+    // final _req = await _c.getUrl(Uri.parse(url))
+    final reqVar = k.VariableDeclaration('_req',
+      initializer: k.AwaitExpression(k.DynamicInvocation(
+        k.DynamicAccessKind.Dynamic, k.VariableGet(clientVar), k.Name('getUrl'),
+        k.Arguments([k.StaticInvocation(_uriParse,
+          k.Arguments([k.VariableGet(urlParam)]))]))),
+      type: const k.DynamicType(), isFinal: true);
+    // _req.followRedirects = false   🔒 (redirect e opt-in)
+    final noRedirect = k.ExpressionStatement(k.DynamicSet(
+      k.DynamicAccessKind.Dynamic, k.VariableGet(reqVar),
+      k.Name('followRedirects'), k.BoolLiteral(false)));
+
+    // final _resp = await _req.close()
+    final respVar = k.VariableDeclaration('_resp',
+      initializer: k.AwaitExpression(k.DynamicInvocation(
+        k.DynamicAccessKind.Dynamic, k.VariableGet(reqVar),
+        k.Name('close'), k.Arguments([]))),
+      type: const k.DynamicType(), isFinal: true);
+    // final _st = _resp.statusCode
+    final statusVar = k.VariableDeclaration('_st',
+      initializer: k.DynamicGet(k.DynamicAccessKind.Dynamic,
+        k.VariableGet(respVar), k.Name('statusCode')),
+      type: const k.DynamicType(), isFinal: true);
+    // final _by = await _resp.expand((c) => c).toList()   (bytes, 1x)
+    final cParam = k.VariableDeclaration('c',
+      type: const k.DynamicType(), isFinal: true);
+    final identityFn = k.FunctionExpression(k.FunctionNode(
+      k.ReturnStatement(k.VariableGet(cParam)),
+      positionalParameters: [cParam], returnType: const k.DynamicType()));
+    final bytesVar = k.VariableDeclaration('_by',
+      initializer: k.AwaitExpression(k.DynamicInvocation(
+        k.DynamicAccessKind.Dynamic,
+        k.DynamicInvocation(k.DynamicAccessKind.Dynamic, k.VariableGet(respVar),
+          k.Name('expand'), k.Arguments([identityFn])),
+        k.Name('toList'), k.Arguments([]))),
+      type: const k.DynamicType(), isFinal: true);
+    // _c.close()
+    final closeClient = k.ExpressionStatement(k.DynamicInvocation(
+      k.DynamicAccessKind.Dynamic, k.VariableGet(clientVar),
+      k.Name('close'), k.Arguments([])));
+
+    // return Result.ok(value: [_st, Uint8List.fromList(_by)])
+    final response = k.ListLiteral([
+      k.VariableGet(statusVar),
+      k.StaticInvocation(_uint8ListFromList, k.Arguments([k.VariableGet(bytesVar)])),
+    ], typeArgument: const k.DynamicType());
+    final returnOk = k.ReturnStatement(k.ConstructorInvocation(
+      _constructors['Result_ok']!,
+      k.Arguments([], named: [k.NamedExpression('value', response)])));
+
+    final tryBody = k.Block([
+      clientVar, setTimeout, reqVar, noRedirect, respVar, statusVar,
+      bytesVar, closeClient, returnOk,
+    ]);
+
+    // catch (_e) → return Result.err(error: _e.toString())  (nunca panic)
+    final eVar = k.VariableDeclaration('_e', type: const k.DynamicType());
+    final catchBody = k.Block([
+      k.ReturnStatement(k.ConstructorInvocation(_constructors['Result_err']!,
+        k.Arguments([], named: [k.NamedExpression('error',
+          k.DynamicInvocation(k.DynamicAccessKind.Dynamic, k.VariableGet(eVar),
+            k.Name('toString'), k.Arguments([])))]))),
+    ]);
+
+    final body = k.Block([
+      k.TryCatch(tryBody,
+        [k.Catch(eVar, catchBody, guard: const k.DynamicType())]),
+    ]);
+
+    _fetchHelper = k.Procedure(
+      k.Name('ita_fetch'),
+      k.ProcedureKind.Method,
+      k.FunctionNode(body,
+        positionalParameters: [urlParam],
+        returnType: const k.DynamicType(),
+        asyncMarker: k.AsyncMarker.Async,
+        emittedValueType: const k.DynamicType()),
+      isStatic: true,
+      fileUri: _fileUri,
+    );
+    _library.addProcedure(_fetchHelper!);
+  }
+
   k.Expression _compileHttpCall(String method, List<k.Expression> args) {
     // HttpClient() como valor
     k.Expression _newClient() {
@@ -5560,6 +5689,33 @@ class CodeGenerator {
             (p) => p.name.text == 'bind' && p.isStatic);
           return k.StaticInvocation(bind,
             k.Arguments([k.StringLiteral('0.0.0.0'), args[0]]));
+        }
+        return k.NullLiteral();
+
+      // === Accessors do Response de fetch (List [statusCode, bytes]) ===
+      case 'status':
+        // Http.status(resp) → resp[0]  (Int)
+        if (args.isNotEmpty) {
+          return k.DynamicInvocation(k.DynamicAccessKind.Dynamic,
+            args[0], k.Name('[]'), k.Arguments([k.IntLiteral(0)]));
+        }
+        return k.NullLiteral();
+
+      case 'bytes':
+        // Http.bytes(resp) → resp[1]  (Uint8List / Buffer)
+        if (args.isNotEmpty) {
+          return k.DynamicInvocation(k.DynamicAccessKind.Dynamic,
+            args[0], k.Name('[]'), k.Arguments([k.IntLiteral(1)]));
+        }
+        return k.NullLiteral();
+
+      case 'text':
+        // Http.text(resp) → utf8.decode(resp[1])  (String, decode sob demanda)
+        if (args.isNotEmpty) {
+          return k.DynamicInvocation(k.DynamicAccessKind.Dynamic,
+            k.StaticGet(_utf8Field), k.Name('decode'),
+            k.Arguments([k.DynamicInvocation(k.DynamicAccessKind.Dynamic,
+              args[0], k.Name('[]'), k.Arguments([k.IntLiteral(1)]))]));
         }
         return k.NullLiteral();
 

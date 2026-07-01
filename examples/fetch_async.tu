@@ -3,7 +3,7 @@
 
 actor Api {
   fn get(url: String) -> String {
-    fetch(url)
+    Http.get(url)
   }
 
   fn post(url: String, body: String) -> String {

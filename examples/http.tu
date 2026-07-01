@@ -1,10 +1,10 @@
 // HTTP Client, Server, WebSocket, Fetch
 
 fn main() {
-  print("=== Fetch (shortcut) ===")
+  print("=== Http.get (shortcut) ===")
 
-  let body = fetch("https://httpbin.org/get")
-  print("fetch length: ${body}")
+  let body = Http.get("https://httpbin.org/get")
+  print("get length: ${body}")
 
   print("=== Http.get ===")
 
