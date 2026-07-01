@@ -7244,13 +7244,24 @@ class CodeGenerator {
           return methods[callee.member]!(args, obj);
         }
       }
-      // Fallback: tentar todos os builtins
+      // Fallback: tipo estatico do receiver desconhecido (ou nao e um builtin
+      // conhecido). Coleta TODOS os builtins que tem esse metodo.
+      final candidates = <String>[];
       for (final entry in _builtinMethods.entries) {
         if (receiverType != null && entry.key == receiverType) continue; // já tentou
-        final methods = entry.value;
-        if (methods.containsKey(callee.member)) {
-          return methods[callee.member]!(args, obj);
-        }
+        if (entry.value.containsKey(callee.member)) candidates.add(entry.key);
+      }
+      if (candidates.length == 1) {
+        // Sem ambiguidade → dispatch direto (comportamento anterior, sem risco).
+        return _builtinMethods[candidates.first]![callee.member]!(args, obj);
+      }
+      if (candidates.length >= 2) {
+        // Ambiguo: o metodo (ex: unwrapOr/map) existe em 2+ builtins (Option E
+        // Result) e o tipo estatico e desconhecido. Pegar o PRIMEIRO registrado
+        // era o bug (Option.unwrapOr num Result.err acessa `.value` inexistente
+        // → NoSuchMethodError). Gera dispatch por RUNTIME-TYPE: avalia obj uma
+        // vez e testa a classe real do variant.
+        return _buildAmbiguousBuiltinDispatch(callee.member, candidates, args, obj);
       }
 
       return k.DynamicInvocation(
@@ -7268,6 +7279,57 @@ class CodeGenerator {
         List.filled(args.length, const k.DynamicType()),
         const k.DynamicType(), k.Nullability.nonNullable),
     );
+  }
+
+  /// Dispatch por runtime-type para metodos built-in ambiguos.
+  ///
+  /// Quando o tipo estatico do receiver e desconhecido e `member` existe em
+  /// 2+ builtins (ex: `unwrapOr`/`map` em Option E Result), nao da pra escolher
+  /// o impl estaticamente. Avalia `obj` e cada `arg` UMA vez (temps) e emite
+  /// uma cadeia condicional testando a classe real do variant do receiver,
+  /// chamando o impl do builtin correspondente; fallback = DynamicInvocation.
+  ///
+  /// Node-safety: cada branch referencia obj/args via `VariableGet` fresco —
+  /// nenhum no Kernel e compartilhado entre branches (reparent quebraria).
+  k.Expression _buildAmbiguousBuiltinDispatch(String member,
+      List<String> candidates, List<k.Expression> args, k.Expression obj) {
+    final objTemp = k.VariableDeclaration('_bd', initializer: obj,
+      type: const k.DynamicType(), isFinal: true);
+    final argTemps = <k.VariableDeclaration>[];
+    for (var i = 0; i < args.length; i++) {
+      argTemps.add(k.VariableDeclaration('_bda$i', initializer: args[i],
+        type: const k.DynamicType(), isFinal: true));
+    }
+    // VariableGets frescos a cada chamada (um no distinto por uso/branch).
+    List<k.Expression> argGets() =>
+      [for (final t in argTemps) k.VariableGet(t)];
+
+    // Fallback (tipo nao bate com nenhum builtin candidato): dynamic dispatch.
+    k.Expression chain = k.DynamicInvocation(k.DynamicAccessKind.Dynamic,
+      k.VariableGet(objTemp), k.Name(member), k.Arguments(argGets()));
+
+    // Cadeia de tras pra frente → mantem a prioridade de `candidates` (os
+    // type-tests sao mutuamente exclusivos: um valor nao e Option E Result).
+    for (final cand in candidates.reversed) {
+      final variants = _enumVariants[cand];
+      if (variants == null || variants.isEmpty) continue; // sem type-test possivel
+      // _bd is <V1> || _bd is <V2> || ...
+      k.Expression? test;
+      for (final vCls in variants.values) {
+        final isV = k.IsExpression(k.VariableGet(objTemp),
+          k.InterfaceType(vCls, k.Nullability.nonNullable));
+        test = test == null
+          ? isV
+          : k.LogicalExpression(test, k.LogicalExpressionOperator.OR, isV);
+      }
+      final impl = _builtinMethods[cand]![member]!;
+      chain = k.ConditionalExpression(test!,
+        impl(argGets(), k.VariableGet(objTemp)),
+        chain,
+        const k.DynamicType());
+    }
+
+    return k.BlockExpression(k.Block([objTemp, ...argTemps]), chain);
   }
 
   k.Expression _compileMember(ast.MemberExpr expr) {
