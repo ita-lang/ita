@@ -3668,7 +3668,14 @@ class CodeGenerator {
           case 'sha1':
             return _opensslCmd('printf "%s" "', args[0], '" | openssl dgst -sha1 | awk \'{print \$NF}\'');
           case 'crc32':
-            return _shellTrim('printf "%s" "' + '" | cksum | awk \'{print \$1}\'');
+            // Checksum.crc32(buf) → Int: CRC-32 padrao (ISO 3309 / zlib / PNG),
+            // bitwise sem tabela. Helper sincrono sintetizado (nao shell cksum,
+            // que usa outro polinomio). buf = Uint8List (Buffer.*).
+            if (args.isNotEmpty) {
+              _ensureCrc32Helper();
+              return k.StaticInvocation(_crc32Helper!, k.Arguments([args[0]]));
+            }
+            return k.NullLiteral();
         }
 
       // === Aes (AES-256-CBC + PBKDF2 + salt, authenticated via HMAC) ===
@@ -5632,6 +5639,95 @@ class CodeGenerator {
       fileUri: _fileUri,
     );
     _library.addProcedure(_fetchHelper!);
+  }
+
+  k.Procedure? _crc32Helper;
+
+  /// Sintetiza (lazy) o helper sincrono `ita_crc32(buf) -> int`: CRC-32 padrao
+  /// (ISO 3309 / zlib / PNG), algoritmo bitwise SEM tabela. Polinomio refletido
+  /// 0xEDB88320, init 0xFFFFFFFF, XOR final 0xFFFFFFFF. crc fica sempre em
+  /// [0, 0xFFFFFFFF] (positivo) → `>>` e logico, sem problema de sinal (int64).
+  /// Mesmo idioma de loop de Buffer.from (WhileStatement + _dynamicOp), locais
+  /// dinamicos, sem async/TryCatch. buf indexado via `[]` (Uint8List).
+  ///
+  ///   int crc = 0xFFFFFFFF; int i = 0; final n = buf.length;
+  ///   while (i < n) {
+  ///     crc = crc ^ buf[i];
+  ///     int j = 0;
+  ///     while (j < 8) {
+  ///       crc = (crc & 1) == 1 ? (crc >> 1) ^ 0xEDB88320 : (crc >> 1);
+  ///       j = j + 1;
+  ///     }
+  ///     i = i + 1;
+  ///   }
+  ///   return crc ^ 0xFFFFFFFF;
+  void _ensureCrc32Helper() {
+    if (_crc32Helper != null) return;
+
+    final bufParam = k.VariableDeclaration('buf',
+      type: const k.DynamicType(), isFinal: true);
+
+    final crcVar = k.VariableDeclaration('crc',
+      initializer: k.IntLiteral(0xFFFFFFFF), type: const k.DynamicType(), isFinal: false);
+    final iVar = k.VariableDeclaration('i',
+      initializer: k.IntLiteral(0), type: const k.DynamicType(), isFinal: false);
+    final nVar = k.VariableDeclaration('n',
+      initializer: k.DynamicGet(k.DynamicAccessKind.Dynamic,
+        k.VariableGet(bufParam), k.Name('length')),
+      type: const k.DynamicType(), isFinal: true);
+
+    // Inner loop: 8 rounds do polinomio refletido.
+    final jVar = k.VariableDeclaration('j',
+      initializer: k.IntLiteral(0), type: const k.DynamicType(), isFinal: false);
+    // (crc & 1) == 1
+    final lowBitSet = k.EqualsCall(
+      _dynamicOp(k.VariableGet(crcVar), '&', k.IntLiteral(1)), k.IntLiteral(1),
+      functionType: k.FunctionType([const k.DynamicType()],
+        const k.DynamicType(), k.Nullability.nonNullable),
+      interfaceTarget: _coreTypes.objectEquals);
+    // (crc >> 1) ^ 0xEDB88320  :  (crc >> 1)
+    final newCrc = k.ConditionalExpression(lowBitSet,
+      _dynamicOp(_dynamicOp(k.VariableGet(crcVar), '>>', k.IntLiteral(1)),
+        '^', k.IntLiteral(0xEDB88320)),
+      _dynamicOp(k.VariableGet(crcVar), '>>', k.IntLiteral(1)),
+      const k.DynamicType());
+    final innerLoop = k.WhileStatement(
+      _dynamicOp(k.VariableGet(jVar), '<', k.IntLiteral(8)),
+      k.Block([
+        k.ExpressionStatement(k.VariableSet(crcVar, newCrc)),
+        k.ExpressionStatement(k.VariableSet(jVar,
+          _dynamicOp(k.VariableGet(jVar), '+', k.IntLiteral(1)))),
+      ]));
+
+    // Outer loop sobre os bytes.
+    final outerLoop = k.WhileStatement(
+      _dynamicOp(k.VariableGet(iVar), '<', k.VariableGet(nVar)),
+      k.Block([
+        // crc = crc ^ buf[i]
+        k.ExpressionStatement(k.VariableSet(crcVar,
+          _dynamicOp(k.VariableGet(crcVar), '^',
+            k.DynamicInvocation(k.DynamicAccessKind.Dynamic, k.VariableGet(bufParam),
+              k.Name('[]'), k.Arguments([k.VariableGet(iVar)]))))),
+        jVar,          // int j = 0 (re-inicializado a cada byte)
+        innerLoop,
+        k.ExpressionStatement(k.VariableSet(iVar,
+          _dynamicOp(k.VariableGet(iVar), '+', k.IntLiteral(1)))),
+      ]));
+
+    // return crc ^ 0xFFFFFFFF;
+    final ret = k.ReturnStatement(
+      _dynamicOp(k.VariableGet(crcVar), '^', k.IntLiteral(0xFFFFFFFF)));
+
+    _crc32Helper = k.Procedure(
+      k.Name('ita_crc32'),
+      k.ProcedureKind.Method,
+      k.FunctionNode(k.Block([crcVar, iVar, nVar, outerLoop, ret]),
+        positionalParameters: [bufParam],
+        returnType: const k.DynamicType()),
+      isStatic: true,
+      fileUri: _fileUri,
+    );
+    _library.addProcedure(_crc32Helper!);
   }
 
   k.Expression _compileHttpCall(String method, List<k.Expression> args) {
