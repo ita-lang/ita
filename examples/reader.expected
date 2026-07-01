@@ -1,0 +1,16 @@
+=== BytesReader: OOB -> Result (nunca panic, nunca OOB read) ===
+hex: 5249464612345678abcd7f00
+remaining inicial: 12
+magic (RIFF as u32): Result.ok(value: 1380533830)
+remaining: 8
+u32: Result.ok(value: 305419896)
+remaining: 4
+u16: Result.ok(value: 43981)
+remaining: 2
+u8[10]: Result.ok(value: 127)
+u8[11]: Result.ok(value: 0)
+remaining: 0
+OOB readU32BE: Result.err(error: outOfBounds)
+OOB readU8: Result.err(error: outOfBounds)
+remaining apos OOB: 0
+=== Done! ===

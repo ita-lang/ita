@@ -2349,7 +2349,7 @@ class CodeGenerator {
          'Date', 'Duration', 'Csv', 'Url', 'Env',
          'Toml', 'Yaml', 'Xml', 'Json5', 'Ini', 'Markdown', 'Csrf', 'Buffer',
          'Http', 'Ws', 'Net', 'Dns', 'Security', 'Jwt', 'Response',
-         'Channel', 'Broadcast', 'Mailbox', 'Timer', 'Signal', 'Bits'].contains(expr.name)) {
+         'Channel', 'Broadcast', 'Mailbox', 'Timer', 'Signal', 'Bits', 'Bytes'].contains(expr.name)) {
       return k.NullLiteral(); // Placeholder, real call handled in _compileCall
     }
 
@@ -3867,6 +3867,9 @@ class CodeGenerator {
 
       case 'Bits':
         return _compileBitsCall(method, args);
+
+      case 'Bytes':
+        return _compileBytesCall(method, args);
 
       // ==========================================================
       // HTTP + WebSocket MODULE
@@ -6048,6 +6051,123 @@ class CodeGenerator {
   }
 
   // ============================================================
+  // Bytes Module — parsing seguro com cursor stateful (Fase 1C).
+  //
+  // O reader e um objeto Dart mutavel `[buf, pos]` (List de 2 elementos:
+  // o Uint8List e a posicao do cursor). As leituras retornam Result:
+  // avancam o cursor em caso de sucesso; se `pos + N > length` retornam
+  // `Result.err("outOfBounds")` — NUNCA panic, NUNCA leem fora dos limites.
+  // Este e o payoff 🔒: parsear bytes nao-confiaveis nunca crasha; o erro e
+  // valor. (Defesa em profundidade: o ByteData tambem faz bounds-check
+  // nativo, mas o guard explicito converte OOB em err antes de qualquer
+  // acesso.) O erro e String (mesmo idioma de errors.tu: `.err("...")`);
+  // promover para um enum BytesError e evolucao futura.
+  // ============================================================
+
+  k.Expression _compileBytesCall(String method, List<k.Expression> args) {
+    switch (method) {
+      case 'reader':
+        // Bytes.reader(buf) → [buf, 0]  (cursor stateful: [buffer, pos])
+        if (args.isNotEmpty) {
+          return k.ListLiteral([args[0], k.IntLiteral(0)],
+            typeArgument: const k.DynamicType());
+        }
+        return k.NullLiteral();
+
+      case 'remaining':
+        // Bytes.remaining(r) → r[0].length - r[1]
+        if (args.isNotEmpty) {
+          final rd = k.VariableDeclaration('_rd', initializer: args[0],
+            type: const k.DynamicType(), isFinal: true);
+          final bufLen = k.DynamicGet(k.DynamicAccessKind.Dynamic,
+            k.DynamicInvocation(k.DynamicAccessKind.Dynamic, k.VariableGet(rd),
+              k.Name('[]'), k.Arguments([k.IntLiteral(0)])),
+            k.Name('length'));
+          final pos = k.DynamicInvocation(k.DynamicAccessKind.Dynamic,
+            k.VariableGet(rd), k.Name('[]'), k.Arguments([k.IntLiteral(1)]));
+          return k.BlockExpression(k.Block([rd]), _dynamicOp(bufLen, '-', pos));
+        }
+        return k.NullLiteral();
+
+      case 'readU8':
+        // Bytes.readU8(r) → Result<Int>: avanca 1 byte ou .err("outOfBounds")
+        if (args.isNotEmpty) return _compileReaderRead(args[0], 1, 'getUint8');
+        return k.NullLiteral();
+
+      case 'readU16BE':
+        // Bytes.readU16BE(r) → Result<Int>: avanca 2 bytes (big-endian) ou err
+        if (args.isNotEmpty) {
+          return _compileReaderRead(args[0], 2, 'getUint16', bigEndian: true);
+        }
+        return k.NullLiteral();
+
+      case 'readU32BE':
+        // Bytes.readU32BE(r) → Result<Int>: avanca 4 bytes (big-endian) ou err
+        if (args.isNotEmpty) {
+          return _compileReaderRead(args[0], 4, 'getUint32', bigEndian: true);
+        }
+        return k.NullLiteral();
+
+      default:
+        return k.NullLiteral();
+    }
+  }
+
+  /// Lowering comum das leituras do BytesReader. `readerArg` e o cursor
+  /// `[buf, pos]`. Le [nbytes] via `ByteData.<getter>(pos[, Endian])`; se
+  /// `pos + nbytes > buf.length` retorna `Result.err("outOfBounds")` sem
+  /// tocar a memoria; senao avanca o cursor e retorna `Result.ok(value)`.
+  k.Expression _compileReaderRead(k.Expression readerArg, int nbytes,
+      String getter, {bool? bigEndian}) {
+    k.Expression rdIndex(k.VariableDeclaration rd, int i) =>
+      k.DynamicInvocation(k.DynamicAccessKind.Dynamic, k.VariableGet(rd),
+        k.Name('[]'), k.Arguments([k.IntLiteral(i)]));
+
+    final rd = k.VariableDeclaration('_rd', initializer: readerArg,
+      type: const k.DynamicType(), isFinal: true);
+    final buf = k.VariableDeclaration('_rbuf', initializer: rdIndex(rd, 0),
+      type: const k.DynamicType(), isFinal: true);
+    final pos = k.VariableDeclaration('_rpos', initializer: rdIndex(rd, 1),
+      type: const k.DynamicType(), isFinal: true);
+    final out = k.VariableDeclaration('_rout',
+      type: const k.DynamicType(), isFinal: false);
+
+    // Guard: pos + nbytes > buf.length  → OOB.
+    final cond = _dynamicOp(
+      _dynamicOp(k.VariableGet(pos), '+', k.IntLiteral(nbytes)),
+      '>',
+      k.DynamicGet(k.DynamicAccessKind.Dynamic, k.VariableGet(buf), k.Name('length')));
+
+    // Leitura: ByteData.sublistView(buf).<getter>(pos[, Endian]).
+    final getterArgs = bigEndian == null
+      ? k.Arguments([k.VariableGet(pos)])
+      : k.Arguments([k.VariableGet(pos), _endianConst(!bigEndian)]);
+    final readExpr = k.DynamicInvocation(k.DynamicAccessKind.Dynamic,
+      _byteDataOf(k.VariableGet(buf)), k.Name(getter), getterArgs);
+
+    final okExpr = k.ConstructorInvocation(_constructors['Result_ok']!,
+      k.Arguments([], named: [k.NamedExpression('value', readExpr)]));
+    final errExpr = k.ConstructorInvocation(_constructors['Result_err']!,
+      k.Arguments([], named: [k.NamedExpression('error', k.StringLiteral('outOfBounds'))]));
+
+    // Avanco do cursor: rd[1] = pos + nbytes.
+    final advance = k.ExpressionStatement(k.DynamicInvocation(
+      k.DynamicAccessKind.Dynamic, k.VariableGet(rd), k.Name('[]='),
+      k.Arguments([k.IntLiteral(1),
+        _dynamicOp(k.VariableGet(pos), '+', k.IntLiteral(nbytes))])));
+
+    final ifStmt = k.IfStatement(cond,
+      k.ExpressionStatement(k.VariableSet(out, errExpr)),
+      k.Block([
+        k.ExpressionStatement(k.VariableSet(out, okExpr)),
+        advance,
+      ]));
+
+    return k.BlockExpression(
+      k.Block([rd, buf, pos, out, ifStmt]), k.VariableGet(out));
+  }
+
+  // ============================================================
   // CSV Module
   // ============================================================
 
@@ -7036,7 +7156,7 @@ class CodeGenerator {
            'Date', 'Duration', 'Csv', 'Url', 'Env',
            'Toml', 'Yaml', 'Xml', 'Json5', 'Ini', 'Markdown', 'Csrf', 'Buffer',
            'Http', 'Ws', 'Net', 'Dns', 'Security', 'Jwt', 'Response',
-           'Channel', 'Broadcast', 'Mailbox', 'Timer', 'Signal', 'Bits'].contains(ns)) {
+           'Channel', 'Broadcast', 'Mailbox', 'Timer', 'Signal', 'Bits', 'Bytes'].contains(ns)) {
         final args = expr.args.map((a) => _compileExpr(a.value)).toList();
         return _compileStaticNamespaceCall(ns, callee.member, args);
       }
