@@ -6519,50 +6519,129 @@ class CodeGenerator {
     final delimParam = k.VariableDeclaration('delim',
       type: const k.DynamicType(), isFinal: true);
 
-    // Closure params (cada um independente)
-    final lParam = k.VariableDeclaration('l', type: _coreTypes.stringNonNullableRawType, isFinal: true);
-    final lineParam = k.VariableDeclaration('line', type: _coreTypes.stringNonNullableRawType, isFinal: true);
-    final fParam = k.VariableDeclaration('f', type: _coreTypes.stringNonNullableRawType, isFinal: true);
+    // --- idiomas locais (reduzem verbosidade) ---
+    k.Expression vg(k.VariableDeclaration v) => k.VariableGet(v);
+    k.Expression charAt(k.Expression s, k.Expression i) =>
+      k.DynamicInvocation(k.DynamicAccessKind.Dynamic, s, k.Name('[]'), k.Arguments([i]));
+    k.Expression lenOf(k.Expression e) =>
+      k.DynamicGet(k.DynamicAccessKind.Dynamic, e, k.Name('length'));
+    k.Expression eq(k.Expression l, k.Expression r) => k.EqualsCall(l, r,
+      functionType: k.FunctionType([const k.DynamicType()],
+        const k.DynamicType(), k.Nullability.nonNullable),
+      interfaceTarget: _coreTypes.objectEquals);
+    k.Statement addI(k.VariableDeclaration v, int by) => k.ExpressionStatement(
+      k.VariableSet(v, _dynamicOp(k.VariableGet(v), '+', k.IntLiteral(by))));
+    k.Statement setStr(k.VariableDeclaration v, k.Expression e) =>
+      k.ExpressionStatement(k.VariableSet(v, e));
 
-    // (f) => f.replaceAll('"', '').trim()
-    final trimQuotes = k.FunctionExpression(k.FunctionNode(
-      k.ReturnStatement(k.DynamicInvocation(k.DynamicAccessKind.Dynamic,
-        k.DynamicInvocation(k.DynamicAccessKind.Dynamic,
-          k.VariableGet(fParam),
-          k.Name('replaceAll'), k.Arguments([k.StringLiteral('"'), k.StringLiteral('')])),
-        k.Name('trim'), k.Arguments([]))),
-      positionalParameters: [fParam], returnType: const k.DynamicType()));
+    // RFC-4180: maquina de estados char-a-char (NAO split).
+    //   var s = input; if (BOM) s = s.substring(1);
+    //   var rows=[]; var row=[]; var field=""; var inQ=false; var i=0;
+    final sVar = k.VariableDeclaration('_s',
+      initializer: vg(inputParam), type: const k.DynamicType(), isFinal: false);
+    // Strip BOM (U+FEFF) se for o 1o char.
+    final bomIf = k.IfStatement(
+      k.LogicalExpression(
+        _dynamicOp(lenOf(vg(sVar)), '>', k.IntLiteral(0)),
+        k.LogicalExpressionOperator.AND,
+        eq(charAt(vg(sVar), k.IntLiteral(0)), k.StringLiteral('\uFEFF'))),
+      setStr(sVar, k.DynamicInvocation(k.DynamicAccessKind.Dynamic,
+        vg(sVar), k.Name('substring'), k.Arguments([k.IntLiteral(1)]))),
+      null);
+    final nVar = k.VariableDeclaration('_n',
+      initializer: lenOf(vg(sVar)), type: const k.DynamicType(), isFinal: true);
+    final rowsVar = k.VariableDeclaration('_rows',
+      initializer: k.ListLiteral([], typeArgument: const k.DynamicType()),
+      type: const k.DynamicType(), isFinal: true);
+    final rowVar = k.VariableDeclaration('_row',
+      initializer: k.ListLiteral([], typeArgument: const k.DynamicType()),
+      type: const k.DynamicType(), isFinal: false);
+    final fieldVar = k.VariableDeclaration('_field',
+      initializer: k.StringLiteral(''), type: const k.DynamicType(), isFinal: false);
+    final inQVar = k.VariableDeclaration('_inq',
+      initializer: k.BoolLiteral(false), type: const k.DynamicType(), isFinal: false);
+    final iVar = k.VariableDeclaration('_i',
+      initializer: k.IntLiteral(0), type: const k.DynamicType(), isFinal: false);
 
-    // (line) => line.split(delim).map(trimQuotes).toList()
-    final splitLine = k.FunctionExpression(k.FunctionNode(
-      k.ReturnStatement(k.DynamicInvocation(k.DynamicAccessKind.Dynamic,
-        k.DynamicInvocation(k.DynamicAccessKind.Dynamic,
-          k.DynamicInvocation(k.DynamicAccessKind.Dynamic,
-            k.VariableGet(lineParam), k.Name('split'),
-            k.Arguments([k.VariableGet(delimParam)])),
-          k.Name('map'), k.Arguments([trimQuotes])),
-        k.Name('toList'), k.Arguments([]))),
-      positionalParameters: [lineParam], returnType: const k.DynamicType()));
+    final cVar = k.VariableDeclaration('_c',
+      initializer: charAt(vg(sVar), vg(iVar)),
+      type: const k.DynamicType(), isFinal: true);
 
-    // (l) => l.trim().isNotEmpty
-    final notEmpty = k.FunctionExpression(k.FunctionNode(
-      k.ReturnStatement(k.DynamicGet(k.DynamicAccessKind.Dynamic,
-        k.DynamicInvocation(k.DynamicAccessKind.Dynamic,
-          k.VariableGet(lParam), k.Name('trim'), k.Arguments([])),
-        k.Name('isNotEmpty'))),
-      positionalParameters: [lParam], returnType: _coreTypes.boolNonNullableRawType));
+    // field = field + c
+    k.Statement accumChar() =>
+      setStr(fieldVar, _dynamicOp(vg(fieldVar), '+', vg(cVar)));
+    // row.add(field)
+    k.Statement pushField() => k.ExpressionStatement(k.DynamicInvocation(
+      k.DynamicAccessKind.Dynamic, vg(rowVar), k.Name('add'), k.Arguments([vg(fieldVar)])));
+    // rows.add(row)
+    k.Statement pushRow() => k.ExpressionStatement(k.DynamicInvocation(
+      k.DynamicAccessKind.Dynamic, vg(rowsVar), k.Name('add'), k.Arguments([vg(rowVar)])));
+    // field = ""
+    k.Statement clearField() => setStr(fieldVar, k.StringLiteral(''));
+    // row = []
+    k.Statement clearRow() => setStr(rowVar,
+      k.ListLiteral([], typeArgument: const k.DynamicType()));
 
-    // input.split("\n").where(notEmpty).map(splitLine).toList()
-    final body = k.ReturnStatement(
-      k.DynamicInvocation(k.DynamicAccessKind.Dynamic,
-        k.DynamicInvocation(k.DynamicAccessKind.Dynamic,
-          k.DynamicInvocation(k.DynamicAccessKind.Dynamic,
-            k.DynamicInvocation(k.DynamicAccessKind.Dynamic,
-              k.VariableGet(inputParam), k.Name('split'),
-              k.Arguments([k.StringLiteral('\n')])),
-            k.Name('where'), k.Arguments([notEmpty])),
-          k.Name('map'), k.Arguments([splitLine])),
-        k.Name('toList'), k.Arguments([])));
+    // Dentro de aspas.
+    final inQuotesBody = k.IfStatement(
+      eq(vg(cVar), k.StringLiteral('"')),
+      // c == '"': aspa escapada ("") ou fecha aspas
+      k.IfStatement(
+        k.LogicalExpression(
+          _dynamicOp(_dynamicOp(vg(iVar), '+', k.IntLiteral(1)), '<', vg(nVar)),
+          k.LogicalExpressionOperator.AND,
+          eq(charAt(vg(sVar), _dynamicOp(vg(iVar), '+', k.IntLiteral(1))),
+            k.StringLiteral('"'))),
+        // "" → aspa literal, avanca 2
+        k.Block([
+          setStr(fieldVar, _dynamicOp(vg(fieldVar), '+', k.StringLiteral('"'))),
+          addI(iVar, 2),
+        ]),
+        // " sozinho → fecha aspas, avanca 1
+        k.Block([
+          setStr(inQVar, k.BoolLiteral(false)),
+          addI(iVar, 1),
+        ])),
+      // outro char → acumula literal (incl. delim, \n)
+      k.Block([accumChar(), addI(iVar, 1)]));
+
+    // Fora de aspas.
+    final outQuotesBody = k.IfStatement(
+      eq(vg(cVar), k.StringLiteral('"')),
+      // " abre aspas
+      k.Block([setStr(inQVar, k.BoolLiteral(true)), addI(iVar, 1)]),
+      k.IfStatement(
+        eq(vg(cVar), vg(delimParam)),
+        // delim fecha campo
+        k.Block([pushField(), clearField(), addI(iVar, 1)]),
+        k.IfStatement(
+          eq(vg(cVar), k.StringLiteral('\n')),
+          // \n fecha campo + linha
+          k.Block([pushField(), clearField(), pushRow(), clearRow(), addI(iVar, 1)]),
+          k.IfStatement(
+            eq(vg(cVar), k.StringLiteral('\r')),
+            // \r ignorado (CRLF)
+            k.Block([addI(iVar, 1)]),
+            // outro char acumula
+            k.Block([accumChar(), addI(iVar, 1)])))));
+
+    final loop = k.WhileStatement(
+      _dynamicOp(vg(iVar), '<', vg(nVar)),
+      k.Block([cVar, k.IfStatement(vg(inQVar), inQuotesBody, outQuotesBody)]));
+
+    // No fim: fecha ultimo campo/linha se houver conteudo pendente.
+    final flush = k.IfStatement(
+      k.LogicalExpression(
+        _dynamicOp(lenOf(vg(fieldVar)), '>', k.IntLiteral(0)),
+        k.LogicalExpressionOperator.OR,
+        _dynamicOp(lenOf(vg(rowVar)), '>', k.IntLiteral(0))),
+      k.Block([pushField(), pushRow()]),
+      null);
+
+    final body = k.Block([
+      sVar, bomIf, nVar, rowsVar, rowVar, fieldVar, inQVar, iVar,
+      loop, flush, k.ReturnStatement(vg(rowsVar)),
+    ]);
 
     _csvParseFn = k.Procedure(
       k.Name('ita_csvParse'), k.ProcedureKind.Method,
@@ -6574,6 +6653,8 @@ class CodeGenerator {
   }
 
   /// Gera helper: ita_csvStringify(List<List> data, String delim) → String
+  /// RFC-4180: quota campo se contem delim/"/\n/\r ("" escapa aspas dentro).
+  /// Round-trippable com ita_csvParse.
   void _ensureCsvStringifyHelper() {
     if (_csvStringifyFn != null) return;
 
@@ -6582,29 +6663,91 @@ class CodeGenerator {
     final delimParam = k.VariableDeclaration('delim',
       type: const k.DynamicType(), isFinal: true);
 
-    final fParam = k.VariableDeclaration('f', type: const k.DynamicType(), isFinal: true);
-    final rowParam = k.VariableDeclaration('row', type: const k.DynamicType(), isFinal: true);
+    k.Expression vg(k.VariableDeclaration v) => k.VariableGet(v);
+    k.Expression lenOf(k.Expression e) =>
+      k.DynamicGet(k.DynamicAccessKind.Dynamic, e, k.Name('length'));
+    k.Expression idx(k.Expression e, k.Expression i) =>
+      k.DynamicInvocation(k.DynamicAccessKind.Dynamic, e, k.Name('[]'), k.Arguments([i]));
+    k.Expression contains(k.Expression s, k.Expression needle) =>
+      k.DynamicInvocation(k.DynamicAccessKind.Dynamic, s, k.Name('contains'), k.Arguments([needle]));
+    k.Statement addI(k.VariableDeclaration v, int by) => k.ExpressionStatement(
+      k.VariableSet(v, _dynamicOp(k.VariableGet(v), '+', k.IntLiteral(by))));
+    k.Statement setV(k.VariableDeclaration v, k.Expression e) =>
+      k.ExpressionStatement(k.VariableSet(v, e));
 
-    // (f) => f.toString()
-    final toStr = k.FunctionExpression(k.FunctionNode(
-      k.ReturnStatement(k.DynamicInvocation(k.DynamicAccessKind.Dynamic,
-        k.VariableGet(fParam), k.Name('toString'), k.Arguments([]))),
-      positionalParameters: [fParam], returnType: const k.DynamicType()));
+    // var out=""; var ri=0; final rn=data.length;
+    final outVar = k.VariableDeclaration('_out',
+      initializer: k.StringLiteral(''), type: const k.DynamicType(), isFinal: false);
+    final riVar = k.VariableDeclaration('_ri',
+      initializer: k.IntLiteral(0), type: const k.DynamicType(), isFinal: false);
+    final rnVar = k.VariableDeclaration('_rn',
+      initializer: lenOf(vg(dataParam)), type: const k.DynamicType(), isFinal: true);
 
-    // (row) => row.map(toStr).join(delim)
-    final joinRow = k.FunctionExpression(k.FunctionNode(
-      k.ReturnStatement(k.DynamicInvocation(k.DynamicAccessKind.Dynamic,
-        k.DynamicInvocation(k.DynamicAccessKind.Dynamic,
-          k.VariableGet(rowParam), k.Name('map'), k.Arguments([toStr])),
-        k.Name('join'), k.Arguments([k.VariableGet(delimParam)]))),
-      positionalParameters: [rowParam], returnType: const k.DynamicType()));
+    // inner loop vars (por linha)
+    final rowVar = k.VariableDeclaration('_row',
+      initializer: idx(vg(dataParam), vg(riVar)),
+      type: const k.DynamicType(), isFinal: true);
+    final lineVar = k.VariableDeclaration('_line',
+      initializer: k.StringLiteral(''), type: const k.DynamicType(), isFinal: false);
+    final ciVar = k.VariableDeclaration('_ci',
+      initializer: k.IntLiteral(0), type: const k.DynamicType(), isFinal: false);
+    final cnVar = k.VariableDeclaration('_cn',
+      initializer: lenOf(vg(rowVar)), type: const k.DynamicType(), isFinal: true);
+    final sfVar = k.VariableDeclaration('_sf',
+      initializer: k.DynamicInvocation(k.DynamicAccessKind.Dynamic,
+        idx(vg(rowVar), vg(ciVar)), k.Name('toString'), k.Arguments([])),
+      type: const k.DynamicType(), isFinal: false);
 
-    // data.map(joinRow).join("\n")
-    final body = k.ReturnStatement(
-      k.DynamicInvocation(k.DynamicAccessKind.Dynamic,
-        k.DynamicInvocation(k.DynamicAccessKind.Dynamic,
-          k.VariableGet(dataParam), k.Name('map'), k.Arguments([joinRow])),
-        k.Name('join'), k.Arguments([k.StringLiteral('\n')])));
+    // needsQuote = s.contains(delim) || s.contains('"') || s.contains('\n') || s.contains('\r')
+    final needsQuote = k.LogicalExpression(
+      contains(vg(sfVar), vg(delimParam)),
+      k.LogicalExpressionOperator.OR,
+      k.LogicalExpression(
+        contains(vg(sfVar), k.StringLiteral('"')),
+        k.LogicalExpressionOperator.OR,
+        k.LogicalExpression(
+          contains(vg(sfVar), k.StringLiteral('\n')),
+          k.LogicalExpressionOperator.OR,
+          contains(vg(sfVar), k.StringLiteral('\r')))));
+    // s = '"' + s.replaceAll('"','""') + '"'
+    final quoteIf = k.IfStatement(needsQuote,
+      setV(sfVar, k.StringConcatenation([
+        k.StringLiteral('"'),
+        k.DynamicInvocation(k.DynamicAccessKind.Dynamic, vg(sfVar),
+          k.Name('replaceAll'), k.Arguments([k.StringLiteral('"'), k.StringLiteral('""')])),
+        k.StringLiteral('"')])),
+      null);
+
+    final innerLoop = k.WhileStatement(
+      _dynamicOp(vg(ciVar), '<', vg(cnVar)),
+      k.Block([
+        sfVar,
+        quoteIf,
+        // line = line + s
+        setV(lineVar, k.StringConcatenation([vg(lineVar), vg(sfVar)])),
+        // if (ci + 1 < cn) line = line + delim
+        k.IfStatement(
+          _dynamicOp(_dynamicOp(vg(ciVar), '+', k.IntLiteral(1)), '<', vg(cnVar)),
+          setV(lineVar, k.StringConcatenation([vg(lineVar), vg(delimParam)])),
+          null),
+        addI(ciVar, 1),
+      ]));
+
+    final outerLoop = k.WhileStatement(
+      _dynamicOp(vg(riVar), '<', vg(rnVar)),
+      k.Block([
+        rowVar, lineVar, ciVar, cnVar, innerLoop,
+        // out = out + line
+        setV(outVar, k.StringConcatenation([vg(outVar), vg(lineVar)])),
+        // if (ri + 1 < rn) out = out + "\n"
+        k.IfStatement(
+          _dynamicOp(_dynamicOp(vg(riVar), '+', k.IntLiteral(1)), '<', vg(rnVar)),
+          setV(outVar, k.StringConcatenation([vg(outVar), k.StringLiteral('\n')])),
+          null),
+        addI(riVar, 1),
+      ]));
+
+    final body = k.Block([outVar, riVar, rnVar, outerLoop, k.ReturnStatement(vg(outVar))]);
 
     _csvStringifyFn = k.Procedure(
       k.Name('ita_csvStringify'), k.ProcedureKind.Method,
