@@ -172,6 +172,7 @@ class CodeGenerator {
   late k.Procedure _processRunSync;
   late k.Procedure _jsonEncode;
   late k.Procedure _jsonDecode;
+  late k.Constructor _jsonEncoderWithIndent;
   late k.Class _regExpClass;
   late k.Procedure _stdoutGetter;
   late k.Procedure _stderrGetter;
@@ -507,6 +508,8 @@ class CodeGenerator {
       (lib) => lib.importUri.toString() == 'dart:convert');
     _jsonEncode = dartConvert.procedures.firstWhere((p) => p.name.text == 'jsonEncode');
     _jsonDecode = dartConvert.procedures.firstWhere((p) => p.name.text == 'jsonDecode');
+    _jsonEncoderWithIndent = dartConvert.classes.firstWhere((c) => c.name == 'JsonEncoder')
+      .constructors.firstWhere((c) => c.name.text == 'withIndent');
 
     // dart:core RegExp
     _regExpClass = dartCore.classes.firstWhere((c) => c.name == 'RegExp');
@@ -3586,9 +3589,44 @@ class CodeGenerator {
       case 'Json':
         switch (method) {
           case 'parse':
-            return k.StaticInvocation(_jsonDecode, k.Arguments(args));
+            return k.StaticInvocation(_jsonDecode,
+              k.Arguments([args.isNotEmpty ? args[0] : k.NullLiteral()]));
           case 'stringify':
-            return k.StaticInvocation(_jsonEncode, k.Arguments(args));
+            // Json.stringify(x[, pretty]). pretty==true → indentado; senao compacto.
+            if (args.length > 1) {
+              return k.ConditionalExpression(
+                k.EqualsCall(args[1], k.BoolLiteral(true),
+                  functionType: k.FunctionType([const k.DynamicType()],
+                    const k.DynamicType(), k.Nullability.nonNullable),
+                  interfaceTarget: _coreTypes.objectEquals),
+                // JsonEncoder.withIndent('  ').convert(x)
+                k.DynamicInvocation(k.DynamicAccessKind.Dynamic,
+                  k.ConstructorInvocation(_jsonEncoderWithIndent,
+                    k.Arguments([k.StringLiteral('  ')])),
+                  k.Name('convert'), k.Arguments([args[0]])),
+                k.StaticInvocation(_jsonEncode, k.Arguments([args[0]])),
+                const k.DynamicType());
+            }
+            return k.StaticInvocation(_jsonEncode,
+              k.Arguments([args.isNotEmpty ? args[0] : k.NullLiteral()]));
+          case 'parseFile':
+            // Json.parseFile(path) → jsonDecode(File(path).readAsStringSync())
+            if (args.isNotEmpty) {
+              return k.StaticInvocation(_jsonDecode, k.Arguments([
+                k.DynamicInvocation(k.DynamicAccessKind.Dynamic,
+                  k.StaticInvocation(_fileFactory, k.Arguments([args[0]])),
+                  k.Name('readAsStringSync'), k.Arguments([]))]));
+            }
+            return k.NullLiteral();
+          case 'writeFile':
+            // Json.writeFile(path, x) → File(path).writeAsStringSync(jsonEncode(x))
+            if (args.length >= 2) {
+              return k.DynamicInvocation(k.DynamicAccessKind.Dynamic,
+                k.StaticInvocation(_fileFactory, k.Arguments([args[0]])),
+                k.Name('writeAsStringSync'),
+                k.Arguments([k.StaticInvocation(_jsonEncode, k.Arguments([args[1]]))]));
+            }
+            return k.NullLiteral();
         }
 
       case 'Terminal':
@@ -5238,7 +5276,14 @@ class CodeGenerator {
     // [text](url) → <a href="url">text</a>
     // \n → <br>
     final reFactory = _regExpClass.procedures.firstWhere((p) => p.isFactory && p.name.text == '');
-    k.Expression result = input;
+
+    // FIX XSS: escapa HTML do input ANTES das regras markdown. `&` primeiro
+    // (senao `&lt;`/`&gt;` seriam duplo-escapados). Assim <script> do usuario
+    // vira &lt;script&gt;; as tags que as regras INSEREM (geradas depois) sao reais.
+    k.Expression esc(k.Expression e, String from, String to) =>
+      k.DynamicInvocation(k.DynamicAccessKind.Dynamic, e, k.Name('replaceAll'),
+        k.Arguments([k.StringLiteral(from), k.StringLiteral(to)]));
+    k.Expression result = esc(esc(esc(input, '&', '&amp;'), '<', '&lt;'), '>', '&gt;');
 
     // replaceAllMapped com closures que extraem group(1)
     for (final (pattern, prefix, suffix, groupIdx) in <(String, String, String, int)>[
@@ -5265,6 +5310,30 @@ class CodeGenerator {
           k.StaticInvocation(reFactory, k.Arguments([k.StringLiteral(pattern)])),
           replacer]));
     }
+
+    // [text](url) → <a href="url">text</a>  (group(2)=url, group(1)=text)
+    final linkParam = k.VariableDeclaration('m', type: const k.DynamicType(), isFinal: true);
+    final linkReplacer = k.FunctionExpression(k.FunctionNode(
+      k.ReturnStatement(k.StringConcatenation([
+        k.StringLiteral('<a href="'),
+        k.DynamicInvocation(k.DynamicAccessKind.Dynamic,
+          k.VariableGet(linkParam), k.Name('group'), k.Arguments([k.IntLiteral(2)])),
+        k.StringLiteral('">'),
+        k.DynamicInvocation(k.DynamicAccessKind.Dynamic,
+          k.VariableGet(linkParam), k.Name('group'), k.Arguments([k.IntLiteral(1)])),
+        k.StringLiteral('</a>')])),
+      positionalParameters: [linkParam],
+      returnType: _coreTypes.stringNonNullableRawType));
+    result = k.DynamicInvocation(k.DynamicAccessKind.Dynamic,
+      result, k.Name('replaceAllMapped'),
+      k.Arguments([
+        k.StaticInvocation(reFactory, k.Arguments([k.StringLiteral(r'\[([^\]]+)\]\(([^)]+)\)')])),
+        linkReplacer]));
+
+    // \n → <br>
+    result = k.DynamicInvocation(k.DynamicAccessKind.Dynamic,
+      result, k.Name('replaceAll'),
+      k.Arguments([k.StringLiteral('\n'), k.StringLiteral('<br>')]));
 
     return result;
   }
