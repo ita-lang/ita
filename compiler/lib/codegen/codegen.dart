@@ -117,6 +117,11 @@ class CodeGenerator {
   late k.Component _component;
   late k.Library _library;
   late CoreTypes _coreTypes;
+  // Plataforma carregada uma unica vez. O _component COMPARTILHA seu canonical
+  // -name root (_platform.root), de modo que libs runtime-lib (ex: o parser
+  // TOML de compiler/lib/toml/toml.dart) mergeadas na plataforma resolvem suas
+  // refs a dart:core contra nos AST ja bound — condicao pra serializar o .dill.
+  late k.Component _platform;
 
   // Referências da plataforma
   late k.Procedure _printProcedure;
@@ -357,7 +362,8 @@ class CodeGenerator {
   // ============================================================
 
   void _initPlatform() {
-    final platform = k.loadComponentFromBinary(platformPath);
+    _platform = k.loadComponentFromBinary(platformPath);
+    final platform = _platform;
     final dartCore = platform.libraries.firstWhere(
       (lib) => lib.importUri.toString() == 'dart:core',
     );
@@ -521,14 +527,18 @@ class CodeGenerator {
   }
 
   void _initComponent() {
-    _component = k.Component();
+    // Compartilha o canonical-name root da plataforma (ver _platform). Isso
+    // mantem _library, plataforma e qualquer runtime-lib mergeada num unico
+    // universo de canonical names, sem conflito de rebind. O .dill de saida
+    // ainda serializa apenas _component.libraries (a plataforma fica de fora,
+    // injetada pelo VM via --dfe em runtime).
+    _component = k.Component(nameRoot: _platform.root);
     _library = k.Library(_libUri, fileUri: _fileUri);
     _component.libraries.add(_library);
     _library.parent = _component;
 
-    // Adicionar dependências necessárias
-    final platform = k.loadComponentFromBinary(platformPath);
-    final dartIsolateLib = platform.libraries.firstWhere(
+    // Adicionar dependências necessárias (reusa a plataforma ja carregada)
+    final dartIsolateLib = _platform.libraries.firstWhere(
       (lib) => lib.importUri.toString() == 'dart:isolate',
     );
     _library.addDependency(k.LibraryDependency.import(dartIsolateLib));
@@ -4198,6 +4208,11 @@ class CodeGenerator {
   final Map<String, k.Procedure?> _formatParsers = {};
   final Map<String, k.Procedure?> _formatStringifiers = {};
 
+  // RUNTIME-LIB (TOML): procedure `parseToml` da lib toml.dart, ja mergeada no
+  // Component. Null enquanto nao resolvido; _tomlRuntimeTried evita retentar.
+  k.Procedure? _tomlRuntimeParse;
+  bool _tomlRuntimeTried = false;
+
   k.Expression _compileFormatCall(String format, String method, List<k.Expression> args) {
     switch (method) {
       case 'parse':
@@ -4255,6 +4270,17 @@ class CodeGenerator {
   void _ensureFormatParser(String format) {
     if (_formatParsers.containsKey(format)) return;
 
+    // RUNTIME-LIB: Toml.parse usa o parser robusto (parseToml, TOML 1.0
+    // completo) linkado no Component, e nao o sintetizado _buildTomlParser
+    // (~37%). Se a runtime-lib nao estiver disponivel, cai no legacy abaixo.
+    if (format == 'toml') {
+      final rt = _ensureTomlRuntimeParser();
+      if (rt != null) {
+        _formatParsers['toml'] = rt;
+        return;
+      }
+    }
+
     final inputParam = k.VariableDeclaration('input',
       type: _coreTypes.stringNonNullableRawType, isFinal: true);
     final lParam = k.VariableDeclaration('l', type: _coreTypes.stringNonNullableRawType, isFinal: true);
@@ -4290,6 +4316,158 @@ class CodeGenerator {
       isStatic: true, fileUri: _fileUri);
     _library.addProcedure(proc);
     _formatParsers[format] = proc;
+  }
+
+  // ============================================================
+  // RUNTIME-LIB — parser TOML robusto linkado no Component
+  // ============================================================
+  // Em vez de sintetizar TOML no codegen (_buildTomlParser, ~37% do TOML 1.0),
+  // compilamos o parser real (compiler/lib/toml/toml.dart, `parseToml`, TOML
+  // 1.0 completo: inline tables, arrays-of-tables, datetimes, dotted keys...)
+  // para um Kernel `.dill`, mergeamos sua Library no Component de saida e
+  // fazemos Toml.parse(x) -> StaticInvocation(parseToml, [x]).
+  //
+  // Mecanica do merge (o "muro" resolvido): a lib do toml.dart referencia
+  // dart:core. Pra serializar essas refs, elas precisam estar bound a nos AST.
+  // Carregamos a runtime-lib DENTRO de _platform (loadComponentFromBinary com
+  // component alvo) — assim suas refs a dart:core resolvem contra a plataforma
+  // ja carregada — e movemos a Library pro _component, que compartilha o mesmo
+  // canonical-name root (_platform.root). O .dill final serializa so a lib do
+  // toml (a plataforma fica de fora, injetada pelo VM via --dfe).
+
+  /// Resolve/mergeia o `parseToml` da runtime-lib. Retorna o Procedure pronto
+  /// pra StaticInvocation, ou null se indisponivel (dai o codegen usa o parser
+  /// sintetizado legacy como fallback — sem regressao).
+  k.Procedure? _ensureTomlRuntimeParser() {
+    if (_tomlRuntimeParse != null) return _tomlRuntimeParse;
+    if (_tomlRuntimeTried) return null;
+    _tomlRuntimeTried = true;
+    // Kill-switch de debug: forca o parser sintetizado legacy.
+    if ((Platform.environment['ITA_DISABLE_TOML_RUNTIME'] ?? '').isNotEmpty) {
+      return null;
+    }
+    try {
+      final dill = _resolveTomlRuntimeDill();
+      if (dill == null) return null;
+
+      // Mergeia a runtime-lib na plataforma (bind das refs a dart:core).
+      k.loadComponentFromBinary(dill, _platform);
+
+      k.Library? tomlLib;
+      for (final lib in _platform.libraries) {
+        final uri = lib.importUri.toString();
+        if (uri.endsWith('/toml/toml.dart') || uri.endsWith('toml.dart')) {
+          // A lib do parser tem `parseToml`; ignora o wrapper (rt_entry.dart).
+          for (final p in lib.procedures) {
+            if (p.name.text == 'parseToml') { tomlLib = lib; break; }
+          }
+          if (tomlLib != null) break;
+        }
+      }
+      if (tomlLib == null) return null;
+
+      // Move a Library da plataforma para o Component de saida (root shared).
+      _platform.libraries.remove(tomlLib);
+      tomlLib.parent = _component;
+      _component.libraries.add(tomlLib);
+      final src = _platform.uriToSource[tomlLib.fileUri];
+      if (src != null) _component.uriToSource[tomlLib.fileUri] = src;
+
+      for (final p in tomlLib.procedures) {
+        if (p.name.text == 'parseToml') { _tomlRuntimeParse = p; break; }
+      }
+      return _tomlRuntimeParse;
+    } catch (_) {
+      // Qualquer falha (SDK ausente, gen_kernel, merge) -> fallback legacy.
+      return null;
+    }
+  }
+
+  /// Caminho do `toml.runtime.dill` (regenera on-demand se ausente/desatualizado).
+  /// Override explicito via env ITA_TOML_RUNTIME_DILL.
+  String? _resolveTomlRuntimeDill() {
+    final override = Platform.environment['ITA_TOML_RUNTIME_DILL'] ?? '';
+    if (override.isNotEmpty && File(override).existsSync()) return override;
+
+    final libDir = _compilerLibDir();
+    if (libDir == null) return null;
+    final tomlSrc = '$libDir/toml/toml.dart';
+    final dillPath = '$libDir/toml/toml.runtime.dill';
+    final dillF = File(dillPath);
+    final srcF = File(tomlSrc);
+    if (!srcF.existsSync()) return dillF.existsSync() ? dillPath : null;
+
+    final fresh = dillF.existsSync() &&
+        dillF.lastModifiedSync().isAfter(srcF.lastModifiedSync());
+    if (fresh) return dillPath;
+
+    if (_generateTomlRuntimeDill(tomlSrc, dillPath)) return dillPath;
+    return dillF.existsSync() ? dillPath : null; // stale, mas usavel
+  }
+
+  /// Localiza `compiler/lib` subindo a partir do script de entrada (itac.dart /
+  /// test_runner.dart). Override via env ITA_COMPILER_LIB.
+  String? _compilerLibDir() {
+    final override = Platform.environment['ITA_COMPILER_LIB'] ?? '';
+    if (override.isNotEmpty && File('$override/toml/toml.dart').existsSync()) {
+      return override;
+    }
+    Directory dir;
+    try {
+      dir = File.fromUri(Platform.script).parent;
+    } catch (_) {
+      return null;
+    }
+    for (var i = 0; i < 10; i++) {
+      if (File('${dir.path}/lib/toml/toml.dart').existsSync()) {
+        return '${dir.path}/lib';
+      }
+      final parent = dir.parent;
+      if (parent.path == dir.path) break;
+      dir = parent;
+    }
+    return null;
+  }
+
+  /// Regenera o toml.runtime.dill via gen_kernel (mesmo mecanismo do
+  /// compiler/tool/gen_toml_runtime.sh). gen_kernel exige um `main`, entao
+  /// escreve um wrapper efemero que importa toml.dart. `--no-link-platform`
+  /// mantem o .dill sem a plataforma. Retorna true em sucesso.
+  bool _generateTomlRuntimeDill(String tomlSrc, String dillPath) {
+    try {
+      final platFile = File(platformPath);
+      final platDir = platFile.parent;              // .../ReleaseARM64
+      final dartBin = (Platform.environment['ITA_DART_BIN'] ?? '').isNotEmpty
+          ? Platform.environment['ITA_DART_BIN']!
+          : '${platDir.path}/dart';
+      final sdkDir = platDir.parent.parent;          // .../sdk
+      final genKernel = '${sdkDir.path}/pkg/vm/bin/gen_kernel.dart';
+      final pkgs = (Platform.environment['ITA_PACKAGES'] ?? '').isNotEmpty
+          ? Platform.environment['ITA_PACKAGES']!
+          : '${sdkDir.path}/.dart_tool/package_config.json';
+      if (!File(genKernel).existsSync() || !File(dartBin).existsSync()) {
+        return false;
+      }
+      final tmp = Directory.systemTemp.createTempSync('ita_toml_rt');
+      try {
+        final wrapper = File('${tmp.path}/rt_entry.dart');
+        wrapper.writeAsStringSync(
+          "import '${Uri.file(tomlSrc)}';\nvoid main() { parseToml; }\n");
+        final res = Process.runSync(dartBin, [
+          if (pkgs.isNotEmpty) '--packages=$pkgs',
+          genKernel,
+          '--platform', platformPath,
+          '--no-link-platform',
+          '-o', dillPath,
+          wrapper.path,
+        ]);
+        return res.exitCode == 0 && File(dillPath).existsSync();
+      } finally {
+        try { tmp.deleteSync(recursive: true); } catch (_) {}
+      }
+    } catch (_) {
+      return false;
+    }
   }
 
   void _ensureFormatStringifier(String format) {

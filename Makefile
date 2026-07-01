@@ -26,9 +26,18 @@ build:
 test:
 	@$(DART_BIN) --packages=$(PACKAGES) compiler/test/test_runner.dart
 
+# Regenerar o RUNTIME-LIB do parser TOML robusto (compiler/lib/toml/toml.dart
+# -> compiler/lib/toml/toml.runtime.dill). O codegen linka essa lib e faz
+# Toml.parse() usar parseToml (TOML 1.0 completo) no lugar do parser sintetizado.
+# O codegen tambem gera sob demanda (lazy); este target e o caminho manual.
+runtime:
+	@ITA_DART_BIN=$(DART_BIN) ITA_PLATFORM_DILL=$(PLATFORM_DILL) ITA_PACKAGES=$(PACKAGES) \
+		bash compiler/tool/gen_toml_runtime.sh
+
 # Limpar artefatos
 clean:
 	@rm -rf $(BUILD_DIR)
+	@rm -f compiler/lib/toml/toml.runtime.dill
 	@echo "Build limpo."
 
-.PHONY: run build test clean
+.PHONY: run build test runtime clean
