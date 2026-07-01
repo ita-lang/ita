@@ -5554,28 +5554,48 @@ class CodeGenerator {
       initializer: k.DynamicGet(k.DynamicAccessKind.Dynamic,
         k.VariableGet(respVar), k.Name('statusCode')),
       type: const k.DynamicType(), isFinal: true);
-    // final _by = await _resp.expand((c) => c).toList()   (bytes, 1x)
-    final cParam = k.VariableDeclaration('c',
-      type: const k.DynamicType(), isFinal: true);
-    final identityFn = k.FunctionExpression(k.FunctionNode(
-      k.ReturnStatement(k.VariableGet(cParam)),
-      positionalParameters: [cParam], returnType: const k.DynamicType()));
-    final bytesVar = k.VariableDeclaration('_by',
+    // Le o corpo SEM higher-order tipado. `Stream<List<int>>.expand`/`.fold`
+    // exigem uma closure `(List<int>) => Iterable`/etc; nossa lambda dinamica
+    // `(dynamic) => dynamic` falha o runtime subtype-check (retorno `dynamic`
+    // nao e subtipo de `Iterable`) → caia no catch e mascarava o happy path.
+    // Idioma robusto (mesmo loop de Buffer.from, zero closure):
+    //   final _chunks = await _resp.toList();   // List<List<int>>
+    //   final _acc = <int>[];                    // List<int> (p/ Uint8List)
+    //   var _ci = 0;
+    //   while (_ci < _chunks.length) { _acc.addAll(_chunks[_ci]); _ci += 1; }
+    final chunksVar = k.VariableDeclaration('_chunks',
       initializer: k.AwaitExpression(k.DynamicInvocation(
-        k.DynamicAccessKind.Dynamic,
-        k.DynamicInvocation(k.DynamicAccessKind.Dynamic, k.VariableGet(respVar),
-          k.Name('expand'), k.Arguments([identityFn])),
+        k.DynamicAccessKind.Dynamic, k.VariableGet(respVar),
         k.Name('toList'), k.Arguments([]))),
       type: const k.DynamicType(), isFinal: true);
+    final accVar = k.VariableDeclaration('_acc',
+      initializer: k.ListLiteral([], typeArgument: _coreTypes.intNonNullableRawType),
+      type: const k.DynamicType(), isFinal: true);
+    final ciVar = k.VariableDeclaration('_ci',
+      initializer: k.IntLiteral(0), type: const k.DynamicType(), isFinal: false);
+    final chunkLoop = k.WhileStatement(
+      k.DynamicInvocation(k.DynamicAccessKind.Dynamic, k.VariableGet(ciVar),
+        k.Name('<'), k.Arguments([k.DynamicGet(k.DynamicAccessKind.Dynamic,
+          k.VariableGet(chunksVar), k.Name('length'))])),
+      k.Block([
+        k.ExpressionStatement(k.DynamicInvocation(k.DynamicAccessKind.Dynamic,
+          k.VariableGet(accVar), k.Name('addAll'),
+          k.Arguments([k.DynamicInvocation(k.DynamicAccessKind.Dynamic,
+            k.VariableGet(chunksVar), k.Name('[]'),
+            k.Arguments([k.VariableGet(ciVar)]))]))),
+        k.ExpressionStatement(k.VariableSet(ciVar,
+          k.DynamicInvocation(k.DynamicAccessKind.Dynamic, k.VariableGet(ciVar),
+            k.Name('+'), k.Arguments([k.IntLiteral(1)])))),
+      ]));
     // _c.close()
     final closeClient = k.ExpressionStatement(k.DynamicInvocation(
       k.DynamicAccessKind.Dynamic, k.VariableGet(clientVar),
       k.Name('close'), k.Arguments([])));
 
-    // return Result.ok(value: [_st, Uint8List.fromList(_by)])
+    // return Result.ok(value: [_st, Uint8List.fromList(_acc)])
     final response = k.ListLiteral([
       k.VariableGet(statusVar),
-      k.StaticInvocation(_uint8ListFromList, k.Arguments([k.VariableGet(bytesVar)])),
+      k.StaticInvocation(_uint8ListFromList, k.Arguments([k.VariableGet(accVar)])),
     ], typeArgument: const k.DynamicType());
     final returnOk = k.ReturnStatement(k.ConstructorInvocation(
       _constructors['Result_ok']!,
@@ -5583,7 +5603,7 @@ class CodeGenerator {
 
     final tryBody = k.Block([
       clientVar, setTimeout, reqVar, noRedirect, respVar, statusVar,
-      bytesVar, closeClient, returnOk,
+      chunksVar, accVar, ciVar, chunkLoop, closeClient, returnOk,
     ]);
 
     // catch (_e) → return Result.err(error: _e.toString())  (nunca panic)
