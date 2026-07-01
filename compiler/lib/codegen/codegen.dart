@@ -6277,10 +6277,24 @@ class CodeGenerator {
         }
         return k.NullLiteral();
 
+      case 'readU16LE':
+        // Bytes.readU16LE(r) → Result<Int>: avanca 2 bytes (little-endian) ou err
+        if (args.isNotEmpty) {
+          return _compileReaderRead(args[0], 2, 'getUint16', bigEndian: false);
+        }
+        return k.NullLiteral();
+
       case 'readU32BE':
         // Bytes.readU32BE(r) → Result<Int>: avanca 4 bytes (big-endian) ou err
         if (args.isNotEmpty) {
           return _compileReaderRead(args[0], 4, 'getUint32', bigEndian: true);
+        }
+        return k.NullLiteral();
+
+      case 'readU32LE':
+        // Bytes.readU32LE(r) → Result<Int>: avanca 4 bytes (little-endian) ou err
+        if (args.isNotEmpty) {
+          return _compileReaderRead(args[0], 4, 'getUint32', bigEndian: false);
         }
         return k.NullLiteral();
 
