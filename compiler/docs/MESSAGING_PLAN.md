@@ -1,4 +1,16 @@
-# Glu Messaging Primitives — Implementation Plan
+# Itá Messaging Primitives — Implementation Plan
+
+## Status real (verificado 2026-06-30)
+
+> As 3 primitivas existem com o **núcleo** (create/send/receive), mas mapeiam para **`ReceivePort`/`SendPort` (cross-isolate)** — não `StreamController` como diz o "Dart mapping" abaixo — e **as semânticas distintivas** (buffer/backpressure, topics, capacidade) **não foram implementadas**.
+
+| Primitiva | Núcleo | Faltando (⬜) |
+|---|---|---|
+| **Channel** | ✅ `create/send/receive/listen/close/port` | `Channel.buffered(N)` (bounded/backpressure); API é estática (`Channel.send(port,msg)`), não a tupla `(sender, receiver)` |
+| **Broadcast** | ✅ `create/publish/subscribe/close` (broker isolate fan-out) | filtro por **topic** (`subscribe("orders", fn)`); `sub.cancel()` 🚧 (herdado do `.listen`) |
+| **Mailbox** | ✅ `create/put/take/listen/close` | **capacidade** (`create(1000)` ignora o arg → sem bound/backpressure), `size/isEmpty/isFull`, `drain()` |
+
+---
 
 ## Filosofia
 
@@ -10,7 +22,7 @@
 
 Canal tipado unidirecional. Um sender, um receiver. Backpressure nativo.
 
-```glu
+```tu
 // Criar canal
 let (sender, receiver) = Channel.create()
 
@@ -40,7 +52,7 @@ for await msg in receiver {
 
 Canal que replica mensagem pra todos os subscribers.
 
-```glu
+```tu
 // Criar broadcast
 let bus = Broadcast.create()
 
@@ -68,7 +80,7 @@ sub.cancel()
 
 Fila bounded FIFO. N producers, 1 consumer. Quando cheia, producers bloqueiam.
 
-```glu
+```tu
 // Criar mailbox com capacidade
 let box = Mailbox.create(1000)  // max 1000 msgs
 

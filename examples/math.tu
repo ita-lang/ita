@@ -1,4 +1,4 @@
-// math.glu — módulo de matemática
+// math.tu — módulo de matemática
 
 pub fn add(a: Int, b: Int) -> Int => a + b
 

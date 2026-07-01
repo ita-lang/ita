@@ -55,5 +55,19 @@ async fn main() {
   Mailbox.put(boxPort, "job-A")
   Mailbox.put(boxPort, "job-B")
 
+  // Mensagens são entregues de forma assíncrona pelo event loop;
+  // dá um tempo pra elas chegarem antes de encerrar.
+  await Timer.delay(200)
+
+  // Teardown — fecha as portas/broker que possuímos.
+  Channel.close(ch)
+  Mailbox.close(box)
+  Broadcast.close(bus)
+
   print("=== Done! ===")
+
+  // exit() explícito: Broadcast.subscribe abre ReceivePorts internos no main
+  // isolate que não são expostos pra fechar. Sem isso, uma porta aberta mantém
+  // a VM viva e o programa nunca encerra (não é deadlock — é falta de teardown).
+  exit(0)
 }

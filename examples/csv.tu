@@ -32,15 +32,15 @@ fn main() {
   print("=== CSV File I/O ===")
 
   // Escrever CSV
-  Csv.writeFile("/tmp/glu_test.csv", table)
+  Csv.writeFile("/tmp/ita_test.csv", table)
 
   // Ler de volta
-  let loaded = Csv.parseFile("/tmp/glu_test.csv")
+  let loaded = Csv.parseFile("/tmp/ita_test.csv")
   print("loaded:")
   for row in loaded {
     print(row)
   }
-  File.delete("/tmp/glu_test.csv")
+  File.delete("/tmp/ita_test.csv")
 
   print("=== CSV com aspas ===")
 

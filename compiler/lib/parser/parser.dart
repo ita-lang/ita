@@ -243,6 +243,7 @@ class Parser {
         methods.add(_fnDecl(pub));
       } else {
         fields.add(_fieldDecl());
+        _match(TokenType.comma); // separador opcional: permite campos inline (x: Int, y: Int)
       }
     }
 
@@ -1422,7 +1423,8 @@ class Parser {
       // () => ... é closure
       if (_check(TokenType.rparen)) {
         _advance();
-        return _check(TokenType.fatArrow) || _check(TokenType.arrow) || _check(TokenType.lbrace);
+        return _check(TokenType.fatArrow) || _check(TokenType.arrow) ||
+        (!_noTrailingClosure && _check(TokenType.lbrace));
       }
 
       // Tenta parsear params
@@ -1436,7 +1438,8 @@ class Parser {
       _advance(); // consume closing )
 
       // Depois do ) vem -> Type { ou => ou {
-      return _check(TokenType.fatArrow) || _check(TokenType.arrow) || _check(TokenType.lbrace);
+      return _check(TokenType.fatArrow) || _check(TokenType.arrow) ||
+        (!_noTrailingClosure && _check(TokenType.lbrace));
     } finally {
       _current = saved;
     }
@@ -1493,7 +1496,12 @@ class Parser {
 
   MatchExpr _matchExpr() {
     final token = _consume(TokenType.kwMatch, 'Expected "match"');
+    // Desabilita trailing-closure ao parsear o subject, senão "match f(x) {"
+    // lê o "{" dos arms como trailing closure de f(x).
+    final prevNoTC = _noTrailingClosure;
+    _noTrailingClosure = true;
     final subject = _expression();
+    _noTrailingClosure = prevNoTC;
     _consume(TokenType.lbrace, 'Expected "{"');
 
     final arms = <MatchArm>[];

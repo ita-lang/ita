@@ -38,9 +38,9 @@ fn main() {
 
   print("=== Glob ===")
 
-  let gluFiles = glob("examples/*.glu")
-  print("found glu files:")
-  for f in gluFiles {
+  let tuFiles = glob("examples/*.tu")
+  print("found tu files:")
+  for f in tuFiles {
     print("  ${f}")
   }
 
@@ -53,12 +53,12 @@ fn main() {
 
   // Escrever JSON em arquivo
   let config = Json.stringify([1, 2, 3])
-  File.write("/tmp/glu_config.json", config)
+  File.write("/tmp/ita_config.json", config)
 
   // Ler de volta
-  let loaded = Json.parse(File.read("/tmp/glu_config.json"))
+  let loaded = Json.parse(File.read("/tmp/ita_config.json"))
   print("loaded config: ${loaded}")
-  File.delete("/tmp/glu_config.json")
+  File.delete("/tmp/ita_config.json")
 
   print("=== Done! ===")
 }

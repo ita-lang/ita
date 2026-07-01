@@ -30,10 +30,10 @@ fn main() {
 
   print("=== File round-trip ===")
   // TOML file
-  File.write("/tmp/glu_test.toml", "[server]\nhost = \"localhost\"\nport = 8080")
-  let config = Toml.parseFile("/tmp/glu_test.toml")
+  File.write("/tmp/ita_test.toml", "[server]\nhost = \"localhost\"\nport = 8080")
+  let config = Toml.parseFile("/tmp/ita_test.toml")
   print("toml file: ${config}")
-  File.delete("/tmp/glu_test.toml")
+  File.delete("/tmp/ita_test.toml")
 
   print("=== Done! ===")
 }

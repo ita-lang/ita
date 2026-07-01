@@ -13,7 +13,7 @@ fn main() {
 
   print("=== Http.post ===")
 
-  let postResult = Http.post("https://httpbin.org/post", "{\"name\":\"Glu\"}")
+  let postResult = Http.post("https://httpbin.org/post", "{\"name\":\"Itá\"}")
   print("post length: ${postResult}")
 
   print("=== Http.head ===")
@@ -23,11 +23,11 @@ fn main() {
 
   print("=== Http.download ===")
 
-  let dl = Http.download("https://httpbin.org/robots.txt", "/tmp/glu_dl.txt")
+  let dl = Http.download("https://httpbin.org/robots.txt", "/tmp/ita_dl.txt")
   print("download: ${dl}")
-  let content = File.read("/tmp/glu_dl.txt")
+  let content = File.read("/tmp/ita_dl.txt")
   print("downloaded: ${content}")
-  File.delete("/tmp/glu_dl.txt")
+  File.delete("/tmp/ita_dl.txt")
 
   print("=== Done! ===")
 }

@@ -1,0 +1,20 @@
+=== Fix: for-in em async fn ===
+10
+20
+30
+=== Fix: retorno implícito com .ok() ===
+Point(x: 1.0, y: 2.0)
+=== Fix: named params ===
+Connected to localhost:3000
+Connected to example.com:8080
+=== Fix: if expression ===
+positive
+non-positive
+=== Fix: copy-with ===
+Point(x: 99.0, y: 2.0)
+Point(x: 1.0, y: 77.0)
+=== Fix: for range ===
+i=0
+i=1
+i=2
+=== Done! ===

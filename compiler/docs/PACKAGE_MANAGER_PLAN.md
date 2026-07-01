@@ -1,10 +1,10 @@
-# Glu Package Manager — Implementation Plan
+# Itá Package Manager — Implementation Plan
 
 ## Filosofia
 
 - **TOML** como formato de configuração (não JSON, não YAML)
 - **Zero node_modules** — dependências em cache central do sistema
-- **Simples** — `gluc init`, `gluc install`, `gluc run`
+- **Simples** — `itac init`, `itac install`, `itac run`
 - **Sem lock file hell** — versões exatas no `ita.toml`
 
 ---
@@ -15,7 +15,7 @@
 [project]
 name = "my-app"
 version = "0.1.0"
-description = "My Glu application"
+description = "My Itá application"
 entry = "src/main.tu"
 
 [dependencies]
@@ -50,32 +50,34 @@ my-app/
 ## 3. CLI commands
 
 ```bash
-gluc init                    # cria ita.toml + src/main.tu
-gluc init --name my-app      # com nome
+itac init                    # cria ita.toml + src/main.tu
+itac init --name my-app      # com nome
 
-gluc build                   # compila src/main.tu → build/app.dill
-gluc run                     # build + executa
-gluc run src/server.tu      # compila e roda arquivo específico
+itac build                   # compila src/main.tu → build/app.dill
+itac run                     # build + executa
+itac run src/server.tu      # compila e roda arquivo específico
 
-gluc test                    # roda testes em test/
-gluc clean                   # remove build/
+itac test                    # roda testes em test/
+itac clean                   # remove build/
 ```
 
 ## 4. Implementação
 
-### Fase 1: gluc init
+### Fase 1: itac init
 - Cria `ita.toml` com template
 - Cria `src/main.tu` com hello world
 - Cria `lib/` e `test/` vazios
 
-### Fase 2: gluc build + gluc run
+### Fase 2: itac build + itac run
 - Lê `ita.toml` pra encontrar entry point
 - Compila com o pipeline existente
 - Salva .dill em build/
 
-### Fase 3: gluc test
+### Fase 3: itac test
 - Encontra `*_test.tu` em test/
 - Compila e executa cada um
+- 🚧 `itac test --json` — emite `toString()` de Map (formato Dart, **não JSON válido**); marcado com `// TODO: proper JSON encoding`
+- 🚧 `itac test --coverage` — heurística **fake** (`coveredLines = totalLines`, ~100% sempre); cobertura real exigiria VM Service `getSourceReport`
 
 ### Fase 4: Resolução de módulos por projeto
 - `import { x } from "routes"` resolve pra `lib/routes.tu`
@@ -84,6 +86,11 @@ gluc clean                   # remove build/
 
 ## 5. O que NÃO fazer agora
 - Registry remoto (pub.dev style) — futuro
-- Lock file — versões exatas no ita.toml bastam
-- Download de dependências — futuro
 - Workspaces/monorepo — futuro
+
+> **Atualização (verificado 2026-06-30) — o plano foi superado.**
+> Dois itens listados aqui originalmente como "não fazer agora" **já foram implementados** (`pm.dart`):
+> - ✅ **Lock file** — `ita.lock` é gerado/lido (não ficou só com versões no `ita.toml`).
+> - ✅ **Download de dependências** — `itac add <pkg> --git <url>` / `--path <local>`, com cache central em `~/.ita/packages/`; comandos `itac install/remove/deps` operacionais. Resolução: relativo → `lib/` → `foundation/` → cache.
+>
+> Continuam ⬜ futuros: registry remoto, workspaces/monorepo.

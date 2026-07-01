@@ -1,4 +1,4 @@
-/// Glu Test Runner — compila e executa todos os exemplos, valida output.
+/// Itá Test Runner — compila e executa todos os exemplos, valida output.
 ///
 /// Uso: dart test_runner.dart <dart_bin> <platform_dill> <packages>
 ///
@@ -6,6 +6,8 @@
 /// Se existe um .expected ao lado, o output é comparado.
 /// Se não existe .expected, só verifica que compila e executa sem crash.
 
+import 'dart:async';
+import 'dart:convert';
 import 'dart:io';
 
 class TestResult {
@@ -30,7 +32,7 @@ class TestResult {
 
 void main(List<String> args) async {
   if (args.length != 3) {
-    print('Glu Test Runner');
+    print('Itá Test Runner');
     print('Uso: dart test_runner.dart <dart_bin> <platform_dill> <packages>');
     exit(1);
   }
@@ -47,6 +49,13 @@ void main(List<String> args) async {
 
   // Encontrar todos os .tu (excluir módulos auxiliares que não tem main)
   final auxiliaryModules = {'math.tu', 'greetings.tu'};
+
+  // Exemplos de longa duração (servidores/listeners que rodam pra sempre
+  // esperando conexão/sinal). Não terminam por design — verificamos só que
+  // compilam, sem tentar executar até o fim (senão dão timeout sempre).
+  final compileOnly = {
+    'server', 'server_inline', 'tcp', 'websocket_server', 'timer_signal',
+  };
   final testFiles = examplesDir
       .listSync()
       .whereType<File>()
@@ -54,7 +63,7 @@ void main(List<String> args) async {
       .toList()
     ..sort((a, b) => a.path.compareTo(b.path));
 
-  print('=== Glu Test Runner ===');
+  print('=== Itá Test Runner ===');
   print('Found ${testFiles.length} test files\n');
 
   final results = <TestResult>[];
@@ -92,17 +101,51 @@ void main(List<String> args) async {
       }
     }
 
-    // Executar
+    // Exemplos de longa duração: só compilam, não executam até o fim.
+    if (compileOnly.contains(name)) {
+      print('PASS (compile-only, long-running, ${compileTime.inMilliseconds}ms)');
+      results.add(TestResult(
+        name: name, compiled: true, executed: true, outputMatch: true,
+        compileTime: compileTime, runTime: Duration.zero));
+      passed++;
+      continue;
+    }
+
+    // Executar — com timeout por teste, pra um exemplo que trava (ex: porta/
+    // isolate sem teardown) nao congelar a suite inteira.
+    const runTimeout = Duration(seconds: 20);
     final runStart = DateTime.now();
-    final runResult = Process.runSync(dartBin, [
+    final process = await Process.start(dartBin, [
       '--dfe=$platformDill',
       dillPath,
     ]);
+    final stdoutFuture = process.stdout.transform(utf8.decoder).join();
+    final stderrFuture = process.stderr.transform(utf8.decoder).join();
+    int runExitCode;
+    var timedOut = false;
+    try {
+      runExitCode = await process.exitCode.timeout(runTimeout);
+    } on TimeoutException {
+      process.kill(ProcessSignal.sigkill);
+      runExitCode = await process.exitCode;
+      timedOut = true;
+    }
     final runTime = DateTime.now().difference(runStart);
-    final output = runResult.stdout.toString().trimRight();
+    final output = (await stdoutFuture).trimRight();
 
-    if (runResult.exitCode != 0) {
-      final stderr = runResult.stderr.toString();
+    if (timedOut) {
+      print('FAIL (timeout > ${runTimeout.inSeconds}s)');
+      results.add(TestResult(
+        name: name, compiled: true, executed: false, outputMatch: false,
+        error: 'timeout apos ${runTimeout.inSeconds}s '
+            '(possivel ReceivePort/isolate sem teardown)',
+        compileTime: compileTime, runTime: runTime));
+      failed++;
+      continue;
+    }
+
+    if (runExitCode != 0) {
+      final stderr = await stderrFuture;
       print('FAIL (runtime crash)');
       results.add(TestResult(
         name: name, compiled: true, executed: false, outputMatch: false,

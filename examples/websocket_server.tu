@@ -29,7 +29,7 @@ async fn handleRequest(request) {
 
   let resp = request.response
   if path == "/" {
-    sendResponse(resp, Response.json("HTTP + WebSocket in Glu!"))
+    sendResponse(resp, Response.json("HTTP + WebSocket in Itá!"))
   } else {
     sendResponse(resp, Response.notFound("404"))
   }

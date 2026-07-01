@@ -1,4 +1,4 @@
-// greetings.glu — módulo de saudações
+// greetings.tu — módulo de saudações
 
 pub fn hello(name: String) -> String {
   "Hello, ${name}!"

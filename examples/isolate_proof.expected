@@ -1,0 +1,7 @@
+=== Isolate Real ===
+Local: 328350
+Isolate: 328350
+MATCH! Isolate produziu o mesmo resultado
+I am a worker
+r1=285, r2=2470, r3=40425
+=== Done! ===

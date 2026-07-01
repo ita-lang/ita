@@ -1,4 +1,4 @@
-// Fetch async via actors — a filosofia Glu
+// Fetch async via actors — a filosofia Itá
 // I/O blocking → actor com isolate → não bloqueia o main
 
 actor Api {
@@ -30,7 +30,7 @@ async fn main() {
   print("Parallel results: ${results}")
 
   // POST
-  let posted = await api.post("https://httpbin.org/post", "{\"name\":\"Glu\"}")
+  let posted = await api.post("https://httpbin.org/post", "{\"name\":\"Itá\"}")
   print("POST: ${posted}")
 
   print("=== Done! ===")

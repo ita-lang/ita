@@ -17,9 +17,9 @@
 ITA_HOME="${ITA_HOME:-$(dirname "$(dirname "$(realpath "$0")")")}"
 
 # Dart SDK
-ITA_DART_BIN="${ITA_DART_BIN:-/Users/gabriel_aderaldo/Desktop/dev/google_tools/dart-sdk-source/sdk/xcodebuild/ReleaseARM64/dart}"
-ITA_PLATFORM_DILL="${ITA_PLATFORM_DILL:-/Users/gabriel_aderaldo/Desktop/dev/google_tools/dart-sdk-source/sdk/xcodebuild/ReleaseARM64/vm_platform.dill}"
-ITA_PACKAGES="${ITA_PACKAGES:-/Users/gabriel_aderaldo/Desktop/dev/google_tools/dart-sdk-source/sdk/.dart_tool/package_config.json}"
+ITA_DART_BIN="${ITA_DART_BIN:-/Users/gabriel_aderaldo/Desktop/Projetos/dev/google_tools/dart-sdk-source/sdk/xcodebuild/ReleaseARM64/dart}"
+ITA_PLATFORM_DILL="${ITA_PLATFORM_DILL:-/Users/gabriel_aderaldo/Desktop/Projetos/dev/google_tools/dart-sdk-source/sdk/xcodebuild/ReleaseARM64/vm_platform.dill}"
+ITA_PACKAGES="${ITA_PACKAGES:-/Users/gabriel_aderaldo/Desktop/Projetos/dev/google_tools/dart-sdk-source/sdk/.dart_tool/package_config.json}"
 
 # Compiler entry point
 COMPILER="${ITA_HOME}/compiler/bin/itac.dart"

@@ -11,7 +11,7 @@ fn main() {
   print("SHA1: ${Checksum.sha1("hello")}")
 
   print("=== Base64 ===")
-  let encoded = Base64.encode("Hello Glu!")
+  let encoded = Base64.encode("Hello Itá!")
   print("encode: ${encoded}")
   let decoded = Base64.decode(encoded)
   print("decode: ${decoded}")

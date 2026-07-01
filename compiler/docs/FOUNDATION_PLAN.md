@@ -1,6 +1,20 @@
-# Glu Foundation — Standard Library Plan
+# Itá Foundation — Standard Library Plan
 
-A Foundation é a stdlib do Glu, escrita inteiramente em **pure .tu**. Usa as primitivas nativas do codegen como base.
+## Status real (verificado 2026-06-30)
+
+> ⬜ **Nenhum dos 12 módulos `lib/foundation/*.tu` existe neste repo (`ita/`).** O diretório `lib/foundation/` não está presente — `find` não acha `collections.tu`, `validate.tu`, `cache.tu`, etc.
+>
+> A stdlib em pure `.tu` (estes 12 módulos) vive no **repo irmão `../stdlib`**, **fora do escopo deste repo** — não dá pra marcar "feito" aqui sem inspecioná-lo.
+>
+> Ressalva: alguns nomes deste plano existem como **namespaces built-in no codegen** (`log`, `Date`, `Duration`), mas **não** como os módulos `.tu` descritos abaixo (`Math`, `DateTime`, `Log` em `lib/foundation/`). O `pm.dart` já referencia `foundation/` como path de resolução, mas sem arquivos.
+
+| Módulo (`lib/foundation/*.tu`) | Status neste repo |
+|---|---|
+| Collections, Iter, Text, Math, Validate, Async, Event, Cache, Config, Server, Log, DateTime | ⬜ ausentes (ver `../stdlib`) |
+
+---
+
+A Foundation é a stdlib do Itá, escrita inteiramente em **pure .tu**. Usa as primitivas nativas do codegen como base.
 
 ## Módulos
 

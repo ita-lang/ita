@@ -1,0 +1,12 @@
+=== Generics ===
+Pair(first: 1, second: hello)
+1
+hello
+Box(value: 42)
+Box(value: Itá)
+x=10.0, y=20.0
+Box(value: Pair(first: 1, second: 2))
+[1, 2, 3]
+Option.some(value: typed!)
+Result.ok(value: 42)
+=== Done! ===

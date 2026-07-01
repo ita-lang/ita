@@ -23,7 +23,7 @@ fn main() {
   // Box
   let b1 = Box(value: 42)
   print(b1)
-  let b2 = Box(value: "Glu")
+  let b2 = Box(value: "Itá")
   print(b2)
 
   // Pair de structs

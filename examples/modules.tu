@@ -19,7 +19,7 @@ fn main() {
 
   // Usar com alias
   print(greet("World"))
-  print(goodbye("Glu"))
+  print(goodbye("Itá"))
 
   // Usar tipo importado
   let v = Vector(x: 1.0, y: 2.0)

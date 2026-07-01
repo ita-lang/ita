@@ -42,7 +42,7 @@ async fn main() {
 
   let svc = spawn DataService()
 
-  let processed = await svc.process("hello glu")
+  let processed = await svc.process("hello itá")
   print(processed)
 
   let calc = await svc.calculate(3, 7)

@@ -1,0 +1,10 @@
+=== Async/Await ===
+done after 100ms
+=== Actor: spawn + call ===
+1
+30
+=== Actor: computação pesada ===
+7² = 49
+21 * 2 = 42
+The number is 42
+=== Done! ===

@@ -5,7 +5,7 @@ import '../lib/lexer/lexer.dart';
 
 void main() {
   const source = r'''
-// Glu language example
+// Itá language example
 
 use math.{ abs, round }
 
@@ -86,7 +86,7 @@ fn main() {
 }
 ''';
 
-  print('=== Glu Lexer Test ===\n');
+  print('=== Itá Lexer Test ===\n');
   print('Source: ${source.length} chars\n');
 
   final lexer = Lexer(source);

@@ -7,6 +7,6 @@ environment:
 
 dependencies:
   kernel:
-    path: /Users/gabriel_aderaldo/Desktop/dev/google_tools/dart-sdk-source/sdk/pkg/kernel
+    path: /Users/gabriel_aderaldo/Desktop/Projetos/dev/google_tools/dart-sdk-source/sdk/pkg/kernel
   _fe_analyzer_shared:
-    path: /Users/gabriel_aderaldo/Desktop/dev/google_tools/dart-sdk-source/sdk/pkg/_fe_analyzer_shared
+    path: /Users/gabriel_aderaldo/Desktop/Projetos/dev/google_tools/dart-sdk-source/sdk/pkg/_fe_analyzer_shared

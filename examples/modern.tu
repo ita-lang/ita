@@ -25,7 +25,7 @@ fn divide(a: Float, b: Float) -> Result<Float> {
 fn main() {
   print("=== String Interpolation ===")
 
-  let name = "Glu"
+  let name = "Itá"
   let version = 1
   print("Welcome to ${name} v${version}!")
 

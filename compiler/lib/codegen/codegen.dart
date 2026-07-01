@@ -50,7 +50,7 @@
 import 'dart:io';
 import 'package:kernel/kernel.dart' as k;
 import 'package:kernel/core_types.dart';
-import '../parser/ast.dart' as glu;
+import '../parser/ast.dart' as ast;
 import '../lexer/token.dart';
 import '../lexer/lexer.dart' as lex show Lexer;
 import '../parser/parser.dart' as parse show Parser;
@@ -66,6 +66,46 @@ class CompileError {
 
   @override
   String toString() => 'CompileError[$line:$column]: $message';
+}
+
+/// Passe final sobre o kernel: garante fileOffset valido (>= 0) em todos os
+/// nos sinteticos. Sem isso, nos com fileOffset == noOffset (-1) produzem um
+/// .dill que a Dart VM rejeita em KernelLoader::GenerateFieldAccessors com
+/// Bus error (BUS_ADRALN) ao gerar getters/setters dos campos. O bug e
+/// cumulativo: so se manifesta quando ha nos -1 suficientes desalinhando os
+/// offsets do binario.
+class _OffsetNormalizer extends k.RecursiveVisitor {
+  static const _noOffset = k.TreeNode.noOffset;
+
+  @override
+  void defaultNode(k.Node node) {
+    if (node is k.TreeNode && node.fileOffset == _noOffset) {
+      node.fileOffset = 0;
+    }
+    if (node is k.Class) {
+      if (node.startFileOffset == _noOffset) node.startFileOffset = 0;
+      if (node.fileEndOffset == _noOffset) node.fileEndOffset = 0;
+    } else if (node is k.Constructor) {
+      if (node.startFileOffset == _noOffset) node.startFileOffset = 0;
+      if (node.fileEndOffset == _noOffset) node.fileEndOffset = 0;
+    } else if (node is k.Procedure) {
+      if (node.fileStartOffset == _noOffset) node.fileStartOffset = 0;
+      if (node.fileEndOffset == _noOffset) node.fileEndOffset = 0;
+    } else if (node is k.Field) {
+      if (node.fileEndOffset == _noOffset) node.fileEndOffset = 0;
+      // Field.immutable cria setterReference=null mas isFinal=false (default),
+      // produzindo um "campo mutavel sem setter" — kernel malformado que a VM
+      // rejeita. Todo campo sem setter deve ser final.
+      if (node.setterReference == null && !node.isFinal) {
+        node.isFinal = true;
+      }
+    } else if (node is k.FunctionNode) {
+      if (node.fileEndOffset == _noOffset) node.fileEndOffset = 0;
+    } else if (node is k.Block) {
+      if (node.fileEndOffset == _noOffset) node.fileEndOffset = 0;
+    }
+    super.defaultNode(node);
+  }
 }
 
 class CodeGenerator {
@@ -117,6 +157,8 @@ class CodeGenerator {
   late k.Procedure _uint8ListFromList;
   late k.Class _byteDataClass;
   late k.Procedure _byteDataView;
+  late k.Procedure _byteDataSublistView;
+  late k.Class _endianClass;
   late k.Procedure _stringFromCharCodes;
   late k.Class _uriClass;
   late k.Procedure _uriParse;
@@ -180,10 +222,10 @@ class CodeGenerator {
   final Map<String, Map<String, k.Procedure>> _methods = {};
 
   // Trait declarations (para impl)
-  final Map<String, glu.TraitDecl> _traitDecls = {};
+  final Map<String, ast.TraitDecl> _traitDecls = {};
 
   // Impl bodies pendentes
-  final List<glu.ImplDecl> _pendingImpls = [];
+  final List<ast.ImplDecl> _pendingImpls = [];
 
   // Procedure atual
   k.Procedure? _currentProcedure;
@@ -204,7 +246,7 @@ class CodeGenerator {
   final List<Map<String, k.TypeParameter>> _typeParamScopes = [];
   final Map<String, List<k.TypeParameter>> _classTypeParams = {};
 
-  void _pushTypeParams(List<glu.GenericParam> params, List<k.TypeParameter> kernelParams) {
+  void _pushTypeParams(List<ast.GenericParam> params, List<k.TypeParameter> kernelParams) {
     final scope = <String, k.TypeParameter>{};
     for (var i = 0; i < params.length; i++) {
       scope[params[i].name] = kernelParams[i];
@@ -229,13 +271,13 @@ class CodeGenerator {
   String? _enumContext;
 
   // Info de parâmetros de funções (função → lista de tipos dos params)
-  final Map<String, List<glu.TypeAnnotation?>> _fnParamTypes = {};
+  final Map<String, List<ast.TypeAnnotation?>> _fnParamTypes = {};
 
   // Return type da função atual (para inferir .variant em return)
-  glu.TypeAnnotation? _currentReturnType;
+  ast.TypeAnnotation? _currentReturnType;
 
   // Módulos já compilados (evita compilar o mesmo módulo duas vezes)
-  final Map<String, glu.Program> _compiledModules = {};
+  final Map<String, ast.Program> _compiledModules = {};
 
   CodeGenerator(this.platformPath, {this.sourcePath = ''});
 
@@ -243,32 +285,32 @@ class CodeGenerator {
   // Entry point
   // ============================================================
 
-  k.Component compile(glu.Program program) {
+  k.Component compile(ast.Program program) {
     _initPlatform();
     _initComponent();
 
     // Pass 1: Registrar todos os tipos e funções (forward references)
     for (final decl in program.declarations) {
       switch (decl) {
-        case glu.FnDecl d:
+        case ast.FnDecl d:
           _registerFunction(d);
-        case glu.StructDecl d:
+        case ast.StructDecl d:
           _registerStruct(d);
-        case glu.ClassDecl d:
+        case ast.ClassDecl d:
           _registerClassDecl(d);
-        case glu.EnumDecl d:
+        case ast.EnumDecl d:
           _registerEnum(d);
-        case glu.TraitDecl d:
+        case ast.TraitDecl d:
           _traitDecls[d.name] = d;
-        case glu.ImplDecl d:
+        case ast.ImplDecl d:
           _pendingImpls.add(d);
-        case glu.ExtensionDecl d:
+        case ast.ExtensionDecl d:
           _registerExtension(d);
-        case glu.ActorDecl d:
+        case ast.ActorDecl d:
           _registerActor(d);
-        case glu.ImportDecl d:
+        case ast.ImportDecl d:
           _processImport(d);
-        case glu.OperatorDecl d:
+        case ast.OperatorDecl d:
           _registerOperator(d);
         default:
           break;
@@ -292,6 +334,13 @@ class CodeGenerator {
       _error('No main() function found', 0, 0,
         hint: 'todo programa precisa de uma funcao main(): fn main() { ... }');
     }
+
+    // Normaliza fileOffsets sinteticos (noOffset/-1 -> 0). Os nos do codegen
+    // (Class, Field, Procedure, Constructor, FunctionNode...) sao criados sem
+    // fileOffset. A Dart VM crasha em KernelLoader::GenerateFieldAccessors
+    // (Bus error / BUS_ADRALN) ao finalizar classes cujos nos estao em -1,
+    // de forma cumulativa (so estoura quando ha nos suficientes no .dill).
+    _component.accept(_OffsetNormalizer());
 
     _component.computeCanonicalNames();
     return _component;
@@ -333,6 +382,9 @@ class CodeGenerator {
     _byteDataClass = dartTyped.classes.firstWhere((c) => c.name == 'ByteData');
     _byteDataView = _byteDataClass.procedures.firstWhere(
       (p) => p.isFactory && p.name.text == 'view');
+    _byteDataSublistView = _byteDataClass.procedures.firstWhere(
+      (p) => p.isFactory && p.name.text == 'sublistView');
+    _endianClass = dartTyped.classes.firstWhere((c) => c.name == 'Endian');
     _stringFromCharCodes = dartCore.classes.firstWhere((c) => c.name == 'String')
       .procedures.firstWhere((p) => p.name.text == 'fromCharCodes');
     _uriParse = _uriClass.procedures.firstWhere((p) => p.name.text == 'parse');
@@ -642,7 +694,7 @@ class CodeGenerator {
   // Pass 1: Registration
   // ============================================================
 
-  void _registerFunction(glu.FnDecl decl) {
+  void _registerFunction(ast.FnDecl decl) {
     final proc = k.Procedure(
       k.Name(decl.name),
       k.ProcedureKind.Method,
@@ -657,12 +709,12 @@ class CodeGenerator {
     _fnParamTypes[decl.name] = decl.params.map((p) => p.type).toList();
 
     // Guardar return type pra inferência de receiver type
-    if (decl.returnType is glu.NamedType) {
-      _fnReturnTypes[decl.name] = (decl.returnType as glu.NamedType).name;
+    if (decl.returnType is ast.NamedType) {
+      _fnReturnTypes[decl.name] = (decl.returnType as ast.NamedType).name;
     }
   }
 
-  void _registerStruct(glu.StructDecl decl) {
+  void _registerStruct(ast.StructDecl decl) {
     // Criar TypeParameters
     final kernelTypeParams = decl.typeParams.map((gp) =>
       k.TypeParameter(gp.name, const k.DynamicType(), const k.DynamicType())
@@ -731,7 +783,7 @@ class CodeGenerator {
     _methods[decl.name] = {};
   }
 
-  void _registerClassDecl(glu.ClassDecl decl) {
+  void _registerClassDecl(ast.ClassDecl decl) {
     final kernelTypeParams = decl.typeParams.map((gp) =>
       k.TypeParameter(gp.name, const k.DynamicType(), const k.DynamicType())
     ).toList();
@@ -799,7 +851,7 @@ class CodeGenerator {
     _methods[decl.name] = {};
   }
 
-  void _registerEnum(glu.EnumDecl decl) {
+  void _registerEnum(ast.EnumDecl decl) {
     // Classe base abstrata
     final baseCls = k.Class(
       name: decl.name,
@@ -933,7 +985,7 @@ class CodeGenerator {
   // ============================================================
 
   /// Processa import: carrega, parseia e registra símbolos do módulo
-  void _processImport(glu.ImportDecl decl) {
+  void _processImport(ast.ImportDecl decl) {
     // Resolver path do módulo
     final modulePath = _resolveModulePath(decl.module);
     if (modulePath == null) {
@@ -993,7 +1045,7 @@ class CodeGenerator {
     return null;
   }
 
-  /// Encontra a raiz do projeto subindo ate achar ita.toml ou glu.toml
+  /// Encontra a raiz do projeto subindo ate achar ita.toml
   String _findProjectRoot(String dir) {
     var current = dir;
     for (var i = 0; i < 10; i++) {
@@ -1007,7 +1059,7 @@ class CodeGenerator {
     return dir;
   }
 
-  glu.Program? _compileModule(String path) {
+  ast.Program? _compileModule(String path) {
     if (_compiledModules.containsKey(path)) {
       return _compiledModules[path];
     }
@@ -1035,52 +1087,52 @@ class CodeGenerator {
   }
 
   /// Registra os símbolos públicos de um módulo no compilador atual
-  void _registerModuleSymbols(glu.Program module, {
+  void _registerModuleSymbols(ast.Program module, {
     String? prefix,
-    List<glu.ImportMember>? filter,
+    List<ast.ImportMember>? filter,
   }) {
     for (final decl in module.declarations) {
       String? name;
       bool isPublic = false;
 
       switch (decl) {
-        case glu.FnDecl d:
+        case ast.FnDecl d:
           name = d.name;
           isPublic = d.isPublic;
           if (_shouldImport(name, isPublic, filter)) {
             final importName = _importedName(name, prefix, filter);
-            _registerFunction(glu.FnDecl(
+            _registerFunction(ast.FnDecl(
               name: importName, params: d.params, namedParams: d.namedParams,
               returnType: d.returnType, isPublic: false, isAsync: d.isAsync,
               isStream: d.isStream, typeParams: d.typeParams, body: d.body,
               line: d.line, column: d.column,
             ));
           }
-        case glu.StructDecl d:
+        case ast.StructDecl d:
           name = d.name;
           isPublic = d.isPublic;
           if (_shouldImport(name, isPublic, filter)) {
             _registerStruct(d);
           }
-        case glu.ClassDecl d:
+        case ast.ClassDecl d:
           name = d.name;
           isPublic = d.isPublic;
           if (_shouldImport(name, isPublic, filter)) {
             _registerClassDecl(d);
           }
-        case glu.EnumDecl d:
+        case ast.EnumDecl d:
           name = d.name;
           isPublic = d.isPublic;
           if (_shouldImport(name, isPublic, filter)) {
             _registerEnum(d);
           }
-        case glu.TraitDecl d:
+        case ast.TraitDecl d:
           name = d.name;
           isPublic = d.isPublic;
           if (_shouldImport(name, isPublic, filter)) {
             _traitDecls[name] = d;
           }
-        case glu.ActorDecl d:
+        case ast.ActorDecl d:
           name = d.name;
           isPublic = d.isPublic;
           if (_shouldImport(name, isPublic, filter)) {
@@ -1094,17 +1146,17 @@ class CodeGenerator {
     // Pass 2: compilar corpos dos imports
     for (final decl in module.declarations) {
       switch (decl) {
-        case glu.FnDecl d when d.isPublic && _shouldImport(d.name, true, filter):
+        case ast.FnDecl d when d.isPublic && _shouldImport(d.name, true, filter):
           final importName = _importedName(d.name, prefix, filter);
           if (_functions.containsKey(importName)) {
-            _compileFnDecl(glu.FnDecl(
+            _compileFnDecl(ast.FnDecl(
               name: importName, params: d.params, namedParams: d.namedParams,
               returnType: d.returnType, isAsync: d.isAsync, isStream: d.isStream,
               typeParams: d.typeParams, body: d.body,
               line: d.line, column: d.column,
             ));
           }
-        case glu.StructDecl d when d.isPublic && _shouldImport(d.name, true, filter):
+        case ast.StructDecl d when d.isPublic && _shouldImport(d.name, true, filter):
           _compileStructMethods(d);
         default:
           break;
@@ -1112,13 +1164,13 @@ class CodeGenerator {
     }
   }
 
-  bool _shouldImport(String? name, bool isPublic, List<glu.ImportMember>? filter) {
+  bool _shouldImport(String? name, bool isPublic, List<ast.ImportMember>? filter) {
     if (name == null || !isPublic) return false;
     if (filter == null) return true;
     return filter.any((m) => m.name == name);
   }
 
-  String _importedName(String name, String? prefix, List<glu.ImportMember>? filter) {
+  String _importedName(String name, String? prefix, List<ast.ImportMember>? filter) {
     // Alias individual: import { add as sum }
     if (filter != null) {
       for (final m in filter) {
@@ -1130,7 +1182,7 @@ class CodeGenerator {
     return name;
   }
 
-  void _registerActor(glu.ActorDecl decl) {
+  void _registerActor(ast.ActorDecl decl) {
     _actorNames.add(decl.name);
     _actorMethodNames[decl.name] = decl.methods.map((m) => m.name).toList();
 
@@ -1168,7 +1220,7 @@ class CodeGenerator {
   // Rastrear quais métodos de actor são stream (pra tratar diferente no dispatch)
   final Map<String, Set<String>> _actorStreamMethods = {};
 
-  void _compileActorMethods(glu.ActorDecl decl) {
+  void _compileActorMethods(ast.ActorDecl decl) {
     final cls = _classes[decl.name];
     if (cls == null) return;
 
@@ -1212,7 +1264,7 @@ class CodeGenerator {
   ///     reply.send(result);
   ///   });
   /// }
-  void _generateActorEntryPoint(glu.ActorDecl decl) {
+  void _generateActorEntryPoint(ast.ActorDecl decl) {
     final cls = _classes[decl.name]!;
     final ctor = _constructors[decl.name]!;
 
@@ -1309,7 +1361,7 @@ class CodeGenerator {
     final entryBody = k.Block([portVar, sendPortToMain, actorVar, listenCall]);
 
     final entryPoint = k.Procedure(
-      k.Name('glu_${decl.name}_entryPoint'),
+      k.Name('ita_${decl.name}_entryPoint'),
       k.ProcedureKind.Method,
       k.FunctionNode(entryBody,
         positionalParameters: [mainPortParam],
@@ -1318,7 +1370,7 @@ class CodeGenerator {
       fileUri: _fileUri,
     );
     _library.addProcedure(entryPoint);
-    _functions['glu_${decl.name}_entryPoint'] = entryPoint;
+    _functions['ita_${decl.name}_entryPoint'] = entryPoint;
   }
 
   /// Gera helper: _callActor(SendPort sp, String method, List args) async {
@@ -1329,9 +1381,9 @@ class CodeGenerator {
   ///   return result;
   /// }
   /// Gera top-level async* function pra stream methods do actor.
-  /// actor.stream_method(args) → glu_ActorName_method(args) que é async*
-  void _generateStreamTopLevel(glu.ActorDecl decl, glu.FnDecl method) {
-    final fnName = 'glu_${decl.name}_${method.name}';
+  /// actor.stream_method(args) → ita_ActorName_method(args) que é async*
+  void _generateStreamTopLevel(ast.ActorDecl decl, ast.FnDecl method) {
+    final fnName = 'ita_${decl.name}_${method.name}';
     // O método já foi compilado na classe. Vamos criar um wrapper top-level
     // que instancia o actor e chama o método (stream fn roda local, não no isolate)
     final cls = _classes[decl.name]!;
@@ -1418,7 +1470,7 @@ class CodeGenerator {
       k.ReturnStatement(k.VariableGet(resultVar))]);
 
     _callActorHelper = k.Procedure(
-      k.Name('glu_callActor'),
+      k.Name('ita_callActor'),
       k.ProcedureKind.Method,
       k.FunctionNode(body,
         positionalParameters: [spParam, methodParam, argsParam],
@@ -1432,7 +1484,7 @@ class CodeGenerator {
   }
 
   /// await race(a, b) → await Future.any([a, b])
-  k.Expression _compileAwaitRace(glu.AwaitRaceExpr expr) {
+  k.Expression _compileAwaitRace(ast.AwaitRaceExpr expr) {
     final compiled = expr.futures.map(_compileExpr).toList();
     return k.AwaitExpression(
       k.StaticInvocation(_futureAnyProcedure,
@@ -1442,7 +1494,7 @@ class CodeGenerator {
 
   /// await all(a, b, c) → await Future.wait([a, b, c])
   /// Retorna List<dynamic> — destructuring do let extrai os valores
-  k.Expression _compileAwaitAll(glu.AwaitAllExpr expr) {
+  k.Expression _compileAwaitAll(ast.AwaitAllExpr expr) {
     // Compilar cada future (cada uma já é Isolate.run ou chamada async)
     final compiledFutures = expr.futures.map(_compileExpr).toList();
 
@@ -1464,12 +1516,12 @@ class CodeGenerator {
 
   /// spawn Actor() → cria isolate persistente, retorna SendPort
   /// Gera: { final rp = ReceivePort(); await Isolate.spawn(entryPoint, rp.sendPort); await rp.first }
-  k.Expression _compileSpawn(glu.SpawnExpr expr) {
+  k.Expression _compileSpawn(ast.SpawnExpr expr) {
     // Descobrir qual actor está sendo spawned
     String? actorName;
-    if (expr.actorCall is glu.CallExpr) {
-      final callee = (expr.actorCall as glu.CallExpr).callee;
-      if (callee is glu.IdentifierExpr) actorName = callee.name;
+    if (expr.actorCall is ast.CallExpr) {
+      final callee = (expr.actorCall as ast.CallExpr).callee;
+      if (callee is ast.IdentifierExpr) actorName = callee.name;
     }
 
     if (actorName == null || !_actorNames.contains(actorName)) {
@@ -1483,7 +1535,7 @@ class CodeGenerator {
       type: const k.DynamicType(), isFinal: true);
 
     // Referência à entry point function
-    final entryPointProc = _functions['glu_${actorName}_entryPoint']!;
+    final entryPointProc = _functions['ita_${actorName}_entryPoint']!;
 
     // Isolate.spawn(entryPoint, rp.sendPort)
     // Precisa ser um tear-off da função. Usar FunctionExpression wrapper.
@@ -1516,8 +1568,8 @@ class CodeGenerator {
     return k.BlockExpression(spawnBlock, getSendPort);
   }
 
-  void _registerOperator(glu.OperatorDecl decl) {
-    final fnName = 'glu_op_${decl.op.replaceAll('*', 'star')}';
+  void _registerOperator(ast.OperatorDecl decl) {
+    final fnName = 'ita_op_${decl.op.replaceAll('*', 'star')}';
     final proc = k.Procedure(
       k.Name(fnName), k.ProcedureKind.Method,
       k.FunctionNode(null), isStatic: true, fileUri: _fileUri);
@@ -1526,8 +1578,8 @@ class CodeGenerator {
     _customOperators[decl.op] = proc;
   }
 
-  void _compileOperator(glu.OperatorDecl decl) {
-    final fnName = 'glu_op_${decl.op.replaceAll('*', 'star')}';
+  void _compileOperator(ast.OperatorDecl decl) {
+    final fnName = 'ita_op_${decl.op.replaceAll('*', 'star')}';
     final proc = _functions[fnName];
     if (proc == null) return;
 
@@ -1541,8 +1593,8 @@ class CodeGenerator {
     }
 
     k.Statement body;
-    if (decl.body is glu.ExprStmt) {
-      body = k.ReturnStatement(_compileExpr((decl.body as glu.ExprStmt).expression));
+    if (decl.body is ast.ExprStmt) {
+      body = k.ReturnStatement(_compileExpr((decl.body as ast.ExprStmt).expression));
     } else {
       body = _compileFnBody(decl.body);
     }
@@ -1553,7 +1605,7 @@ class CodeGenerator {
     _popScope();
   }
 
-  void _registerExtension(glu.ExtensionDecl ext) {
+  void _registerExtension(ast.ExtensionDecl ext) {
     final cls = _classes[ext.targetName];
     if (cls == null) {
       _error('Extension target not found: ${ext.targetName}', ext.line, ext.column);
@@ -1574,9 +1626,9 @@ class CodeGenerator {
     }
   }
 
-  void _processImpl(glu.ImplDecl impl) {
-    final targetName = impl.targetType is glu.NamedType
-        ? (impl.targetType as glu.NamedType).name
+  void _processImpl(ast.ImplDecl impl) {
+    final targetName = impl.targetType is ast.NamedType
+        ? (impl.targetType as ast.NamedType).name
         : null;
     if (targetName == null || !_classes.containsKey(targetName)) return;
 
@@ -1598,30 +1650,30 @@ class CodeGenerator {
   // Pass 3: Compile bodies
   // ============================================================
 
-  void _compileDeclaration(glu.Declaration decl) {
+  void _compileDeclaration(ast.Declaration decl) {
     switch (decl) {
-      case glu.FnDecl d:
+      case ast.FnDecl d:
         _compileFnDecl(d);
-      case glu.StructDecl d:
+      case ast.StructDecl d:
         _compileStructMethods(d);
-      case glu.ClassDecl d:
+      case ast.ClassDecl d:
         _compileClassMethods(d);
-      case glu.EnumDecl d:
+      case ast.EnumDecl d:
         _compileEnumMethods(d);
-      case glu.ImplDecl d:
+      case ast.ImplDecl d:
         _compileImplMethods(d);
-      case glu.ExtensionDecl d:
+      case ast.ExtensionDecl d:
         _compileExtensionMethods(d);
-      case glu.ActorDecl d:
+      case ast.ActorDecl d:
         _compileActorMethods(d);
-      case glu.OperatorDecl d:
+      case ast.OperatorDecl d:
         _compileOperator(d);
       default:
         break;
     }
   }
 
-  void _compileFnDecl(glu.FnDecl decl) {
+  void _compileFnDecl(ast.FnDecl decl) {
     final proc = _functions[decl.name];
     if (proc == null) return;
 
@@ -1658,10 +1710,10 @@ class CodeGenerator {
     k.Statement body;
     if (decl.body == null) {
       body = k.EmptyStatement();
-    } else if (decl.body is glu.ExprStmt) {
+    } else if (decl.body is ast.ExprStmt) {
       final prevCtx = _enumContext;
       if (decl.returnType != null) _enumContext = _enumNameFromType(decl.returnType!);
-      body = k.ReturnStatement(_compileExpr((decl.body as glu.ExprStmt).expression));
+      body = k.ReturnStatement(_compileExpr((decl.body as ast.ExprStmt).expression));
       _enumContext = prevCtx;
     } else {
       body = _compileFnBody(decl.body!);
@@ -1694,7 +1746,7 @@ class CodeGenerator {
     _currentReturnType = null;
   }
 
-  void _compileStructMethods(glu.StructDecl decl) {
+  void _compileStructMethods(ast.StructDecl decl) {
     final cls = _classes[decl.name];
     if (cls == null) return;
 
@@ -1703,7 +1755,7 @@ class CodeGenerator {
     }
   }
 
-  void _compileClassMethods(glu.ClassDecl decl) {
+  void _compileClassMethods(ast.ClassDecl decl) {
     final cls = _classes[decl.name];
     if (cls == null) return;
 
@@ -1712,7 +1764,7 @@ class CodeGenerator {
     }
   }
 
-  void _compileEnumMethods(glu.EnumDecl decl) {
+  void _compileEnumMethods(ast.EnumDecl decl) {
     // Métodos definidos no enum body vão na classe base
     final cls = _classes[decl.name];
     if (cls == null) return;
@@ -1721,9 +1773,9 @@ class CodeGenerator {
     }
   }
 
-  void _compileImplMethods(glu.ImplDecl impl) {
-    final targetName = impl.targetType is glu.NamedType
-        ? (impl.targetType as glu.NamedType).name
+  void _compileImplMethods(ast.ImplDecl impl) {
+    final targetName = impl.targetType is ast.NamedType
+        ? (impl.targetType as ast.NamedType).name
         : null;
     if (targetName == null || !_classes.containsKey(targetName)) return;
 
@@ -1733,7 +1785,7 @@ class CodeGenerator {
     }
   }
 
-  void _compileExtensionMethods(glu.ExtensionDecl ext) {
+  void _compileExtensionMethods(ast.ExtensionDecl ext) {
     final cls = _classes[ext.targetName];
     if (cls == null) return;
 
@@ -1742,7 +1794,7 @@ class CodeGenerator {
     }
   }
 
-  void _compileMethodBody(k.Class cls, String typeName, glu.FnDecl method) {
+  void _compileMethodBody(k.Class cls, String typeName, ast.FnDecl method) {
     // Encontrar o Procedure já registrado
     k.Procedure? proc;
     // Procurar nos procedures da classe
@@ -1784,8 +1836,8 @@ class CodeGenerator {
     }
 
     k.Statement body;
-    if (method.body is glu.ExprStmt) {
-      body = k.ReturnStatement(_compileExpr((method.body as glu.ExprStmt).expression));
+    if (method.body is ast.ExprStmt) {
+      body = k.ReturnStatement(_compileExpr((method.body as ast.ExprStmt).expression));
     } else {
       body = _compileFnBody(method.body!);
     }
@@ -1804,16 +1856,16 @@ class CodeGenerator {
   // Function body (implicit return)
   // ============================================================
 
-  k.Statement _compileFnBody(glu.Statement stmt) {
-    if (stmt is glu.BlockStmt) {
+  k.Statement _compileFnBody(ast.Statement stmt) {
+    if (stmt is ast.BlockStmt) {
       _pushScope();
       final stmts = <k.Statement>[];
       for (var i = 0; i < stmt.statements.length; i++) {
         final s = stmt.statements[i];
         final isLast = i == stmt.statements.length - 1;
-        if (isLast && s is glu.ExprStmt) {
+        if (isLast && s is ast.ExprStmt) {
           stmts.add(k.ReturnStatement(_compileExpr(s.expression)));
-        } else if (isLast && s is glu.IfStmt) {
+        } else if (isLast && s is ast.IfStmt) {
           stmts.add(_compileIfWithImplicitReturn(s));
         } else {
           stmts.add(_compileStatement(s));
@@ -1825,7 +1877,7 @@ class CodeGenerator {
     return _compileStatement(stmt);
   }
 
-  k.Statement _compileIfWithImplicitReturn(glu.IfStmt stmt) {
+  k.Statement _compileIfWithImplicitReturn(ast.IfStmt stmt) {
     final condition = _compileExpr(stmt.condition);
     final then = _wrapWithImplicitReturn(stmt.thenBranch);
     final otherwise = stmt.elseBranch != null
@@ -1834,10 +1886,10 @@ class CodeGenerator {
     return k.IfStatement(condition, then, otherwise);
   }
 
-  k.Statement _wrapWithImplicitReturn(glu.Statement stmt) {
-    if (stmt is glu.BlockStmt && stmt.statements.isNotEmpty) {
+  k.Statement _wrapWithImplicitReturn(ast.Statement stmt) {
+    if (stmt is ast.BlockStmt && stmt.statements.isNotEmpty) {
       final last = stmt.statements.last;
-      if (last is glu.ExprStmt) {
+      if (last is ast.ExprStmt) {
         _pushScope();
         final stmts = <k.Statement>[];
         for (var i = 0; i < stmt.statements.length - 1; i++) {
@@ -1855,45 +1907,45 @@ class CodeGenerator {
   // Statements
   // ============================================================
 
-  k.Statement _compileStatement(glu.Statement stmt) {
+  k.Statement _compileStatement(ast.Statement stmt) {
     switch (stmt) {
-      case glu.BlockStmt s:
+      case ast.BlockStmt s:
         return _compileBlock(s);
-      case glu.LetStmt s:
+      case ast.LetStmt s:
         return _compileLet(s);
-      case glu.VarStmt s:
+      case ast.VarStmt s:
         return _compileVar(s);
-      case glu.ReturnStmt s:
+      case ast.ReturnStmt s:
         return _compileReturn(s);
-      case glu.ExprStmt s:
+      case ast.ExprStmt s:
         return _compileExprStmt(s);
-      case glu.IfStmt s:
+      case ast.IfStmt s:
         return _compileIf(s);
-      case glu.GuardStmt s:
+      case ast.GuardStmt s:
         return _compileGuard(s);
-      case glu.GuardLetStmt s:
+      case ast.GuardLetStmt s:
         return _compileGuardLet(s);
-      case glu.WhileStmt s:
+      case ast.WhileStmt s:
         return _compileWhile(s);
-      case glu.ForInStmt s:
+      case ast.ForInStmt s:
         return _compileForIn(s);
-      case glu.DestructureStmt s:
+      case ast.DestructureStmt s:
         return _compileDestructure(s);
-      case glu.EmitStmt s:
+      case ast.EmitStmt s:
         return k.YieldStatement(_compileExpr(s.value));
-      case glu.ForAwaitStmt s:
+      case ast.ForAwaitStmt s:
         return _compileForAwait(s);
     }
   }
 
-  k.Block _compileBlock(glu.BlockStmt stmt) {
+  k.Block _compileBlock(ast.BlockStmt stmt) {
     _pushScope();
     final stmts = stmt.statements.map(_compileStatement).toList();
     _popScope();
     return k.Block(stmts);
   }
 
-  k.Statement _compileLet(glu.LetStmt stmt) {
+  k.Statement _compileLet(ast.LetStmt stmt) {
     // Propagar contexto de tipo para inferência de .variant
     final prevCtx = _enumContext;
     if (stmt.type != null) {
@@ -1911,20 +1963,20 @@ class CodeGenerator {
     );
     _declareVar(stmt.name, varDecl);
     // Rastrear tipo pra inferência
-    if (stmt.type is glu.NamedType) {
-      _varTypes[stmt.name] = (stmt.type as glu.NamedType).name;
-    } else if (stmt.value is glu.SpawnExpr) {
+    if (stmt.type is ast.NamedType) {
+      _varTypes[stmt.name] = (stmt.type as ast.NamedType).name;
+    } else if (stmt.value is ast.SpawnExpr) {
       // spawn Actor() — rastrear o tipo do actor
-      final spawn = stmt.value as glu.SpawnExpr;
-      if (spawn.actorCall is glu.CallExpr) {
-        final callee = (spawn.actorCall as glu.CallExpr).callee;
-        if (callee is glu.IdentifierExpr) {
+      final spawn = stmt.value as ast.SpawnExpr;
+      if (spawn.actorCall is ast.CallExpr) {
+        final callee = (spawn.actorCall as ast.CallExpr).callee;
+        if (callee is ast.IdentifierExpr) {
           _varTypes[stmt.name] = callee.name;
         }
       }
-    } else if (stmt.value is glu.CallExpr) {
-      final callee = (stmt.value as glu.CallExpr).callee;
-      if (callee is glu.IdentifierExpr) {
+    } else if (stmt.value is ast.CallExpr) {
+      final callee = (stmt.value as ast.CallExpr).callee;
+      if (callee is ast.IdentifierExpr) {
         if (_fnReturnTypes.containsKey(callee.name)) {
           _varTypes[stmt.name] = _fnReturnTypes[callee.name]!;
         } else if (_constructors.containsKey(callee.name)) {
@@ -1932,18 +1984,20 @@ class CodeGenerator {
           _varTypes[stmt.name] = callee.name;
         }
       }
-    } else if (stmt.value is glu.CopyWithExpr) {
+    } else if (stmt.value is ast.CopyWithExpr) {
       // let p2 = p1.{ x: 10 } → mesmo tipo que p1
-      final cw = stmt.value as glu.CopyWithExpr;
-      if (cw.source is glu.IdentifierExpr) {
-        final srcType = _varTypes[(cw.source as glu.IdentifierExpr).name];
+      final cw = stmt.value as ast.CopyWithExpr;
+      if (cw.source is ast.IdentifierExpr) {
+        final srcType = _varTypes[(cw.source as ast.IdentifierExpr).name];
         if (srcType != null) _varTypes[stmt.name] = srcType;
       }
+    } else if (stmt.value is ast.ListLiteralExpr) {
+      _varTypes[stmt.name] = 'List';
     }
     return varDecl;
   }
 
-  k.Statement _compileVar(glu.VarStmt stmt) {
+  k.Statement _compileVar(ast.VarStmt stmt) {
     final prevCtx = _enumContext;
     if (stmt.type != null) _enumContext = _enumNameFromType(stmt.type!);
     final init = stmt.value != null ? _compileExpr(stmt.value!) : null;
@@ -1958,7 +2012,7 @@ class CodeGenerator {
     return varDecl;
   }
 
-  k.ReturnStatement _compileReturn(glu.ReturnStmt stmt) {
+  k.ReturnStatement _compileReturn(ast.ReturnStmt stmt) {
     final prevCtx = _enumContext;
     if (_currentReturnType != null) {
       _enumContext = _enumNameFromType(_currentReturnType!);
@@ -1968,11 +2022,11 @@ class CodeGenerator {
     return k.ReturnStatement(value);
   }
 
-  k.ExpressionStatement _compileExprStmt(glu.ExprStmt stmt) {
+  k.ExpressionStatement _compileExprStmt(ast.ExprStmt stmt) {
     return k.ExpressionStatement(_compileExpr(stmt.expression));
   }
 
-  k.IfStatement _compileIf(glu.IfStmt stmt) {
+  k.IfStatement _compileIf(ast.IfStmt stmt) {
     final condition = _compileExpr(stmt.condition);
     final then = _compileStatement(stmt.thenBranch);
     final otherwise = stmt.elseBranch != null
@@ -1981,13 +2035,13 @@ class CodeGenerator {
     return k.IfStatement(condition, then, otherwise);
   }
 
-  k.Statement _compileGuard(glu.GuardStmt stmt) {
+  k.Statement _compileGuard(ast.GuardStmt stmt) {
     final condition = k.Not(_compileExpr(stmt.condition));
     final body = _compileStatement(stmt.elseBody);
     return k.IfStatement(condition, body, null);
   }
 
-  k.Statement _compileGuardLet(glu.GuardLetStmt stmt) {
+  k.Statement _compileGuardLet(ast.GuardLetStmt stmt) {
     // guard let name = expr [&& condition] else { body }
     // → var _tmp = expr; if (_tmp == null [|| !condition]) { body } let name = _tmp;
 
@@ -2025,14 +2079,14 @@ class CodeGenerator {
     ]);
   }
 
-  k.WhileStatement _compileWhile(glu.WhileStmt stmt) {
+  k.WhileStatement _compileWhile(ast.WhileStmt stmt) {
     return k.WhileStatement(_compileExpr(stmt.condition), _compileStatement(stmt.body));
   }
 
   /// for await x in stream { body }
   /// → stream.listen((x) { body })
   /// Streaming real: processa cada item conforme chega, não espera todos.
-  k.Statement _compileForAwait(glu.ForAwaitStmt stmt) {
+  k.Statement _compileForAwait(ast.ForAwaitStmt stmt) {
     final stream = _compileExpr(stmt.stream);
 
     _pushScope();
@@ -2057,10 +2111,10 @@ class CodeGenerator {
         stream, k.Name('listen'), k.Arguments([listener])));
   }
 
-  k.Statement _compileForIn(glu.ForInStmt stmt) {
+  k.Statement _compileForIn(ast.ForInStmt stmt) {
     // Otimização: for i in 0..10 → while loop direto
-    if (stmt.iterable is glu.RangeExpr) {
-      return _compileForRange(stmt.variable, stmt.iterable as glu.RangeExpr, stmt.body);
+    if (stmt.iterable is ast.RangeExpr) {
+      return _compileForRange(stmt.variable, stmt.iterable as ast.RangeExpr, stmt.body);
     }
 
     // Compilar como while loop com index (seguro em sync e async)
@@ -2099,7 +2153,7 @@ class CodeGenerator {
   }
 
   /// for i in start..end → var i = start; while (i < end) { body; i++; }
-  k.Statement _compileForRange(String variable, glu.RangeExpr range, glu.Statement body) {
+  k.Statement _compileForRange(String variable, ast.RangeExpr range, ast.Statement body) {
     _pushScope();
     final start = _compileExpr(range.start);
     final end = _compileExpr(range.end);
@@ -2130,47 +2184,47 @@ class CodeGenerator {
   // Expressions
   // ============================================================
 
-  k.Expression _compileExpr(glu.Expression expr) {
+  k.Expression _compileExpr(ast.Expression expr) {
     switch (expr) {
-      case glu.IntLiteralExpr e:
+      case ast.IntLiteralExpr e:
         return k.IntLiteral(e.value);
-      case glu.FloatLiteralExpr e:
+      case ast.FloatLiteralExpr e:
         return k.DoubleLiteral(e.value);
-      case glu.StringLiteralExpr e:
+      case ast.StringLiteralExpr e:
         return _compileStringLiteral(e);
-      case glu.BoolLiteralExpr e:
+      case ast.BoolLiteralExpr e:
         return k.BoolLiteral(e.value);
-      case glu.NilLiteralExpr _:
+      case ast.NilLiteralExpr _:
         return k.NullLiteral();
-      case glu.IdentifierExpr e:
+      case ast.IdentifierExpr e:
         return _compileIdentifier(e);
-      case glu.BinaryExpr e:
+      case ast.BinaryExpr e:
         return _compileBinary(e);
-      case glu.UnaryExpr e:
+      case ast.UnaryExpr e:
         return _compileUnary(e);
-      case glu.CallExpr e:
+      case ast.CallExpr e:
         return _compileCall(e);
-      case glu.MemberExpr e:
+      case ast.MemberExpr e:
         return _compileMember(e);
-      case glu.IndexExpr e:
+      case ast.IndexExpr e:
         return _compileIndex(e);
-      case glu.AssignExpr e:
+      case ast.AssignExpr e:
         return _compileAssign(e);
-      case glu.ClosureExpr e:
+      case ast.ClosureExpr e:
         return _compileClosure(e);
-      case glu.MatchExpr e:
+      case ast.MatchExpr e:
         return _compileMatch(e);
-      case glu.ListLiteralExpr e:
+      case ast.ListLiteralExpr e:
         return _compileList(e);
-      case glu.RangeExpr e:
+      case ast.RangeExpr e:
         return _compileRange(e);
-      case glu.PipeExpr e:
+      case ast.PipeExpr e:
         return _compilePipe(e);
-      case glu.NilCoalesceExpr e:
+      case ast.NilCoalesceExpr e:
         return _compileNilCoalesce(e);
-      case glu.ForceUnwrapExpr e:
+      case ast.ForceUnwrapExpr e:
         return k.NullCheck(_compileExpr(e.operand));
-      case glu.OptionalChainExpr e:
+      case ast.OptionalChainExpr e:
         final obj = _compileExpr(e.object);
         final tmp = k.VariableDeclaration('_oc',
           initializer: obj, type: const k.DynamicType(), isFinal: true);
@@ -2180,9 +2234,9 @@ class CodeGenerator {
           k.DynamicGet(k.DynamicAccessKind.Dynamic, k.VariableGet(tmp), k.Name(e.member)),
           const k.DynamicType(),
         ));
-      case glu.CopyWithExpr e:
+      case ast.CopyWithExpr e:
         return _compileCopyWith(e);
-      case glu.IfLetExpr e:
+      case ast.IfLetExpr e:
         if (e.name.isEmpty) {
           // if as expression: if cond { a } else { b }
           final cond = _compileExpr(e.value);
@@ -2197,35 +2251,35 @@ class CodeGenerator {
         final elseVal = e.elseBranch != null ? _compileBlockValue(e.elseBranch!) : k.NullLiteral();
         return k.Let(tmp, k.ConditionalExpression(
           k.Not(k.EqualsNull(k.VariableGet(tmp))), thenVal, elseVal, const k.DynamicType()));
-      case glu.BlockExpr e:
+      case ast.BlockExpr e:
         if (e.value != null) return _compileExpr(e.value!);
         return k.NullLiteral();
-      case glu.EnumAccessExpr e:
+      case ast.EnumAccessExpr e:
         return _compileEnumAccess(e);
-      case glu.TryExpr e:
+      case ast.TryExpr e:
         return _compileTryOperator(e);
-      case glu.PanicExpr e:
+      case ast.PanicExpr e:
         return _compilePanic(e);
-      case glu.AwaitRaceExpr e:
+      case ast.AwaitRaceExpr e:
         return _compileAwaitRace(e);
-      case glu.AwaitAllExpr e:
+      case ast.AwaitAllExpr e:
         return _compileAwaitAll(e);
-      case glu.AwaitExpr e:
+      case ast.AwaitExpr e:
         return k.AwaitExpression(_compileExpr(e.value));
-      case glu.SpawnExpr e:
+      case ast.SpawnExpr e:
         return _compileSpawn(e);
-      case glu.ComposeExpr e:
+      case ast.ComposeExpr e:
         return _compileCompose(e);
-      case glu.WhereExpr e:
+      case ast.WhereExpr e:
         return _compileWhere(e);
-      case glu.MapLiteralExpr _:
-      case glu.PartialAppExpr _:
-      case glu.StringInterpolationExpr _:
+      case ast.MapLiteralExpr _:
+      case ast.PartialAppExpr _:
+      case ast.StringInterpolationExpr _:
         return k.NullLiteral();
     }
   }
 
-  k.Expression _compileIdentifier(glu.IdentifierExpr expr) {
+  k.Expression _compileIdentifier(ast.IdentifierExpr expr) {
     // self → ThisExpression (dentro de método)
     if (expr.name == 'self' && _currentClass != null) {
       return k.ThisExpression();
@@ -2295,7 +2349,7 @@ class CodeGenerator {
          'Date', 'Duration', 'Csv', 'Url', 'Env',
          'Toml', 'Yaml', 'Xml', 'Json5', 'Ini', 'Markdown', 'Csrf', 'Buffer',
          'Http', 'Ws', 'Net', 'Dns', 'Security', 'Jwt', 'Response',
-         'Channel', 'Broadcast', 'Mailbox', 'Timer', 'Signal'].contains(expr.name)) {
+         'Channel', 'Broadcast', 'Mailbox', 'Timer', 'Signal', 'Bits'].contains(expr.name)) {
       return k.NullLiteral(); // Placeholder, real call handled in _compileCall
     }
 
@@ -2311,7 +2365,7 @@ class CodeGenerator {
     return k.NullLiteral();
   }
 
-  k.Expression _compileBinary(glu.BinaryExpr expr) {
+  k.Expression _compileBinary(ast.BinaryExpr expr) {
     // Custom operators: se o lexeme do operador foi registrado, chamar a função
     if (_customOperators.containsKey(expr.op.lexeme)) {
       final left = _compileExpr(expr.left);
@@ -2324,10 +2378,10 @@ class CodeGenerator {
     // Para == e !=, inferir tipo do enum a partir do outro lado
     final prevCtx = _enumContext;
     if (expr.op.type == TokenType.eqEq || expr.op.type == TokenType.bangEq) {
-      if (expr.right is glu.EnumAccessExpr && expr.left is glu.IdentifierExpr) {
-        _enumContext = _inferEnumFromIdentifier((expr.left as glu.IdentifierExpr).name);
-      } else if (expr.left is glu.EnumAccessExpr && expr.right is glu.IdentifierExpr) {
-        _enumContext = _inferEnumFromIdentifier((expr.right as glu.IdentifierExpr).name);
+      if (expr.right is ast.EnumAccessExpr && expr.left is ast.IdentifierExpr) {
+        _enumContext = _inferEnumFromIdentifier((expr.left as ast.IdentifierExpr).name);
+      } else if (expr.left is ast.EnumAccessExpr && expr.right is ast.IdentifierExpr) {
+        _enumContext = _inferEnumFromIdentifier((expr.right as ast.IdentifierExpr).name);
       }
     }
 
@@ -2369,10 +2423,10 @@ class CodeGenerator {
   }
 
   /// Checa se uma expressao e float (literal float ou identificador com 'f' suffix)
-  bool _isFloatExpr(glu.Expression e) {
-    if (e is glu.FloatLiteralExpr) return true;
+  bool _isFloatExpr(ast.Expression e) {
+    if (e is ast.FloatLiteralExpr) return true;
     // Divisao entre floats
-    if (e is glu.BinaryExpr && e.op.type == TokenType.slash) {
+    if (e is ast.BinaryExpr && e.op.type == TokenType.slash) {
       return _isFloatExpr(e.left) || _isFloatExpr(e.right);
     }
     return false;
@@ -2383,11 +2437,11 @@ class CodeGenerator {
       k.DynamicAccessKind.Dynamic, left, k.Name(op), k.Arguments([right]));
   }
 
-  /// Checa se uma expressão Glu é garantidamente string.
+  /// Checa se uma expressão Itá é garantidamente string.
   /// Usado pra decidir se + deve ser StringConcatenation.
-  bool _isStringExpr(glu.Expression e) {
-    if (e is glu.StringLiteralExpr) return true;
-    if (e is glu.BinaryExpr && e.op.type == TokenType.plus) {
+  bool _isStringExpr(ast.Expression e) {
+    if (e is ast.StringLiteralExpr) return true;
+    if (e is ast.BinaryExpr && e.op.type == TokenType.plus) {
       return _isStringExpr(e.left) || _isStringExpr(e.right);
     }
     return false;
@@ -2404,16 +2458,24 @@ class CodeGenerator {
     TokenType.gt => '>',
     TokenType.ltEq => '<=',
     TokenType.gtEq => '>=',
+    // Bitwise — int do Dart implementa &, |, ^, << nativamente
+    TokenType.amp => '&',
+    TokenType.pipe => '|',
+    TokenType.caret => '^',
+    TokenType.ltLt => '<<',
     _ => '+',
   };
 
-  k.Expression _compileUnary(glu.UnaryExpr expr) {
+  k.Expression _compileUnary(ast.UnaryExpr expr) {
     final operand = _compileExpr(expr.operand);
     if (expr.isPrefix) {
       return switch (expr.op.type) {
         TokenType.bang => k.Not(operand),
         TokenType.minus => k.DynamicInvocation(
           k.DynamicAccessKind.Dynamic, operand, k.Name('unary-'), k.Arguments([])),
+        // NOT bitwise (~) — antes caia no default e virava no-op (bug)
+        TokenType.tilde => k.DynamicInvocation(
+          k.DynamicAccessKind.Dynamic, operand, k.Name('~'), k.Arguments([])),
         _ => operand,
       };
     }
@@ -2424,7 +2486,7 @@ class CodeGenerator {
   // Built-in I/O functions
   // ============================================================
 
-  k.Expression? _compileBuiltinCall(String name, List<glu.Argument> args) {
+  k.Expression? _compileBuiltinCall(String name, List<ast.Argument> args) {
     final compiledArgs = args.map((a) => _compileExpr(a.value)).toList();
 
     switch (name) {
@@ -2623,7 +2685,7 @@ class CodeGenerator {
   // ===========================================================================
 
   /// test("name", () => { body }) → run body in try/catch, print TEST:PASS/FAIL
-  k.Expression _compileTestCall(List<k.Expression> compiledArgs, List<glu.Argument> rawArgs) {
+  k.Expression _compileTestCall(List<k.Expression> compiledArgs, List<ast.Argument> rawArgs) {
     if (rawArgs.length < 2) return k.NullLiteral();
 
     final testName = compiledArgs[0]; // String
@@ -2657,7 +2719,7 @@ class CodeGenerator {
   }
 
   /// bench("name", iterations, () => { body }) → run N times, print timing
-  k.Expression _compileBenchCall(List<k.Expression> compiledArgs, List<glu.Argument> rawArgs) {
+  k.Expression _compileBenchCall(List<k.Expression> compiledArgs, List<ast.Argument> rawArgs) {
     if (rawArgs.length < 2) return k.NullLiteral();
 
     final benchName = compiledArgs[0];
@@ -2945,7 +3007,7 @@ class CodeGenerator {
   /// Internamente equivale a:
   ///   let _fn = () => { ... }
   ///   try { _fn(); if (shouldThrow) FAIL } catch { if (!shouldThrow) FAIL }
-  k.Expression _compileExpectThrowBuiltin(List<k.Expression> compiledArgs, List<glu.Argument> rawArgs, bool shouldThrow) {
+  k.Expression _compileExpectThrowBuiltin(List<k.Expression> compiledArgs, List<ast.Argument> rawArgs, bool shouldThrow) {
     if (rawArgs.isEmpty) return k.NullLiteral();
 
     // Armazenar a closure numa variavel temporaria — a chave do workaround
@@ -2993,7 +3055,7 @@ class CodeGenerator {
 
   /// feature("name", () => { scenarios }) / scenario("name", () => { steps })
   /// Prints "BDD:FEATURE:name" or "BDD:SCENARIO:name", runs body, prints "BDD:END"
-  k.Expression _compileBddBlock(String tag, List<k.Expression> compiledArgs, List<glu.Argument> rawArgs) {
+  k.Expression _compileBddBlock(String tag, List<k.Expression> compiledArgs, List<ast.Argument> rawArgs) {
     if (rawArgs.length < 2) return k.NullLiteral();
 
     final name = compiledArgs[0];
@@ -3022,7 +3084,7 @@ class CodeGenerator {
   }
 
   /// then("description", () => { assertions }) → prints label, runs body in try/catch
-  k.Expression _compileBddThen(List<k.Expression> compiledArgs, List<glu.Argument> rawArgs) {
+  k.Expression _compileBddThen(List<k.Expression> compiledArgs, List<ast.Argument> rawArgs) {
     if (compiledArgs.isEmpty) return k.NullLiteral();
 
     final name = compiledArgs[0];
@@ -3064,7 +3126,7 @@ class CodeGenerator {
   // Runs the callback in a loop until time runs out.
   // Reports iterations completed, elapsed time, and avg time per iteration.
 
-  k.Expression _compileStressCall(List<k.Expression> compiledArgs, List<glu.Argument> rawArgs) {
+  k.Expression _compileStressCall(List<k.Expression> compiledArgs, List<ast.Argument> rawArgs) {
     if (rawArgs.length < 3) return k.NullLiteral();
 
     final name = compiledArgs[0];
@@ -3142,7 +3204,7 @@ class CodeGenerator {
   }
 
   /// flow("name", () => { steps + cleanup }) → wraps in try/finally for cleanup
-  k.Expression _compileFlowCall(List<k.Expression> compiledArgs, List<glu.Argument> rawArgs) {
+  k.Expression _compileFlowCall(List<k.Expression> compiledArgs, List<ast.Argument> rawArgs) {
     if (rawArgs.length < 2) return k.NullLiteral();
 
     final name = compiledArgs[0];
@@ -3180,7 +3242,7 @@ class CodeGenerator {
   }
 
   /// step("description", () => { body }) → run body in try/catch, print E2E:STEP:PASS/FAIL
-  k.Expression _compileStepCall(List<k.Expression> compiledArgs, List<glu.Argument> rawArgs) {
+  k.Expression _compileStepCall(List<k.Expression> compiledArgs, List<ast.Argument> rawArgs) {
     if (rawArgs.length < 2) return k.NullLiteral();
 
     final name = compiledArgs[0];
@@ -3230,7 +3292,7 @@ class CodeGenerator {
 
   /// cleanup(() => { body }) → runs body (for cleanup after flow)
   /// Prints E2E:CLEANUP before running
-  k.Expression _compileCleanupCall(List<k.Expression> compiledArgs, List<glu.Argument> rawArgs) {
+  k.Expression _compileCleanupCall(List<k.Expression> compiledArgs, List<ast.Argument> rawArgs) {
     if (rawArgs.isEmpty) return k.NullLiteral();
 
     final callback = compiledArgs[0];
@@ -3803,6 +3865,9 @@ class CodeGenerator {
       case 'Buffer':
         return _compileBufferCall(method, args);
 
+      case 'Bits':
+        return _compileBitsCall(method, args);
+
       // ==========================================================
       // HTTP + WebSocket MODULE
       // ==========================================================
@@ -3955,7 +4020,7 @@ class CodeGenerator {
     }
   }
 
-  /// Gera helper: glu_envLoad(String path) → Map<String, String>
+  /// Gera helper: ita_envLoad(String path) → Map<String, String>
   /// Parse .env: KEY=VALUE (ignora # comments, linhas vazias, trim quotes)
   void _ensureEnvLoadHelper() {
     if (_envLoadFn != null) return;
@@ -4062,7 +4127,7 @@ class CodeGenerator {
       k.ReturnStatement(k.VariableGet(mapVar))]);
 
     _envLoadFn = k.Procedure(
-      k.Name('glu_envLoad'), k.ProcedureKind.Method,
+      k.Name('ita_envLoad'), k.ProcedureKind.Method,
       k.FunctionNode(body,
         positionalParameters: [pathParam],
         returnType: const k.DynamicType()),
@@ -4146,7 +4211,7 @@ class CodeGenerator {
     }
 
     final proc = k.Procedure(
-      k.Name('glu_${format}Parse'), k.ProcedureKind.Method,
+      k.Name('ita_${format}Parse'), k.ProcedureKind.Method,
       k.FunctionNode(body,
         positionalParameters: [inputParam],
         returnType: const k.DynamicType()),
@@ -4164,7 +4229,7 @@ class CodeGenerator {
   /// Parser KV (TOML/INI): key = value, [section], # comments
   k.Statement _buildKvParser(k.VariableDeclaration inputParam, String separator) {
     // Reusar a mesma lógica do Env parser mas com suporte a [sections]
-    // Simplificado: chama glu_envLoad lógica inline
+    // Simplificado: chama ita_envLoad lógica inline
     final contentVar = k.VariableDeclaration('_lines',
       initializer: k.DynamicInvocation(k.DynamicAccessKind.Dynamic,
         k.VariableGet(inputParam), k.Name('split'),
@@ -4850,7 +4915,7 @@ class CodeGenerator {
     final body = k.Block([port, sendBack, subs, listenCall]);
 
     _broadcastBrokerEntry = k.Procedure(
-      k.Name('glu_broadcastBroker'), k.ProcedureKind.Method,
+      k.Name('ita_broadcastBroker'), k.ProcedureKind.Method,
       k.FunctionNode(body,
         positionalParameters: [mainPort],
         returnType: const k.VoidType()),
@@ -5600,7 +5665,7 @@ class CodeGenerator {
             k.ReturnStatement(k.NullLiteral()))]))]);
 
     _routeMatchFn = k.Procedure(
-      k.Name('glu_matchRoute'), k.ProcedureKind.Method,
+      k.Name('ita_matchRoute'), k.ProcedureKind.Method,
       k.FunctionNode(body,
         positionalParameters: [patParam, pathParam],
         returnType: const k.DynamicType()),
@@ -5818,6 +5883,165 @@ class CodeGenerator {
         }
         return k.NullLiteral();
 
+      // ------------------------------------------------------------
+      // Fase 1A — leitura/escrita de inteiros (largura + endianness
+      // explicitas no nome), backed por ByteData sobre o Uint8List.
+      // O ByteData do Dart faz bounds-check e lanca RangeError em acesso
+      // OOB: nenhuma leitura/escrita fora dos limites (memory-safe). NAO
+      // desabilitar. TODO(1C): envolver OOB -> Result (fase separada).
+      // ------------------------------------------------------------
+
+      case 'readU8':
+        // Buffer.readU8(buf, off) → ByteData.sublistView(buf).getUint8(off)
+        if (args.length >= 2) {
+          return k.DynamicInvocation(k.DynamicAccessKind.Dynamic,
+            _byteDataOf(args[0]), k.Name('getUint8'), k.Arguments([args[1]]));
+        }
+        return k.NullLiteral();
+
+      case 'readU16BE':
+      case 'readU16LE':
+        // Buffer.readU16BE/LE(buf, off) → ByteData.sublistView(buf).getUint16(off, Endian.big/little)
+        if (args.length >= 2) {
+          return k.DynamicInvocation(k.DynamicAccessKind.Dynamic,
+            _byteDataOf(args[0]), k.Name('getUint16'),
+            k.Arguments([args[1], _endianConst(method.endsWith('LE'))]));
+        }
+        return k.NullLiteral();
+
+      case 'readU32BE':
+      case 'readU32LE':
+        // Buffer.readU32BE/LE(buf, off) → ByteData.sublistView(buf).getUint32(off, Endian.big/little)
+        if (args.length >= 2) {
+          return k.DynamicInvocation(k.DynamicAccessKind.Dynamic,
+            _byteDataOf(args[0]), k.Name('getUint32'),
+            k.Arguments([args[1], _endianConst(method.endsWith('LE'))]));
+        }
+        return k.NullLiteral();
+
+      case 'writeU8':
+        // Buffer.writeU8(buf, off, value) → ByteData.sublistView(buf).setUint8(off, value)
+        if (args.length >= 3) {
+          return k.DynamicInvocation(k.DynamicAccessKind.Dynamic,
+            _byteDataOf(args[0]), k.Name('setUint8'), k.Arguments([args[1], args[2]]));
+        }
+        return k.NullLiteral();
+
+      case 'writeU16BE':
+      case 'writeU16LE':
+        // Buffer.writeU16BE/LE(buf, off, value) → ByteData.sublistView(buf).setUint16(off, value, Endian.big/little)
+        if (args.length >= 3) {
+          return k.DynamicInvocation(k.DynamicAccessKind.Dynamic,
+            _byteDataOf(args[0]), k.Name('setUint16'),
+            k.Arguments([args[1], args[2], _endianConst(method.endsWith('LE'))]));
+        }
+        return k.NullLiteral();
+
+      case 'writeU32BE':
+      case 'writeU32LE':
+        // Buffer.writeU32BE/LE(buf, off, value) → ByteData.sublistView(buf).setUint32(off, value, Endian.big/little)
+        if (args.length >= 3) {
+          return k.DynamicInvocation(k.DynamicAccessKind.Dynamic,
+            _byteDataOf(args[0]), k.Name('setUint32'),
+            k.Arguments([args[1], args[2], _endianConst(method.endsWith('LE'))]));
+        }
+        return k.NullLiteral();
+
+      case 'writeString':
+        // Buffer.writeString(buf, off, str) → buf.setAll(off, utf8.encode(str))
+        // Bytes UTF-8 (ASCII e subconjunto) copiados a partir de `off`. O setAll
+        // do Uint8List faz bounds-check e lanca RangeError se off+len > length —
+        // memory-safe, sem OOB. TODO(1C): OOB->Result.
+        if (args.length >= 3) {
+          return k.DynamicInvocation(k.DynamicAccessKind.Dynamic,
+            args[0], k.Name('setAll'), k.Arguments([
+              args[1],
+              k.DynamicInvocation(k.DynamicAccessKind.Dynamic,
+                k.StaticGet(_utf8Field), k.Name('encode'), k.Arguments([args[2]]))]));
+        }
+        return k.NullLiteral();
+
+      default:
+        return k.NullLiteral();
+    }
+  }
+
+  /// ByteData view sobre o Uint8List `buf`, respeitando offset/length de
+  /// slices (idioma da doc do SDK: `ByteData.sublistView(bytes)`). Bounds-check
+  /// nativo do ByteData garante que nenhum get/set le/escreve OOB.
+  k.Expression _byteDataOf(k.Expression buf) =>
+    k.StaticInvocation(_byteDataSublistView, k.Arguments([buf]));
+
+  /// `Endian.little` se [little], senao `Endian.big` — endianness explicita
+  /// exigida pelo nome do metodo (sem host-endian default).
+  k.Expression _endianConst(bool little) =>
+    k.StaticGet(_endianClass.fields.firstWhere(
+      (f) => f.name.text == (little ? 'little' : 'big')));
+
+  // ============================================================
+  // Bits Module — operacoes de palavra explicitas (Fase 1B).
+  // O Itá proibe operadores bitwise na SINTAXE (precedencia ambigua;
+  // >> colide com Compose). Aqui eles reaparecem como metodos nomeados,
+  // mapeados aos operadores nativos de `int` do Dart no Kernel — runtime,
+  // permitido (a proibicao e na sintaxe da linguagem, nao no lowering).
+  // ============================================================
+
+  k.Expression _compileBitsCall(String method, List<k.Expression> args) {
+    switch (method) {
+      case 'and':
+        // Bits.and(a, b) → a & b
+        if (args.length >= 2) return _dynamicOp(args[0], '&', args[1]);
+        return k.NullLiteral();
+
+      case 'or':
+        // Bits.or(a, b) → a | b
+        if (args.length >= 2) return _dynamicOp(args[0], '|', args[1]);
+        return k.NullLiteral();
+
+      case 'xor':
+        // Bits.xor(a, b) → a ^ b
+        if (args.length >= 2) return _dynamicOp(args[0], '^', args[1]);
+        return k.NullLiteral();
+
+      case 'not':
+        // Bits.not(a) → ~a
+        if (args.isNotEmpty) {
+          return k.DynamicInvocation(k.DynamicAccessKind.Dynamic,
+            args[0], k.Name('~'), k.Arguments([]));
+        }
+        return k.NullLiteral();
+
+      case 'shl':
+        // Bits.shl(x, n) → x << n
+        if (args.length >= 2) return _dynamicOp(args[0], '<<', args[1]);
+        return k.NullLiteral();
+
+      case 'shr':
+        // Bits.shr(x, n) → x >> n
+        if (args.length >= 2) return _dynamicOp(args[0], '>>', args[1]);
+        return k.NullLiteral();
+
+      case 'bit':
+        // Bits.bit(x, i) → ((x >> i) & 1) == 1  (Bool do i-esimo bit)
+        if (args.length >= 2) {
+          final masked = _dynamicOp(
+            _dynamicOp(args[0], '>>', args[1]), '&', k.IntLiteral(1));
+          return k.EqualsCall(masked, k.IntLiteral(1),
+            functionType: k.FunctionType(
+              [const k.DynamicType()], const k.DynamicType(), k.Nullability.nonNullable),
+            interfaceTarget: _coreTypes.objectEquals);
+        }
+        return k.NullLiteral();
+
+      case 'bits':
+        // Bits.bits(x, off, count) → (x >> off) & ((1 << count) - 1)  (campo de bits)
+        if (args.length >= 3) {
+          final mask = _dynamicOp(
+            _dynamicOp(k.IntLiteral(1), '<<', args[2]), '-', k.IntLiteral(1));
+          return _dynamicOp(_dynamicOp(args[0], '>>', args[1]), '&', mask);
+        }
+        return k.NullLiteral();
+
       default:
         return k.NullLiteral();
     }
@@ -5880,7 +6104,7 @@ class CodeGenerator {
     }
   }
 
-  /// Gera helper: glu_csvParse(String input, String delim) → List<List<String>>
+  /// Gera helper: ita_csvParse(String input, String delim) → List<List<String>>
   void _ensureCsvParseHelper() {
     if (_csvParseFn != null) return;
 
@@ -5935,7 +6159,7 @@ class CodeGenerator {
         k.Name('toList'), k.Arguments([])));
 
     _csvParseFn = k.Procedure(
-      k.Name('glu_csvParse'), k.ProcedureKind.Method,
+      k.Name('ita_csvParse'), k.ProcedureKind.Method,
       k.FunctionNode(body,
         positionalParameters: [inputParam, delimParam],
         returnType: const k.DynamicType()),
@@ -5943,7 +6167,7 @@ class CodeGenerator {
     _library.addProcedure(_csvParseFn!);
   }
 
-  /// Gera helper: glu_csvStringify(List<List> data, String delim) → String
+  /// Gera helper: ita_csvStringify(List<List> data, String delim) → String
   void _ensureCsvStringifyHelper() {
     if (_csvStringifyFn != null) return;
 
@@ -5977,7 +6201,7 @@ class CodeGenerator {
         k.Name('join'), k.Arguments([k.StringLiteral('\n')])));
 
     _csvStringifyFn = k.Procedure(
-      k.Name('glu_csvStringify'), k.ProcedureKind.Method,
+      k.Name('ita_csvStringify'), k.ProcedureKind.Method,
       k.FunctionNode(body,
         positionalParameters: [dataParam, delimParam],
         returnType: const k.DynamicType()),
@@ -6739,17 +6963,17 @@ class CodeGenerator {
       k.Name('trim'), k.Arguments([]));
   }
 
-  k.Expression _compileCall(glu.CallExpr expr) {
+  k.Expression _compileCall(ast.CallExpr expr) {
     final callee = expr.callee;
 
     // === Built-in functions ===
-    if (callee is glu.IdentifierExpr) {
+    if (callee is ast.IdentifierExpr) {
       final builtinResult = _compileBuiltinCall(callee.name, expr.args);
       if (builtinResult != null) return builtinResult;
     }
 
     // === Constructor: Point(x: 1.0, y: 2.0) ===
-    if (callee is glu.IdentifierExpr && _constructors.containsKey(callee.name)) {
+    if (callee is ast.IdentifierExpr && _constructors.containsKey(callee.name)) {
       final ctor = _constructors[callee.name]!;
       final cls = _classes[callee.name]!;
       final named = <k.NamedExpression>[];
@@ -6770,7 +6994,7 @@ class CodeGenerator {
     }
 
     // === Top-level function ===
-    if (callee is glu.IdentifierExpr && _functions.containsKey(callee.name)) {
+    if (callee is ast.IdentifierExpr && _functions.containsKey(callee.name)) {
       final paramTypes = _fnParamTypes[callee.name] ?? [];
       final declaredCount = paramTypes.length;
       final providedCount = expr.args.length;
@@ -6803,8 +7027,8 @@ class CodeGenerator {
     }
 
     // === Static namespace calls: File.read(), Dir.list(), Path.join(), log.info() ===
-    if (callee is glu.MemberExpr && callee.object is glu.IdentifierExpr) {
-      final ns = (callee.object as glu.IdentifierExpr).name;
+    if (callee is ast.MemberExpr && callee.object is ast.IdentifierExpr) {
+      final ns = (callee.object as ast.IdentifierExpr).name;
       if (['File', 'Dir', 'Path', 'log', 'Json', 'Terminal', 'Shell',
            'Hash', 'Checksum', 'Crypto', 'Base64', 'Hex', 'Hmac',
            'Aes', 'Rsa', 'Ed25519', 'Password',
@@ -6812,15 +7036,15 @@ class CodeGenerator {
            'Date', 'Duration', 'Csv', 'Url', 'Env',
            'Toml', 'Yaml', 'Xml', 'Json5', 'Ini', 'Markdown', 'Csrf', 'Buffer',
            'Http', 'Ws', 'Net', 'Dns', 'Security', 'Jwt', 'Response',
-           'Channel', 'Broadcast', 'Mailbox', 'Timer', 'Signal'].contains(ns)) {
+           'Channel', 'Broadcast', 'Mailbox', 'Timer', 'Signal', 'Bits'].contains(ns)) {
         final args = expr.args.map((a) => _compileExpr(a.value)).toList();
         return _compileStaticNamespaceCall(ns, callee.member, args);
       }
     }
 
     // === Enum variant constructor: Shape.circle(radius: 5.0) ===
-    if (callee is glu.MemberExpr && callee.object is glu.IdentifierExpr) {
-      final enumName = (callee.object as glu.IdentifierExpr).name;
+    if (callee is ast.MemberExpr && callee.object is ast.IdentifierExpr) {
+      final enumName = (callee.object as ast.IdentifierExpr).name;
       if (_enumVariants.containsKey(enumName) &&
           _enumVariants[enumName]!.containsKey(callee.member)) {
         final ctor = _constructors['${enumName}_${callee.member}']!;
@@ -6838,10 +7062,10 @@ class CodeGenerator {
     }
 
     // === Test assertions: expect(x).toBe(y), expect(x).toBeTrue(), etc. ===
-    if (callee is glu.MemberExpr && callee.object is glu.CallExpr) {
-      final callObj = callee.object as glu.CallExpr;
-      if (callObj.callee is glu.IdentifierExpr &&
-          (callObj.callee as glu.IdentifierExpr).name == 'expect') {
+    if (callee is ast.MemberExpr && callee.object is ast.CallExpr) {
+      final callObj = callee.object as ast.CallExpr;
+      if (callObj.callee is ast.IdentifierExpr &&
+          (callObj.callee as ast.IdentifierExpr).name == 'expect') {
         final compiledActual = callObj.args.isNotEmpty ? _compileExpr(callObj.args[0].value) : k.NullLiteral();
         final method = callee.member;
         final methodArgs = expr.args.map((a) => _compileExpr(a.value)).toList();
@@ -6849,7 +7073,7 @@ class CodeGenerator {
         // Para closures passadas a expect (toThrow, toNotThrow), armazenar
         // numa variavel temporaria para evitar que FunctionExpression aninhado
         // se perca no Dart Kernel IR
-        if (callObj.args.isNotEmpty && callObj.args[0].value is glu.ClosureExpr) {
+        if (callObj.args.isNotEmpty && callObj.args[0].value is ast.ClosureExpr) {
           final tmpVar = k.VariableDeclaration('_expectFn',
             initializer: compiledActual, type: const k.DynamicType(), isFinal: true);
           final assertion = _compileExpectAssertion(k.VariableGet(tmpVar), method, methodArgs);
@@ -6861,7 +7085,7 @@ class CodeGenerator {
     }
 
     // === Method call: obj.method(args) ===
-    if (callee is glu.MemberExpr) {
+    if (callee is ast.MemberExpr) {
       final obj = _compileExpr(callee.object);
       final args = expr.args.map((a) => _compileExpr(a.value)).toList();
 
@@ -6871,7 +7095,7 @@ class CodeGenerator {
         // Stream method → chama top-level async* function diretamente
         final streamMethods = _actorStreamMethods[varType] ?? {};
         if (streamMethods.contains(callee.member)) {
-          final fnName = 'glu_${varType}_${callee.member}';
+          final fnName = 'ita_${varType}_${callee.member}';
           final fn = _functions[fnName];
           if (fn != null) {
             return k.StaticInvocation(fn, k.Arguments(args));
@@ -6926,10 +7150,10 @@ class CodeGenerator {
     );
   }
 
-  k.Expression _compileMember(glu.MemberExpr expr) {
+  k.Expression _compileMember(ast.MemberExpr expr) {
     // Enum static access: Shape.circle → constructor call (sem args)
-    if (expr.object is glu.IdentifierExpr) {
-      final enumName = (expr.object as glu.IdentifierExpr).name;
+    if (expr.object is ast.IdentifierExpr) {
+      final enumName = (expr.object as ast.IdentifierExpr).name;
       if (_enumVariants.containsKey(enumName)) {
         final variants = _enumVariants[enumName]!;
         if (variants.containsKey(expr.member)) {
@@ -6951,7 +7175,7 @@ class CodeGenerator {
     return k.DynamicGet(k.DynamicAccessKind.Dynamic, obj, k.Name(expr.member));
   }
 
-  k.Expression _compileEnumAccess(glu.EnumAccessExpr expr) {
+  k.Expression _compileEnumAccess(ast.EnumAccessExpr expr) {
     // .variant shorthand — usa contexto de tipo se disponível
     if (_enumContext != null && _enumVariants.containsKey(_enumContext)) {
       final variants = _enumVariants[_enumContext]!;
@@ -6971,7 +7195,7 @@ class CodeGenerator {
 
   /// Constrói uma instância de um enum variant.
   k.Expression _constructEnumVariant(
-      String enumName, String variant, List<glu.Argument> args) {
+      String enumName, String variant, List<ast.Argument> args) {
     final variantCls = _enumVariants[enumName]![variant]!;
     final ctor = _constructors['${enumName}_$variant']!;
 
@@ -6994,32 +7218,36 @@ class CodeGenerator {
   }
 
   /// Extrai nome do enum a partir de um TypeAnnotation.
-  String? _enumNameFromType(glu.TypeAnnotation type) {
-    if (type is glu.NamedType && _enumVariants.containsKey(type.name)) {
+  String? _enumNameFromType(ast.TypeAnnotation type) {
+    if (type is ast.NamedType && _enumVariants.containsKey(type.name)) {
       return type.name;
     }
     return null;
   }
 
   /// Infere o tipo do receiver de um method call pra resolver builtins.
-  String? _inferReceiverType(glu.Expression expr) {
+  String? _inferReceiverType(ast.Expression expr) {
     // Chamada encadeada: findUser(1).map(...) → o tipo vem do return type de findUser
-    if (expr is glu.CallExpr && expr.callee is glu.IdentifierExpr) {
-      final fnName = (expr.callee as glu.IdentifierExpr).name;
+    if (expr is ast.CallExpr && expr.callee is ast.IdentifierExpr) {
+      final fnName = (expr.callee as ast.IdentifierExpr).name;
       // Procurar nas declarations pelo return type da função
       // Heurística simples: se o nome da função está no _functions e temos o return type
       return _fnReturnTypes[fnName];
     }
     // Chamada encadeada em method call: x.map().unwrapOr() — propagate
-    if (expr is glu.CallExpr && expr.callee is glu.MemberExpr) {
+    if (expr is ast.CallExpr && expr.callee is ast.MemberExpr) {
       return _inferReceiverType(expr.callee);
     }
-    if (expr is glu.MemberExpr) {
+    if (expr is ast.MemberExpr) {
       return _inferReceiverType(expr.object);
     }
     // Variável com tipo conhecido
-    if (expr is glu.IdentifierExpr) {
+    if (expr is ast.IdentifierExpr) {
       return _varTypes[expr.name];
+    }
+    // List literal direto: [1,2,3].map(...)
+    if (expr is ast.ListLiteralExpr) {
+      return 'List';
     }
     return null;
   }
@@ -7032,7 +7260,7 @@ class CodeGenerator {
     return null; // será expandido com type inference
   }
 
-  k.Expression _compileCopyWith(glu.CopyWithExpr expr) {
+  k.Expression _compileCopyWith(ast.CopyWithExpr expr) {
     // p.{ x: 10.0 } → cria novo struct copiando campos + overrides
     final source = _compileExpr(expr.source);
     final tmp = k.VariableDeclaration('_cw',
@@ -7046,8 +7274,8 @@ class CodeGenerator {
 
     // Tentar inferir o tipo pra saber os campos
     String? typeName;
-    if (expr.source is glu.IdentifierExpr) {
-      typeName = _varTypes[(expr.source as glu.IdentifierExpr).name];
+    if (expr.source is ast.IdentifierExpr) {
+      typeName = _varTypes[(expr.source as ast.IdentifierExpr).name];
     }
 
     if (typeName != null && _constructors.containsKey(typeName) && _typeFields.containsKey(typeName)) {
@@ -7074,16 +7302,16 @@ class CodeGenerator {
     return k.Let(tmp, k.VariableGet(tmp));
   }
 
-  k.Expression _compileIndex(glu.IndexExpr expr) {
+  k.Expression _compileIndex(ast.IndexExpr expr) {
     final obj = _compileExpr(expr.object);
     final index = _compileExpr(expr.index);
     return k.DynamicInvocation(
       k.DynamicAccessKind.Dynamic, obj, k.Name('[]'), k.Arguments([index]));
   }
 
-  k.Expression _compileAssign(glu.AssignExpr expr) {
-    if (expr.target is glu.IdentifierExpr) {
-      final name = (expr.target as glu.IdentifierExpr).name;
+  k.Expression _compileAssign(ast.AssignExpr expr) {
+    if (expr.target is ast.IdentifierExpr) {
+      final name = (expr.target as ast.IdentifierExpr).name;
       final varDecl = _lookupVar(name);
       if (varDecl == null) {
         _error('Undefined: $name', expr.line, expr.column);
@@ -7110,8 +7338,8 @@ class CodeGenerator {
       return k.VariableSet(varDecl, value);
     }
 
-    if (expr.target is glu.MemberExpr) {
-      final member = expr.target as glu.MemberExpr;
+    if (expr.target is ast.MemberExpr) {
+      final member = expr.target as ast.MemberExpr;
       final obj = _compileExpr(member.object);
       return k.DynamicSet(
         k.DynamicAccessKind.Dynamic, obj, k.Name(member.member),
@@ -7122,7 +7350,7 @@ class CodeGenerator {
     return k.NullLiteral();
   }
 
-  k.Expression _compileClosure(glu.ClosureExpr expr) {
+  k.Expression _compileClosure(ast.ClosureExpr expr) {
     _pushScope();
     final params = <k.VariableDeclaration>[];
 
@@ -7148,16 +7376,16 @@ class CodeGenerator {
     }
 
     k.Statement body;
-    if (expr.body is glu.ExprStmt) {
+    if (expr.body is ast.ExprStmt) {
       // Arrow closure: () => expr
-      body = k.ReturnStatement(_compileExpr((expr.body as glu.ExprStmt).expression));
-    } else if (expr.body is glu.BlockStmt) {
+      body = k.ReturnStatement(_compileExpr((expr.body as ast.ExprStmt).expression));
+    } else if (expr.body is ast.BlockStmt) {
       // Block closure: () => { stmts; lastExpr }
       // Adiciona return implicito na ultima expressao do bloco
-      final block = expr.body as glu.BlockStmt;
-      if (block.statements.isNotEmpty && block.statements.last is glu.ExprStmt) {
+      final block = expr.body as ast.BlockStmt;
+      if (block.statements.isNotEmpty && block.statements.last is ast.ExprStmt) {
         final stmts = block.statements.sublist(0, block.statements.length - 1);
-        final lastExpr = (block.statements.last as glu.ExprStmt).expression;
+        final lastExpr = (block.statements.last as ast.ExprStmt).expression;
         final compiledStmts = stmts.map((s) => _compileStatement(s)).toList();
         compiledStmts.add(k.ReturnStatement(_compileExpr(lastExpr)));
         body = k.Block(compiledStmts);
@@ -7180,7 +7408,7 @@ class CodeGenerator {
   // Match + Patterns
   // ============================================================
 
-  k.Expression _compileMatch(glu.MatchExpr expr) {
+  k.Expression _compileMatch(ast.MatchExpr expr) {
     final subject = _compileExpr(expr.subject);
     final tmpVar = k.VariableDeclaration('_match',
       initializer: subject, type: const k.DynamicType(), isFinal: true);
@@ -7194,37 +7422,28 @@ class CodeGenerator {
       final bindings = <k.Statement>[];
       final condition = _compilePattern(arm.pattern, k.VariableGet(tmpVar), bindings);
 
-      k.Expression body;
-      if (bindings.isNotEmpty) {
-        // Wrap body com bindings
-        final bodyExpr = _compileExpr(arm.body);
-        // Usar Let chain para bindings
-        body = bodyExpr;
-        for (var j = bindings.length - 1; j >= 0; j--) {
-          final binding = bindings[j] as k.VariableDeclaration;
-          body = k.Let(binding, body);
-        }
-      } else {
-        body = _compileExpr(arm.body);
-      }
+      // Guard e body são compilados DENTRO do escopo dos bindings do pattern,
+      // senão a variável capturada (ex: `n if n > 10`) não é resolvida e vem
+      // null em runtime. O guard, quando falha, cai no `result` (fall-through).
+      final guardExpr = arm.guard != null ? _compileExpr(arm.guard!) : null;
+      final bodyExpr = _compileExpr(arm.body);
       _popScope();
 
-      if (condition == null && arm.guard == null) {
-        // Wildcard sem guard — default case
-        result = body;
+      k.Expression armValue = guardExpr != null
+        ? k.ConditionalExpression(guardExpr, bodyExpr, result, const k.DynamicType())
+        : bodyExpr;
+
+      // Embrulha os bindings (Let chain) em volta de guard+body.
+      for (var j = bindings.length - 1; j >= 0; j--) {
+        armValue = k.Let(bindings[j] as k.VariableDeclaration, armValue);
+      }
+
+      if (condition == null) {
+        // Pattern irrefutável (wildcard/identifier). Com guard, armValue já
+        // embute o fall-through; sem guard, é o caso default.
+        result = armValue;
       } else {
-        // Combinar condition do pattern + guard
-        k.Expression fullCond;
-        if (condition != null && arm.guard != null) {
-          fullCond = k.LogicalExpression(
-            condition, k.LogicalExpressionOperator.AND, _compileExpr(arm.guard!));
-        } else if (condition != null) {
-          fullCond = condition;
-        } else {
-          // Wildcard COM guard — guard é a condição inteira
-          fullCond = _compileExpr(arm.guard!);
-        }
-        result = k.ConditionalExpression(fullCond, body, result, const k.DynamicType());
+        result = k.ConditionalExpression(condition, armValue, result, const k.DynamicType());
       }
     }
 
@@ -7234,11 +7453,11 @@ class CodeGenerator {
     return k.Let(tmpVar, result);
   }
 
-  void _checkExhaustiveMatch(glu.MatchExpr expr) {
+  void _checkExhaustiveMatch(ast.MatchExpr expr) {
     // Inferir tipo do subject
     String? enumName;
-    if (expr.subject is glu.IdentifierExpr) {
-      enumName = _varTypes[(expr.subject as glu.IdentifierExpr).name];
+    if (expr.subject is ast.IdentifierExpr) {
+      enumName = _varTypes[(expr.subject as ast.IdentifierExpr).name];
     }
     if (enumName == null || !_enumVariants.containsKey(enumName)) return;
 
@@ -7247,10 +7466,10 @@ class CodeGenerator {
     var hasWildcard = false;
 
     for (final arm in expr.arms) {
-      if (arm.pattern is glu.WildcardPattern || arm.pattern is glu.IdentifierPattern) {
+      if (arm.pattern is ast.WildcardPattern || arm.pattern is ast.IdentifierPattern) {
         hasWildcard = true;
-      } else if (arm.pattern is glu.EnumPattern) {
-        coveredVariants.add((arm.pattern as glu.EnumPattern).variant);
+      } else if (arm.pattern is ast.EnumPattern) {
+        coveredVariants.add((arm.pattern as ast.EnumPattern).variant);
       }
     }
 
@@ -7265,12 +7484,12 @@ class CodeGenerator {
   }
 
   k.Expression? _compilePattern(
-    glu.Pattern pattern, k.Expression subject, List<k.Statement> bindings) {
+    ast.Pattern pattern, k.Expression subject, List<k.Statement> bindings) {
     switch (pattern) {
-      case glu.WildcardPattern _:
+      case ast.WildcardPattern _:
         return null;
 
-      case glu.IdentifierPattern p:
+      case ast.IdentifierPattern p:
         // Binding: captura o valor
         final binding = k.VariableDeclaration(p.name,
           initializer: subject, type: const k.DynamicType(), isFinal: true);
@@ -7278,14 +7497,14 @@ class CodeGenerator {
         _declareVar(p.name, binding);
         return null; // irrefutable
 
-      case glu.LiteralPattern p:
+      case ast.LiteralPattern p:
         final literal = _compileExpr(p.literal);
         return k.EqualsCall(subject, literal,
           functionType: k.FunctionType(
             [const k.DynamicType()], const k.DynamicType(), k.Nullability.nonNullable),
           interfaceTarget: _coreTypes.objectEquals);
 
-      case glu.EnumPattern p:
+      case ast.EnumPattern p:
         // .variant(bindings) → subject is EnumName_variant
         // Procura a variant class
         k.Class? variantCls;
@@ -7306,7 +7525,7 @@ class CodeGenerator {
         final fieldNames = _enumVariantFields[variantCls] ?? [];
         for (var i = 0; i < p.subpatterns.length && i < fieldNames.length; i++) {
           final subp = p.subpatterns[i];
-          if (subp is glu.IdentifierPattern) {
+          if (subp is ast.IdentifierPattern) {
             final fieldGet = k.DynamicGet(
               k.DynamicAccessKind.Dynamic, subject, k.Name(fieldNames[i]));
             final binding = k.VariableDeclaration(subp.name,
@@ -7318,36 +7537,55 @@ class CodeGenerator {
 
         return isCheck;
 
-      case glu.ListPattern p:
-        if (p.elements.isEmpty) {
-          return k.EqualsCall(
-            k.DynamicGet(k.DynamicAccessKind.Dynamic, subject, k.Name('length')),
-            k.IntLiteral(0),
-            functionType: k.FunctionType(
-              [const k.DynamicType()], const k.DynamicType(), k.Nullability.nonNullable),
-            interfaceTarget: _coreTypes.objectEquals);
-        }
-        final expectedLen = p.elements.where((e) => e is! glu.RestPattern).length;
-        if (p.hasRest) {
-          return _dynamicOp(
-            k.DynamicGet(k.DynamicAccessKind.Dynamic, subject, k.Name('length')),
-            '>=', k.IntLiteral(expectedLen));
-        }
-        return k.EqualsCall(
-          k.DynamicGet(k.DynamicAccessKind.Dynamic, subject, k.Name('length')),
-          k.IntLiteral(expectedLen),
-          functionType: k.FunctionType(
-            [const k.DynamicType()], const k.DynamicType(), k.Nullability.nonNullable),
-          interfaceTarget: _coreTypes.objectEquals);
+      case ast.ListPattern p:
+        final fixedCount = p.elements.where((e) => e is! ast.RestPattern).length;
 
-      case glu.RangePattern p:
+        // Condição de tamanho: == fixedCount, ou >= fixedCount se houver rest.
+        k.Expression cond = p.hasRest
+          ? _dynamicOp(
+              k.DynamicGet(k.DynamicAccessKind.Dynamic, subject, k.Name('length')),
+              '>=', k.IntLiteral(fixedCount))
+          : k.EqualsCall(
+              k.DynamicGet(k.DynamicAccessKind.Dynamic, subject, k.Name('length')),
+              k.IntLiteral(fixedCount),
+              functionType: k.FunctionType([const k.DynamicType()],
+                const k.DynamicType(), k.Nullability.nonNullable),
+              interfaceTarget: _coreTypes.objectEquals);
+
+        // Bind elementos posicionais (recursivo) e o rest (sublist). Rest é
+        // assumido no fim — elementos após o rest não são suportados.
+        var idx = 0;
+        for (final el in p.elements) {
+          if (el is ast.RestPattern) {
+            if (el.name != null) {
+              final sub = k.DynamicInvocation(k.DynamicAccessKind.Dynamic, subject,
+                k.Name('sublist'), k.Arguments([k.IntLiteral(idx)]));
+              final binding = k.VariableDeclaration(el.name!,
+                initializer: sub, type: const k.DynamicType(), isFinal: true);
+              bindings.add(binding);
+              _declareVar(el.name!, binding);
+            }
+          } else {
+            final elemGet = k.DynamicInvocation(k.DynamicAccessKind.Dynamic, subject,
+              k.Name('[]'), k.Arguments([k.IntLiteral(idx)]));
+            final subCond = _compilePattern(el, elemGet, bindings);
+            if (subCond != null) {
+              cond = k.LogicalExpression(
+                cond, k.LogicalExpressionOperator.AND, subCond);
+            }
+            idx++;
+          }
+        }
+        return cond;
+
+      case ast.RangePattern p:
         final start = _compileExpr(p.start);
         final end = _compileExpr(p.end);
         final geStart = _dynamicOp(subject, '>=', start);
         final leEnd = _dynamicOp(subject, p.inclusive ? '<=' : '<', end);
         return k.LogicalExpression(geStart, k.LogicalExpressionOperator.AND, leEnd);
 
-      case glu.StructPattern p:
+      case ast.StructPattern p:
         // TypeName { field1, field2 } → subject is TypeName && bind fields
         final cls = _classes[p.typeName];
         if (cls == null) return null;
@@ -7366,9 +7604,9 @@ class CodeGenerator {
 
         return isCheck;
 
-      case glu.RestPattern _:
-      case glu.ObjectDestructurePattern _:
-      case glu.FieldPattern _:
+      case ast.RestPattern _:
+      case ast.ObjectDestructurePattern _:
+      case ast.FieldPattern _:
         return null;
     }
   }
@@ -7377,7 +7615,7 @@ class CodeGenerator {
   // String Interpolation
   // ============================================================
 
-  k.Expression _compileStringLiteral(glu.StringLiteralExpr expr) {
+  k.Expression _compileStringLiteral(ast.StringLiteralExpr expr) {
     if (expr.interpolationParts == null) {
       return k.StringLiteral(expr.value);
     }
@@ -7432,11 +7670,11 @@ class CodeGenerator {
     // Fallback simples: member access chain
     final dotParts = source.split('.');
     if (dotParts.length == 1) {
-      return _compileExpr(glu.IdentifierExpr(source, 0, 0));
+      return _compileExpr(ast.IdentifierExpr(source, 0, 0));
     }
-    glu.Expression result = glu.IdentifierExpr(dotParts[0], 0, 0);
+    ast.Expression result = ast.IdentifierExpr(dotParts[0], 0, 0);
     for (var i = 1; i < dotParts.length; i++) {
-      result = glu.MemberExpr(result, dotParts[i], 0, 0);
+      result = ast.MemberExpr(result, dotParts[i], 0, 0);
     }
     return _compileExpr(result);
   }
@@ -7446,10 +7684,10 @@ class CodeGenerator {
   // ============================================================
 
   /// Extrai o valor de um bloco (última expressão)
-  k.Expression _compileBlockValue(glu.Statement stmt) {
-    if (stmt is glu.BlockStmt && stmt.statements.isNotEmpty) {
+  k.Expression _compileBlockValue(ast.Statement stmt) {
+    if (stmt is ast.BlockStmt && stmt.statements.isNotEmpty) {
       final last = stmt.statements.last;
-      if (last is glu.ExprStmt) {
+      if (last is ast.ExprStmt) {
         // Compilar statements anteriores + retornar última expressão
         if (stmt.statements.length == 1) {
           return _compileExpr(last.expression);
@@ -7468,7 +7706,7 @@ class CodeGenerator {
   }
 
   /// 0..10 ou 0..=10 → List gerada com while loop
-  k.Expression _compileRange(glu.RangeExpr expr) {
+  k.Expression _compileRange(ast.RangeExpr expr) {
     final start = _compileExpr(expr.start);
     final end = _compileExpr(expr.end);
     // Gerar: () { var list = []; var i = start; while (i < end) { list.add(i); i++; } return list; }()
@@ -7496,7 +7734,7 @@ class CodeGenerator {
   }
 
   /// panic("msg") → throw "PANIC: msg"
-  k.Expression _compilePanic(glu.PanicExpr expr) {
+  k.Expression _compilePanic(ast.PanicExpr expr) {
     final msg = _compileExpr(expr.message);
     // Gerar: throw "PANIC: " + msg
     final panicMsg = k.StringConcatenation([
@@ -7508,7 +7746,7 @@ class CodeGenerator {
 
   /// expr? → if result is err, return early; else unwrap value
   /// Gera: let _t = expr; if (_t is Result_err) return _t; _t.value
-  k.Expression _compileTryOperator(glu.TryExpr expr) {
+  k.Expression _compileTryOperator(ast.TryExpr expr) {
     final compiled = _compileExpr(expr.value);
     final errCls = _enumVariants['Result']!['err']!;
     final errType = k.InterfaceType(errCls, k.Nullability.nonNullable);
@@ -7536,7 +7774,7 @@ class CodeGenerator {
   }
 
   /// f >> g → (x) => g(f(x))
-  k.Expression _compileCompose(glu.ComposeExpr expr) {
+  k.Expression _compileCompose(ast.ComposeExpr expr) {
     final f = _compileExpr(expr.left);
     final g = _compileExpr(expr.right);
 
@@ -7573,7 +7811,7 @@ class CodeGenerator {
 
   /// expr where { let x = ... }  → Let(x = ..., expr)
   /// Os bindings ficam visíveis pro body (compilados antes, scope mantido)
-  k.Expression _compileWhere(glu.WhereExpr expr) {
+  k.Expression _compileWhere(ast.WhereExpr expr) {
     _pushScope();
 
     // Compilar bindings (ficam no scope)
@@ -7600,7 +7838,7 @@ class CodeGenerator {
 
   /// let { x, y } = point  →  tmp = point; x = tmp.x; y = tmp.y
   /// let [a, b, c] = list  →  tmp = list; a = tmp[0]; b = tmp[1]; c = tmp[2]
-  k.Statement _compileDestructure(glu.DestructureStmt stmt) {
+  k.Statement _compileDestructure(ast.DestructureStmt stmt) {
     final isFinal = !stmt.isMutable;
     final value = _compileExpr(stmt.value);
     final tmp = k.VariableDeclaration('_destr',
@@ -7609,7 +7847,7 @@ class CodeGenerator {
     final stmts = <k.Statement>[tmp];
 
     switch (stmt.pattern) {
-      case glu.ObjectDestructurePattern p:
+      case ast.ObjectDestructurePattern p:
         // { x, y, z } → extract fields by name
         for (final field in p.fields) {
           final extracted = k.DynamicGet(
@@ -7620,11 +7858,11 @@ class CodeGenerator {
           _declareVar(field.name, varDecl);
         }
 
-      case glu.ListPattern p:
+      case ast.ListPattern p:
         // [a, b, c] → extract by index
         var index = 0;
         for (final element in p.elements) {
-          if (element is glu.IdentifierPattern) {
+          if (element is ast.IdentifierPattern) {
             final extracted = k.DynamicInvocation(
               k.DynamicAccessKind.Dynamic, k.VariableGet(tmp),
               k.Name('[]'), k.Arguments([k.IntLiteral(index)]));
@@ -7633,7 +7871,7 @@ class CodeGenerator {
             stmts.add(varDecl);
             _declareVar(element.name, varDecl);
             index++;
-          } else if (element is glu.RestPattern) {
+          } else if (element is ast.RestPattern) {
             // ..rest → sublist from index
             if (element.name != null) {
               final extracted = k.DynamicInvocation(
@@ -7657,7 +7895,7 @@ class CodeGenerator {
   /// Currying: quando uma função é chamada com menos args que espera,
   /// retorna closure com os args restantes.
   k.Expression _buildCurriedClosure(k.Procedure proc, String name,
-      List<glu.Argument> providedArgs, int totalParams) {
+      List<ast.Argument> providedArgs, int totalParams) {
     final compiledProvided = providedArgs.map((a) => _compileExpr(a.value)).toList();
 
     // Capturar args fornecidos em temp vars
@@ -7694,23 +7932,23 @@ class CodeGenerator {
     return result;
   }
 
-  k.Expression _compileList(glu.ListLiteralExpr expr) {
+  k.Expression _compileList(ast.ListLiteralExpr expr) {
     return k.ListLiteral(
       expr.elements.map(_compileExpr).toList(),
       typeArgument: const k.DynamicType());
   }
 
-  k.Expression _compilePipe(glu.PipeExpr expr) {
+  k.Expression _compilePipe(ast.PipeExpr expr) {
     final value = _compileExpr(expr.value);
     final fn = expr.function;
 
-    if (fn is glu.CallExpr) {
+    if (fn is ast.CallExpr) {
       final callee = _compileExpr(fn.callee);
       final compiledArgs = fn.args.map((a) => _compileExpr(a.value)).toList();
       compiledArgs.insert(0, value);
 
-      if (fn.callee is glu.IdentifierExpr) {
-        final name = (fn.callee as glu.IdentifierExpr).name;
+      if (fn.callee is ast.IdentifierExpr) {
+        final name = (fn.callee as ast.IdentifierExpr).name;
         if (_functions.containsKey(name)) {
           return k.StaticInvocation(_functions[name]!, k.Arguments(compiledArgs));
         }
@@ -7730,7 +7968,7 @@ class CodeGenerator {
         [const k.DynamicType()], const k.DynamicType(), k.Nullability.nonNullable));
   }
 
-  k.Expression _compileNilCoalesce(glu.NilCoalesceExpr expr) {
+  k.Expression _compileNilCoalesce(ast.NilCoalesceExpr expr) {
     final left = _compileExpr(expr.left);
     final right = _compileExpr(expr.right);
     final tmp = k.VariableDeclaration('_nc',
@@ -7744,10 +7982,10 @@ class CodeGenerator {
   // Type resolution
   // ============================================================
 
-  k.DartType _resolveType(glu.TypeAnnotation? type) {
+  k.DartType _resolveType(ast.TypeAnnotation? type) {
     if (type == null) return const k.DynamicType();
     switch (type) {
-      case glu.NamedType t:
+      case ast.NamedType t:
         // Primitivos
         // Check type parameters primeiro (T, A, B dentro de contexto genérico)
         final typeParam = _lookupTypeParam(t.name);
@@ -7784,25 +8022,25 @@ class CodeGenerator {
         }
         return const k.DynamicType();
 
-      case glu.OptionalType t:
+      case ast.OptionalType t:
         final inner = _resolveType(t.inner);
         if (inner is k.InterfaceType) {
           return inner.withDeclaredNullability(k.Nullability.nullable);
         }
         return const k.DynamicType();
 
-      case glu.FunctionType t:
+      case ast.FunctionType t:
         return k.FunctionType(
           t.paramTypes.map(_resolveType).toList(),
           _resolveType(t.returnType),
           k.Nullability.nonNullable);
 
-      case glu.MutType t:
+      case ast.MutType t:
         return _resolveType(t.inner);
     }
   }
 
-  k.DartType _resolveReturnType(glu.TypeAnnotation? type) {
+  k.DartType _resolveReturnType(ast.TypeAnnotation? type) {
     if (type == null) return const k.VoidType();
     return _resolveType(type);
   }

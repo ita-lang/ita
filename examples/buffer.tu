@@ -15,7 +15,7 @@ fn main() {
   print("=== String ↔ Bytes ===")
 
   // String → bytes
-  let bytes = Buffer.fromString("Hello Glu!")
+  let bytes = Buffer.fromString("Hello Itá!")
   print("bytes: ${bytes}")
 
   // Bytes → string
@@ -56,14 +56,14 @@ fn main() {
 
   // Escrever bytes em arquivo
   let data = Buffer.from([0, 1, 2, 255, 254, 253])
-  Buffer.writeFile("/tmp/glu_bin.dat", data)
+  Buffer.writeFile("/tmp/ita_bin.dat", data)
 
   // Ler de volta
-  let read = Buffer.readFile("/tmp/glu_bin.dat")
+  let read = Buffer.readFile("/tmp/ita_bin.dat")
   print("read: ${read}")
   print("hex: ${Buffer.toHex(read)}")
 
-  File.delete("/tmp/glu_bin.dat")
+  File.delete("/tmp/ita_bin.dat")
 
   print("=== Done! ===")
 }

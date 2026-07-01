@@ -1,0 +1,27 @@
+=== CSV Parse (vírgula) ===
+[[nome, idade, cidade], [Alice, 30, São Paulo], [Bob, 25, Rio]]
+[nome, idade, cidade]
+[Alice, 30, São Paulo]
+[Bob, 25, Rio]
+=== CSV Parse (ponto-e-vírgula BR/EU) ===
+[nome, idade, cidade]
+[Carlos, 28, Curitiba]
+[Diana, 32, BH]
+=== CSV Stringify ===
+produto,preço,qty
+Café,12.50,100
+Chá,8.00,200
+=== CSV Stringify (;) ===
+produto;preço;qty
+Café;12.50;100
+Chá;8.00;200
+=== CSV File I/O ===
+loaded:
+[produto, preço, qty]
+[Café, 12.50, 100]
+[Chá, 8.00, 200]
+=== CSV com aspas ===
+[name, desc]
+[Alice, likes, commas]
+[Bob, simple]
+=== Done! ===

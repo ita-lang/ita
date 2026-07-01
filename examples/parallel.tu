@@ -52,7 +52,7 @@ async fn main() {
   // Mix de actors diferentes em paralelo
   print("--- Mix de actors ---")
   let mixed = await all(
-    w.greet("Glu"),
+    w.greet("Itá"),
     f.fetch("https://api.example.com"),
     w.compute(10),
   )

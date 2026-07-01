@@ -1,0 +1,13 @@
+=== Parallel Execution ===
+--- Sequencial ---
+a=4950, b=19900
+--- Paralelo (await all) ---
+[4950, 19900, 1225]
+r1=4950
+r2=19900
+r3=1225
+--- Mix de actors ---
+Hello, Itá!
+Response from https://api.example.com
+sum(0..9) = 45
+=== Done! ===

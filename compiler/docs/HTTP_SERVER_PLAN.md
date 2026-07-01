@@ -1,10 +1,34 @@
-# Glutter HTTP Server — Implementation Plan
+# Itá HTTP Server — Implementation Plan
+
+## Status real (verificado 2026-06-30)
+
+> Os **tijolos crus** existem no codegen; o **framework Express-style** (`Server()` / `app` / `req`) descrito abaixo **não foi implementado**. O `examples/server.tu` usa apenas os tijolos (`Http.serve`, `Http.matchRoute`, `Response.*`, manipulando `httpResponse` cru).
+
+| Camada | Status | Nota |
+|---|---|---|
+| `Http.serve(port)` | ✅ | `_compileHttpCall` case `serve` → `HttpServer.bind` |
+| `Http.matchRoute(pattern, path)` | 🚧 | MVP: só 1 param, prefix-match, ignora `*path`/sufixo |
+| `Response.text/json/html/noContent/notFound/unauthorized/forbidden/badRequest/error` | ✅ | `_compileResponseCall` (retornam Map `body/status/contentType`) |
+| `Response.redirect(permanent:)` | 🚧 | status sempre 302; `permanent:true`→301 ignorado |
+| `Response.file` / `Response.stream` / `Response.withHeaders` | ⬜ | sem cases |
+| `Ws.upgrade/isUpgrade/connect` | ✅ | `_compileWsCall` |
+| `Security.helmet()` / `Security.cors()` como valores | ✅ | existem (retornam Map), mas sem `app.use` que os consuma |
+| **`Server()` builder** | ⬜ | sem `case 'Server'`; sem namespace |
+| **`app.get/post/put/delete/patch/options`** | ⬜ | sem dispatch de rota |
+| **`app.use` (middleware chain) / `app.route` / `app.group`** | ⬜ | inexistente |
+| **`app.ws` / `app.static` / `app.onError`** | ⬜ | inexistente |
+| **`req.method/path/param/query/header/json/text/...`** | ⬜ | sem objeto Request |
+| **`req.body(Type)` (struct = schema) — o diferencial** | ⬜ | sem parsing tipado |
+
+> O framework está planejado como módulo `lib/foundation/server.tu` (ver FOUNDATION_PLAN) — ainda **não existe** neste repo.
+
+---
 
 ## Design: Express done right, sem next(), body tipado
 
 ### Core API
 
-```glu
+```tu
 let app = Server()
 app.get("/") { req => Response.text("Hello") }
 app.listen(3000)
@@ -16,7 +40,7 @@ app.listen(3000)
 
 ### 1. Server + Router base
 
-```glu
+```tu
 let app = Server()
 
 // Métodos HTTP
@@ -38,7 +62,7 @@ app.listen(3000, "0.0.0.0")
 
 ### 2. Request object
 
-```glu
+```tu
 req.method                    // "GET", "POST"
 req.path                      // "/users/123"
 req.param("id")               // URL params (:id)
@@ -63,7 +87,7 @@ req.body(StructType)          // ← TIPADO: parse + valida contra struct
 
 ### 3. Response helpers
 
-```glu
+```tu
 Response.text("hello")                          // 200 text/plain
 Response.json(data)                             // 200 application/json
 Response.json(data, status: 201)                // custom status
@@ -89,7 +113,7 @@ Middleware = função `(Request) -> Result<Request>`:
 - `.ok(req)` → continua pro próximo middleware/handler
 - `.err(Response)` → para e responde imediatamente
 
-```glu
+```tu
 fn logger(req: Request) -> Result<Request> {
   log.info("${req.method} ${req.path}")
   .ok(req)
@@ -117,7 +141,7 @@ app.use(logger)
 
 ### 5. Route groups (rotas privadas/prefixadas)
 
-```glu
+```tu
 // Grupo com prefixo
 app.route("/api/users", userRoutes)
 app.route("/api/auth", authRoutes)
@@ -140,7 +164,7 @@ app.get("/health") { req => Response.json({"status": "ok"}) }
 
 ### 6. Rotas dinâmicas
 
-```glu
+```tu
 app.get("/users/:id") { req =>
   req.param("id")                    // "123"
 }
@@ -159,7 +183,7 @@ app.get("/api/:version/users/:id") { req =>
 
 ### 7. Body tipado (struct = schema)
 
-```glu
+```tu
 struct CreateUser {
   name: String
   email: String
@@ -195,7 +219,7 @@ extension CreateUser {
 
 ### 8. WebSocket integrado
 
-```glu
+```tu
 app.ws("/chat") { socket =>
   socket.onOpen {
     print("connected")
@@ -213,7 +237,7 @@ app.ws("/chat") { socket =>
 
 ### 9. Static files
 
-```glu
+```tu
 app.static("/public", "./dist")
 ```
 
@@ -221,7 +245,7 @@ app.static("/public", "./dist")
 
 ### 10. Error handler global
 
-```glu
+```tu
 app.onError { err, req =>
   Security.audit("server.error", "${req.method} ${req.path}: ${err}")
   Response.error("Internal Server Error")
@@ -234,7 +258,7 @@ app.onError { err, req =>
 
 Tudo que já implementamos se conecta:
 
-```glu
+```tu
 app.use(Security.helmet())      // 10 headers seguros
 app.use(Security.cors("..."))   // CORS
 app.use(csrfMiddleware)         // CSRF via Csrf.verify()

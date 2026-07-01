@@ -1,0 +1,19 @@
+=== Custom Operator ===
+2^8 = 256.0
+=== Copy-With ===
+Point(x: 1.0, y: 2.0)
+Point(x: 10.0, y: 2.0)
+Point(x: 1.0, y: 99.0)
+=== For Range ===
+0
+1
+2
+3
+4
+inclusive:
+1
+2
+3
+=== String Interpolation ===
+7 * 6 = 42
+=== Done! ===

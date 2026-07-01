@@ -1,6 +1,6 @@
-# Glu Language Specification
+# Itá Language Specification
 
-**Glu** é uma linguagem fortemente tipada, com tipagem estática, que compila para Dart Kernel (.dill) e roda na Dart VM. Ela é um híbrido funcional/OO, com ênfase no funcional, pensada para devs vindos do ecossistema JS/TS.
+**Itá** é uma linguagem fortemente tipada, com tipagem estática, que compila para Dart Kernel (.dill) e roda na Dart VM. Ela é um híbrido funcional/OO, com ênfase no funcional, pensada para devs vindos do ecossistema JS/TS.
 
 ## Princípios
 
@@ -15,10 +15,10 @@
 
 ## 1. Tipos e Bindings
 
-```glu
+```tu
 // Imutável (padrão)
 let x = 42                    // tipo inferido: Int
-let name: String = "Glu"      // tipo explícito
+let name: String = "Itá"      // tipo explícito
 
 // Mutável (opt-in)
 var count = 0
@@ -30,13 +30,13 @@ const PI = 3.14159
 
 ### Tipos primitivos
 
-```glu
+```tu
 Int, Float, Bool, String, Void, Never
 ```
 
 ### Optionals (nullable)
 
-```glu
+```tu
 let name: String? = nil
 let age: Int? = 25
 
@@ -52,7 +52,7 @@ let forced = name!             // String (ou crash)
 
 ### Result
 
-```glu
+```tu
 // Result é built-in, não uma lib
 fn divide(a: Float, b: Float) -> Result<Float, MathError> {
   guard b != 0.0 else { return .err(.divisionByZero) }
@@ -77,7 +77,7 @@ fn calculate() -> Result<Float, MathError> {
 
 ## 2. Funções
 
-```glu
+```tu
 // Declaração padrão
 fn add(a: Int, b: Int) -> Int {
   a + b    // retorno implícito (última expressão)
@@ -111,7 +111,7 @@ fn first<T>(list: List<T>) -> T? => list[0]
 
 ## 3. Closures
 
-```glu
+```tu
 // Closure completa
 let add = (a: Int, b: Int) -> Int => a + b
 
@@ -141,7 +141,7 @@ fetch("url") { response in
 
 ## 4. Pattern Matching
 
-```glu
+```tu
 // Match expression (retorna valor)
 let label = match status {
   0           => "idle",
@@ -176,7 +176,7 @@ match items {
 
 ## 5. Guard Clauses
 
-```glu
+```tu
 // guard (deve divergir: return, throw, break, continue)
 fn process(input: String?) -> String {
   guard let value = input else {
@@ -210,7 +210,7 @@ if let .ok(value) = fetchData() {
 
 ## 6. Structs (Valor)
 
-```glu
+```tu
 // Structs são value types: copiadas na atribuição, imutáveis por padrão
 struct Point {
   x: Float
@@ -248,7 +248,7 @@ struct Pair<A, B> {
 
 ## 7. Classes (Referência)
 
-```glu
+```tu
 // Classes são reference types, mutáveis
 class Counter {
   var count: Int
@@ -285,7 +285,7 @@ class Dog : Animal {
 
 ## 8. Enums (Algebraic Data Types)
 
-```glu
+```tu
 // Enum simples
 enum Direction { north, south, east, west }
 
@@ -311,7 +311,7 @@ fn area(shape: Shape) -> Float => match shape {
 
 ## 9. Traits (Interfaces com comportamento)
 
-```glu
+```tu
 trait Displayable {
   fn display() -> String
 }
@@ -348,7 +348,7 @@ fn process<T: Displayable + Hashable>(item: T) { ... }
 
 ## 10. Extensions (estilo Swift)
 
-```glu
+```tu
 struct Point {
   x: Float
   y: Float
@@ -400,7 +400,7 @@ Extensions podem:
 
 ## 11. Pipe Operator e Composição
 
-```glu
+```tu
 // Pipe forward
 let result = data
   |> filter((x) => x > 0)
@@ -421,7 +421,7 @@ add5(3)                  // 8
 
 ## 11. Custom Operators
 
-```glu
+```tu
 // Definir operador binário
 operator ** (base: Float, exp: Float) -> Float
   precedence 15 right
@@ -449,7 +449,7 @@ let p = Point(x: 1.0, y: 2.0) + Point(x: 3.0, y: 4.0)
 
 ## 12. Unsafe (Aritmética de Ponteiros)
 
-```glu
+```tu
 // unsafe é explícito e isolado — não é o modo normal
 unsafe {
   let ptr: Ptr<Int> = alloc(10)   // aloca 10 Ints
@@ -467,7 +467,7 @@ unsafe {
 
 ## 13. Módulos e Imports
 
-```glu
+```tu
 // Arquivo = módulo implícito
 // math.tu
 pub fn abs(x: Float) -> Float => if x < 0.0 { -x } else { x }
@@ -482,7 +482,7 @@ use math as m                   // alias
 
 ## 14. String Interpolation e Multiline
 
-```glu
+```tu
 let name = "world"
 let greeting = "Hello ${name}!"
 
@@ -501,7 +501,7 @@ let html = """
 
 ## 15. Coleções
 
-```glu
+```tu
 // List (imutável por padrão)
 let nums = [1, 2, 3, 4, 5]
 let doubled = nums.map((x) => x * 2)      // [2, 4, 6, 8, 10]
@@ -528,7 +528,7 @@ let evens = [for x in 0..100 if x % 2 == 0 => x]
 
 ## Mapeamento para Dart Kernel
 
-| Glu                | Dart Kernel Node              |
+| Itá                | Dart Kernel Node              |
 |--------------------|-------------------------------|
 | `let x = 1`       | VariableDeclaration (final)   |
 | `var x = 1`       | VariableDeclaration (mutable) |

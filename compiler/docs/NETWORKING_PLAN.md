@@ -1,9 +1,48 @@
-# Glu Networking Primitives — Implementation Plan
+# Itá Networking Primitives — Implementation Plan
+
+## Status real (verificado 2026-06-30)
+
+> O codegen expõe **bindings finos** dos construtores `dart:io`; as APIs ergonômicas com objeto de opções (`{onData, onConnect, ...}`) e os Response/Request ricos descritos abaixo **não estão fiados** — o dev fia os handlers manualmente sobre o objeto Dart cru.
+
+| Deliverable | Status | Nota |
+|---|---|---|
+| `fetch()` async + Response rico (`status/headers/text/json/bytes`) | ⬜ | `case 'fetch'` é `curl -s` **síncrono** retornando string |
+| `Net.serve()` HTTP + Request rico | ⬜ | sem case `serve`; só `Http.serve` cru (sem `req.query/json/cookie/ip`) |
+| `Net.listen()` TCP raw | 🚧 | `ServerSocket.bind` apenas; callbacks `onConnect/onData/onClose/onError` não fiados |
+| `Net.connect()` TCP client | 🚧 | `Socket.connect` fino; sem callbacks |
+| `Net.udp()` | 🚧 | `RawDatagramSocket.bind` fino; `send/sendMany/onData` ⬜ |
+| `Ws.connect` (client) | 🚧 | `WebSocket.connect`; eventos são métodos crus do WebSocket Dart |
+| `Ws.upgrade/isUpgrade` (server) | ✅ | `_compileWsCall` |
+| `Dns.resolve/resolveAll/reverse` | ✅ | via shell `host` (só registros A) |
+| `Dns.resolve(type:"MX")` / `Dns.prefetch` | ⬜ | não implementados |
+| TLS (`Net.listenTls`) | 🚧 | `SecureServerSocket.bind` fino; HTTP+TLS e `fetch({tls})` ⬜ |
+
+> As primitivas existem como **construtores Dart expostos**. As Fases B/C do plano (raw sockets ergonômicos, UDP rico, WS pub/sub) seguem majoritariamente ⬜.
+
+---
+
+## Roadmap de implementação — gaps + contratos 🔒 (crivo `/ita-sec-gate`)
+
+Cada gap tem a API-alvo e um contrato **secure-by-default** validado no MCP de segurança (fonte OWASP citada). A API segura é o default; o inseguro exige `unsafe` explícito ou não existe. Depende da fundação `Bytes`/`Buffer` (ver `BYTES_BUFFER_PLAN.md`) para parsing de wire protocol.
+
+| # | Gap | API-alvo | 🔒 Contrato secure-by-default (fonte) |
+|---|---|---|---|
+| 1 | `fetch` síncrono/string | `fetch(url, {timeout, redirect, tls}) -> Result<Response>` async; `Response.status/headers/text/json/bytes` | Redirect **off** por default; SSRF via `Security.allowedUrl`/`isPrivateIp` (já no codegen), validando IPv4 **e** IPv6 contra bypass hex/octal/dword; timeout obrigatório com default. Fonte: OWASP SSRF Prevention CS (https://cheatsheetseries.owasp.org/cheatsheets/Server_Side_Request_Forgery_Prevention_Cheat_Sheet.html) |
+| 2 | Sem `Net.serve` | `Net.serve(port, handler)`; `req.method/path/query/header/json/ip` | Max body size + timeout absoluto + **min ingress rate** (anti-slowloris) por default. Fonte: OWASP DoS CS + Web Service Security CS (https://cheatsheetseries.owasp.org/cheatsheets/Denial_of_Service_Cheat_Sheet.html) |
+| 3 | `Net.listen/connect` sem callbacks | `Net.listen(port, {onConnect,onData,onClose,onError})` / `connect(...)` | Limite de conexões simultâneas + timeout de conexão absoluto. Fonte: OWASP Web Service Security CS *Resources Limiting* |
+| 4 | `Ws.connect` cliente cru | `Ws.connect(url, {onOpen,onMessage,onClose,onError})` | **Max frame size** (payload oversized); masking correto; TLS obrigatório em `wss://`. Fonte: OWASP DoS CS *oversized payloads* |
+| 5 | `Net.udp` fino | `udp.send/sendMany/onData` | Limite de tamanho de datagrama; validar origem antes de processar |
+| 6 | `Dns` só registro A | `Dns.resolve(host,{type})`, `Dns.mx`, `Dns.prefetch` | Resolver **e fixar o IP** antes de conectar (anti-**DNS rebinding**); não re-resolver. Fonte: OWASP SSRF CS *DNS pinning* |
+| 7 | TLS fino | `Net.listenTls(port,{cert,key,minVersion})`; HTTP+TLS; `fetch({tls})` | `minVersion` default **TLS 1.2** (nunca 1.0/1.1); hostname verify **on**; **sem** trust-all/aceitar cert silenciosamente. Fonte: OWASP MASTG *TLS Settings / Pinning* (https://github.com/OWASP/owasp-mastg/blob/HEAD/best-practices/MASTG-BEST-0042.md) |
+
+**Co-evolução:** backpressure de socket usa `Channel.buffered(N)` (gap do `MESSAGING_PLAN`) para o contrato de "limitar memória/conexões".
+
+---
 
 ## Filosofia
 
-O Glu provê as **primitivas cruas** de rede. Frameworks (Express-like, GraphQL, gRPC)
-são construídos em Glu puro por devs de libs, usando essas primitivas.
+O Itá provê as **primitivas cruas** de rede. Frameworks (Express-like, GraphQL, gRPC)
+são construídos em Itá puro por devs de libs, usando essas primitivas.
 
 Referência: Bun (fetch, Bun.serve, Bun.listen, Bun.connect, Bun.udpSocket)
 
@@ -16,7 +55,7 @@ Referência: Bun (fetch, Bun.serve, Bun.listen, Bun.connect, Bun.udpSocket)
 
 ### API
 
-```glu
+```tu
 // Básico (já funciona sync via curl)
 let body = fetch("https://api.com/users")
 
@@ -59,7 +98,7 @@ let res = await fetch("https://api.com/slow", {
 
 ### API
 
-```glu
+```tu
 // Criar server
 let server = await Net.serve(3000)
 // ou com options
@@ -119,7 +158,7 @@ Para devs de libs que querem criar database drivers, proxies, protocolos custom.
 
 ### API
 
-```glu
+```tu
 // TCP server
 let server = await Net.listen({
   port: 8080,
@@ -162,7 +201,7 @@ Para conectar a serviços TCP: databases, Redis, custom protocols.
 
 ### API
 
-```glu
+```tu
 // TCP client
 let socket = await Net.connect({
   port: 5432,
@@ -195,7 +234,7 @@ socket.close()
 
 ### Client API (já temos básico)
 
-```glu
+```tu
 // Connect
 let ws = await Ws.connect("ws://localhost:3000/chat")
 
@@ -215,7 +254,7 @@ ws.close()
 
 ### Server API (integrado com Net.serve)
 
-```glu
+```tu
 let server = await Net.serve(3000)
 
 server.listen((req) => {
@@ -241,7 +280,7 @@ server.listen((req) => {
 
 ### Pub/Sub (like Bun)
 
-```glu
+```tu
 // Subscribe to topic
 ws.subscribe("chat-room-1")
 
@@ -273,7 +312,7 @@ Para game servers, DNS, VoIP, IoT.
 
 ### API
 
-```glu
+```tu
 // Create UDP socket
 let socket = await Net.udp({
   port: 41234,
@@ -308,7 +347,7 @@ socket.close()
 
 ### API
 
-```glu
+```tu
 // Resolve hostname
 let addrs = await Dns.resolve("example.com")
 print(addrs)  // ["93.184.216.34"]
@@ -335,7 +374,7 @@ Dns.prefetch("api.myapp.com")
 
 ### API
 
-```glu
+```tu
 // TCP server with TLS
 let server = await Net.listen({
   port: 443,
@@ -391,7 +430,7 @@ let res = await fetch("https://self-signed.example.com", {
 
 ## O que isso desbloqueia pra devs de libs
 
-Com essas primitivas, um dev pode criar EM GLU PURO:
+Com essas primitivas, um dev pode criar EM ITÁ PURO:
 
 ```
 fetch + Response  → HTTP client libraries, API wrappers
@@ -403,4 +442,4 @@ Net.udp           → Game networking, DNS servers, IoT
 TLS               → Secure everything
 ```
 
-O Glu provê os tijolos. A comunidade constrói as casas.
+O Itá provê os tijolos. A comunidade constrói as casas.

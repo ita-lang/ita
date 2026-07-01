@@ -1287,7 +1287,7 @@ String baseName(String path) {
 
 Map<String, String> readConfig() {
   final config = <String, String>{};
-  final tomlFile = File('glu.toml');
+  final tomlFile = File('ita.toml');
 
   if (!tomlFile.existsSync()) {
     return {'entry': 'src/main.tu', 'name': 'app', 'output': 'build/'};
@@ -1316,7 +1316,7 @@ itac — Ita Compiler & Package Manager
 
 Commands:
   init [--name name]     Create new Ita project
-  build                  Compile project (reads glu.toml)
+  build                  Compile project (reads ita.toml)
   run [file.tu]         Compile and run
   run --watch [file.tu] Watch mode + hot reload
   fmt [file.tu]         Format source code
@@ -1324,9 +1324,9 @@ Commands:
   repl                   Interactive REPL
   check [file.tu]        Validate without compiling
   test                   Run tests in test/
-  install [pkg]          Install dependencies (or all from glu.toml)
-  add <pkg> [--git url]  Add dependency to glu.toml
-  remove <pkg>           Remove dependency from glu.toml
+  install [pkg]          Install dependencies (or all from ita.toml)
+  add <pkg> [--git url]  Add dependency to ita.toml
+  remove <pkg>           Remove dependency from ita.toml
   deps                   List installed dependencies
   clean                  Remove build/
   help                   Show this message

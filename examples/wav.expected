@@ -1,0 +1,6 @@
+=== WAV gerado ===
+header (44 bytes): 52494646f407000057415645666d74201000000001000100401f0000401f00000100080064617461d0070000
+total bytes: 2044
+samples: 2000 @ 8000Hz, 8-bit mono
+arquivo: /tmp/ita_demo.wav
+=== Done! ===

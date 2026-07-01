@@ -1,0 +1,6 @@
+=== Error Handling ===
+Result.ok(value: 50.0)
+Result.err(error: division by zero)
+safe = 0.0
+chain = 30.0
+=== Done! ===

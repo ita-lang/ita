@@ -368,12 +368,12 @@ bool _installDep(String name, Map<String, String> info) {
     }
 
     final hasToml = File('${pkgDir.path}/ita.toml').existsSync();
-    final hasGluFiles = pkgDir
+    final hasTuFiles = pkgDir
       .listSync(recursive: true)
       .whereType<File>()
       .any((f) => f.path.endsWith('.tu'));
 
-    if (!hasToml && !hasGluFiles) {
+    if (!hasToml && !hasTuFiles) {
       print('    \x1b[33mWarning: no ita.toml or .tu files found\x1b[0m');
     }
 

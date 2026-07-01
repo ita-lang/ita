@@ -51,7 +51,7 @@ fn main() {
 
   let hello = greet("Hello")
   print(hello("World"))
-  print(hello("Glu"))
+  print(hello("Itá"))
 
   print("=== Composição >> ===")
 

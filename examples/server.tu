@@ -1,4 +1,4 @@
-// Glutter HTTP Server — com Request rico e padrões de concorrência
+// Itá HTTP Server — com Request rico e padrões de concorrência
 
 fn sendResponse(httpResponse, res) {
   httpResponse.statusCode = res["status"]
@@ -32,7 +32,7 @@ fn handleRequest(request) {
 
   if method == "GET" {
     if path == "/" {
-      sendResponse(resp, Response.json(["hello", "glu", "server"]))
+      sendResponse(resp, Response.json(["hello", "ita", "server"]))
     } else {
       if path == "/health" {
         sendResponse(resp, Response.json("ok"))
@@ -64,7 +64,7 @@ async fn main() {
   let dataService = spawn DataService()
 
   let server = await Http.serve(3000)
-  print("Glutter Server on http://localhost:3000")
+  print("Itá Server on http://localhost:3000")
   print("Try:")
   print("  curl http://localhost:3000/")
   print("  curl http://localhost:3000/users/42")

@@ -87,7 +87,7 @@ fn main() {
 }
 ''';
 
-  print('=== Glu Parser Test ===\n');
+  print('=== Itá Parser Test ===\n');
 
   // Lexer
   final lexer = Lexer(source);

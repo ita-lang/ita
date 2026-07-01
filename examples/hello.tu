@@ -1,4 +1,4 @@
-// Primeiro programa Glu!
+// Primeiro programa Itá!
 // Demonstra: funções, let/var, if/else, while, guard, closures, match, pipe
 
 fn greet(name: String) -> String {
@@ -36,7 +36,7 @@ fn fizzbuzz(n: Int) {
 }
 
 fn main() {
-  print("=== Glu Language ===")
+  print("=== Itá Language ===")
 
   // Funções e string
   let msg = greet("World")
@@ -63,7 +63,6 @@ fn main() {
   guard value != nil else {
     print("value is nil, skipping")
   }
-
   // FizzBuzz (while + match)
   fizzbuzz(15)
 

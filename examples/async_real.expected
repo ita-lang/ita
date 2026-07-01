@@ -1,0 +1,8 @@
+=== Async Real ===
+Data from server
+5² + 1 = 26
+Got Data from API and result 50
+=== Actor com await ===
+Processed: hello itá
+3*7+3+7 = 31
+=== Done! ===

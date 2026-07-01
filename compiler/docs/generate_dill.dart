@@ -1,10 +1,10 @@
-/// Fase 2 do Glutter Compiler: Gerar um .dill mínimo na mão.
+/// Fase 2 do Itá Compiler: Gerar um .dill mínimo na mão.
 ///
 /// Este script usa package:kernel pra construir uma AST Dart e
 /// serializar direto pro formato binário .dill, sem passar por
 /// código Dart textual.
 ///
-/// O .dill gerado contém um main() que chama print("Hello from Glutter!").
+/// O .dill gerado contém um main() que chama print("Hello from Itá!").
 
 import 'dart:io';
 import 'package:kernel/kernel.dart';
@@ -38,7 +38,7 @@ void main(List<String> args) {
   print('[3/5] Construindo AST...');
 
   final component = Component();
-  final fileUri = Uri.parse('file:///glutter/main.gl');
+  final fileUri = Uri.parse('file:///ita/main.tu');
   final libraryUri = Uri.parse('app:///main.dart');
 
   // Criar a library principal
@@ -49,7 +49,7 @@ void main(List<String> args) {
 
   // Criar main():
   //   void main() {
-  //     print("Hello from Glutter!");
+  //     print("Hello from Itá!");
   //   }
   final mainProcedure = Procedure(
     Name('main'),
@@ -60,7 +60,7 @@ void main(List<String> args) {
           StaticInvocation.byReference(
             printReference,
             Arguments([
-              StringLiteral('Hello from Glutter!'),
+              StringLiteral('Hello from Itá!'),
             ]),
           ),
         ),

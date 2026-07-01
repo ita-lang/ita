@@ -6,31 +6,31 @@ fn main() {
   eprint("this goes to stderr\n")
 
   print("=== File I/O ===")
-  File.write("/tmp/glu_io_test.txt", "Hello from Glu!")
-  let content = File.read("/tmp/glu_io_test.txt")
+  File.write("/tmp/ita_io_test.txt", "Hello from Itá!")
+  let content = File.read("/tmp/ita_io_test.txt")
   print("read: ${content}")
 
-  let exists = File.exists("/tmp/glu_io_test.txt")
+  let exists = File.exists("/tmp/ita_io_test.txt")
   print("exists: ${exists}")
 
-  File.delete("/tmp/glu_io_test.txt")
-  let gone = File.exists("/tmp/glu_io_test.txt")
+  File.delete("/tmp/ita_io_test.txt")
+  let gone = File.exists("/tmp/ita_io_test.txt")
   print("deleted: ${gone}")
 
   print("=== Dir I/O ===")
-  Dir.create("/tmp/glu_test_dir")
-  let dirExists = Dir.exists("/tmp/glu_test_dir")
+  Dir.create("/tmp/ita_test_dir")
+  let dirExists = Dir.exists("/tmp/ita_test_dir")
   print("dir exists: ${dirExists}")
-  Dir.delete("/tmp/glu_test_dir")
+  Dir.delete("/tmp/ita_test_dir")
 
   print("=== Path ===")
-  let joined = Path.join("src", "main.glu")
+  let joined = Path.join("src", "main.tu")
   print("joined: ${joined}")
 
-  let dir = Path.dirname("/src/main.glu")
+  let dir = Path.dirname("/src/main.tu")
   print("dirname: ${dir}")
 
-  let ext = Path.ext("main.glu")
+  let ext = Path.ext("main.tu")
   print("ext: ${ext}")
 
   print("=== Timing ===")

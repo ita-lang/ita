@@ -10,9 +10,9 @@ Itá ("pedra" em Tupi antigo) é uma linguagem de programação fortemente tipad
 
 ```bash
 # Variáveis de ambiente necessárias
-export ITA_DART_BIN=/Users/gabriel_aderaldo/Desktop/dev/google_tools/dart-sdk-source/sdk/xcodebuild/ReleaseARM64/dart
-export ITA_PLATFORM_DILL=/Users/gabriel_aderaldo/Desktop/dev/google_tools/dart-sdk-source/sdk/xcodebuild/ReleaseARM64/vm_platform.dill
-export ITA_PACKAGES=/Users/gabriel_aderaldo/Desktop/dev/google_tools/dart-sdk-source/sdk/.dart_tool/package_config.json
+export ITA_DART_BIN=/Users/gabriel_aderaldo/Desktop/Projetos/dev/google_tools/dart-sdk-source/sdk/xcodebuild/ReleaseARM64/dart
+export ITA_PLATFORM_DILL=/Users/gabriel_aderaldo/Desktop/Projetos/dev/google_tools/dart-sdk-source/sdk/xcodebuild/ReleaseARM64/vm_platform.dill
+export ITA_PACKAGES=/Users/gabriel_aderaldo/Desktop/Projetos/dev/google_tools/dart-sdk-source/sdk/.dart_tool/package_config.json
 
 # CLI do compilador
 $ITA_DART_BIN --packages=$ITA_PACKAGES compiler/bin/itac.dart <command>
@@ -101,7 +101,7 @@ Http, Ws, Net, Dns, File, Dir, Path, Json, Csv, Toml, Yaml, Xml, Json5, Ini, Mar
 
 ## Pré-requisito
 
-Dart SDK compilado do source em `/Users/gabriel_aderaldo/Desktop/dev/google_tools/dart-sdk-source/sdk/`.
+Dart SDK compilado do source em `/Users/gabriel_aderaldo/Desktop/Projetos/dev/google_tools/dart-sdk-source/sdk/`.
 
 ## Organização
 

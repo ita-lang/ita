@@ -1,4 +1,4 @@
-# Security Implementation Plan for Glu
+# Security Implementation Plan for Itá
 
 Based on: OWASP Top 10 (2017, 2021, 2025) + MDN Web Security
 
@@ -26,7 +26,7 @@ Based on: OWASP Top 10 (2017, 2021, 2025) + MDN Web Security
 
 ### Phase 1: XSS + Injection Prevention (A03/A05:2025)
 
-```glu
+```tu
 // HTML entity encoding — prevents XSS
 Security.escapeHtml("<script>alert('xss')</script>")
 // → "&lt;script&gt;alert(&#39;xss&#39;)&lt;/script&gt;"
@@ -49,7 +49,7 @@ Security.matches("abc", "[a-z]+")      // regex validation
 
 ### Phase 2: HTTP Security Headers (A05/A02:2025 + MDN)
 
-```glu
+```tu
 // Apply ALL secure headers at once (like helmet.js)
 Security.helmet()
 // Sets:
@@ -74,7 +74,7 @@ Security.permissionsPolicy("camera=(), microphone=()")
 
 ### Phase 3: CORS (A01 + MDN)
 
-```glu
+```tu
 // CORS configuration
 Security.cors(
   origins: ["https://myapp.com"],
@@ -90,7 +90,7 @@ Security.cors(origins: ["*"])
 
 ### Phase 4: JWT Authentication (A07:2025 + MDN Auth)
 
-```glu
+```tu
 // JWT sign (HMAC-SHA256)
 let token = Jwt.sign(
   {"userId": "123", "role": "admin"},
@@ -117,7 +117,7 @@ let token = Jwt.sign(
 
 ### Phase 5: Rate Limiting + Brute Force (A01 + A07)
 
-```glu
+```tu
 // Rate limit by key (IP, user, etc)
 let allowed = Security.rateLimit("ip:192.168.1.1", max: 100, windowMs: 60000)
 if !allowed {
@@ -130,7 +130,7 @@ let canTry = Security.bruteForceGuard("login:user@email.com", maxAttempts: 5)
 
 ### Phase 6: SSRF Prevention (A10:2021 + MDN)
 
-```glu
+```tu
 // Check if URL points to private/internal network
 Security.isPrivateIp("http://192.168.1.1")     // true
 Security.isPrivateIp("http://10.0.0.1")         // true
@@ -145,7 +145,7 @@ Security.allowedUrl("http://api.myapp.com", ["api.myapp.com", "cdn.myapp.com"])
 
 ### Phase 7: Secure Cookies (MDN Practical Guides)
 
-```glu
+```tu
 // Set secure cookie
 Security.cookie("session", token, {
   httpOnly: true,       // no JS access
@@ -159,7 +159,7 @@ Security.cookie("session", token, {
 
 ### Phase 8: Data Integrity (A08:2025 + MDN SRI)
 
-```glu
+```tu
 // Sign data
 let signature = Security.sign("important data", "secret")
 
@@ -173,7 +173,7 @@ let sri = Security.sri("/path/to/file.js")
 
 ### Phase 9: Audit Logging (A09:2025 + MDN)
 
-```glu
+```tu
 // Structured security audit log
 Security.audit("auth.failed", {
   ip: "192.168.1.1",
@@ -191,7 +191,7 @@ Security.audit("auth.failed", {
 
 ### Phase 10: Session Management (MDN Auth)
 
-```glu
+```tu
 // Create secure session
 let sessionId = Security.session.create()
 
@@ -219,7 +219,7 @@ let userId = Security.session.get(sessionId, "userId")
 | **Clickjacking** | X-Frame-Options + CSP frame-ancestors | High (in helmet) |
 | **XS-Leaks** | Document mitigations | Low |
 | **Subdomain Takeover** | Documentation only | Low |
-| **Prototype Pollution** | Not applicable (Glu doesn't have prototypes) | N/A |
+| **Prototype Pollution** | Not applicable (Itá doesn't have prototypes) | N/A |
 | **CORP/COOP/COEP** | Cross-origin isolation headers | Medium (in helmet) |
 | **Referrer Policy** | In helmet headers | High (in helmet) |
 | **Passkeys/WebAuthn** | Future — needs GSX | Future |
@@ -229,16 +229,18 @@ let userId = Security.session.get(sessionId, "userId")
 
 ## Implementation order
 
-1. ⬜ `Security.escapeHtml` + `Security.sanitize` (XSS)
-2. ⬜ `Security.escapeSql` (SQL injection)
-3. ⬜ Input validators (`isEmail`, `isUrl`, `isAlphanumeric`, `matches`)
-4. ⬜ `Security.helmet()` (ALL secure HTTP headers)
-5. ⬜ `Security.cors()` (cross-origin)
-6. ⬜ `Jwt.sign/verify/decode` (authentication)
-7. ⬜ `Security.rateLimit()` + `Security.bruteForceGuard()`
-8. ⬜ `Security.isPrivateIp()` + `Security.allowedUrl()` (SSRF)
-9. ⬜ `Security.cookie()` (secure cookies)
-10. ⬜ `Security.sign/verify` (data integrity)
-11. ⬜ `Security.sri()` (subresource integrity)
-12. ⬜ `Security.audit()` (structured logging)
-13. ⬜ `Security.session.*` (session management)
+1. ✅ `Security.escapeHtml` + `Security.sanitize` (XSS)
+2. ✅ `Security.escapeSql` (SQL injection)
+3. ✅ Input validators (`isEmail`, `isUrl`, `isAlphanumeric`, `matches`; + `isNumeric` bônus)
+4. ✅ `Security.helmet()` (retorna Map com os 10 headers seguros)
+5. 🚧 `Security.cors()` — só lê o 1º arg como origin; `methods`/`headers`/`credentials`/`maxAge` ficam hardcoded
+6. ✅ `Jwt.sign/verify/decode` (authentication)
+7. 🚧 `Security.rateLimit()` + `Security.bruteForceGuard()` — stub: retornam sempre `true` (TODO: stateful com Map in-memory)
+8. ✅ `Security.isPrivateIp()` + `Security.allowedUrl()` (SSRF)
+9. ✅ `Security.cookie()` (secure cookies)
+10. ✅ `Security.sign/verify` (data integrity)
+11. ✅ `Security.sri()` (subresource integrity)
+12. ✅ `Security.audit()` (structured logging)
+13. ⬜ `Security.session.*` (session management) — ausente; só existe `Security.sessionId()` (gera hex), não a API `session.*`
+
+> **Nota (verificado 2026-06-30):** os headers individuais `Security.hsts/csp/frameOptions/referrerPolicy/permissionsPolicy` (Phase 2) seguem ⬜ ausentes — só o `Security.helmet()` agregado (com os 10 headers) está implementado.
