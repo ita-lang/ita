@@ -4176,6 +4176,11 @@ class CodeGenerator {
         if (format == 'json5' && args.isNotEmpty) {
           return k.StaticInvocation(_jsonEncode, k.Arguments([args[0]]));
         }
+        // TOML.stringify → helper real (tipado + [section]). Antes null (P0).
+        if (format == 'toml' && args.isNotEmpty) {
+          _ensureTomlStringifyHelper();
+          return k.StaticInvocation(_tomlStringifyFn!, k.Arguments([args[0]]));
+        }
         _ensureFormatStringifier(format);
         final fn = _formatStringifiers[format];
         if (fn != null && args.isNotEmpty) {
@@ -4210,10 +4215,11 @@ class CodeGenerator {
 
     switch (format) {
       case 'toml':
+        // TOML real: tipado + aninhado (int/float/bool/string/array, [a.b.c]).
+        body = _buildTomlParser(inputParam);
       case 'ini':
-        // TOML/INI: key = value, [sections], # comments
-        // Parse as Map<String, dynamic> (sections = nested maps)
-        body = _buildKvParser(inputParam, format == 'toml' ? '=' : '=');
+        // INI: key = value, [sections], # comments (flat, tudo string)
+        body = _buildKvParser(inputParam, '=');
       case 'yaml':
         // YAML básico: key: value, indentation = nesting
         body = _buildYamlParser(inputParam);
@@ -4359,6 +4365,362 @@ class CodeGenerator {
 
     return k.Block([contentVar, mapVar, sectionVar, iVar, loop,
       k.ReturnStatement(k.VariableGet(mapVar))]);
+  }
+
+  // ============================================================
+  // TOML parser real: Map<String,dynamic> TIPADO e ANINHADO.
+  // TODO(toml): inline tables {a=1}, [[array-of-tables]], datetime,
+  //             multiline """/''', chaves com aspas.
+  // ============================================================
+  k.Procedure? _tomlValueFn;
+  k.Procedure? _tomlValStrFn;
+  k.Procedure? _tomlStringifyFn;
+
+  // --- idiomas locais compartilhados (fechados sobre _coreTypes/_dynamicOp) ---
+  k.Expression _vg(k.VariableDeclaration v) => k.VariableGet(v);
+  k.Expression _di(k.Expression r, String m, [List<k.Expression> a = const []]) =>
+    k.DynamicInvocation(k.DynamicAccessKind.Dynamic, r, k.Name(m), k.Arguments(a));
+  k.Expression _dg(k.Expression r, String p) =>
+    k.DynamicGet(k.DynamicAccessKind.Dynamic, r, k.Name(p));
+  k.Expression _eqc(k.Expression l, k.Expression r) => k.EqualsCall(l, r,
+    functionType: k.FunctionType([const k.DynamicType()],
+      const k.DynamicType(), k.Nullability.nonNullable),
+    interfaceTarget: _coreTypes.objectEquals);
+  k.Expression _andc(k.Expression l, k.Expression r) =>
+    k.LogicalExpression(l, k.LogicalExpressionOperator.AND, r);
+  k.Expression _orc(k.Expression l, k.Expression r) =>
+    k.LogicalExpression(l, k.LogicalExpressionOperator.OR, r);
+  k.Statement _setv(k.VariableDeclaration v, k.Expression e) =>
+    k.ExpressionStatement(k.VariableSet(v, e));
+  k.Statement _addn(k.VariableDeclaration v, int by) => k.ExpressionStatement(
+    k.VariableSet(v, _dynamicOp(k.VariableGet(v), '+', k.IntLiteral(by))));
+  k.VariableDeclaration _dv(String name, k.Expression init, {bool isFinal = false}) =>
+    k.VariableDeclaration(name, initializer: init, type: const k.DynamicType(), isFinal: isFinal);
+
+  /// ita_tomlValue(raw) -> valor TIPADO (String/int/double/bool/List).
+  /// Tokeniza pelo 1o char: `"`=string basica (escapes), `'`=literal, `[`=array
+  /// (recursivo), `true`/`false`=bool, senao int.tryParse → double.tryParse →
+  /// fallback string crua. Auto-recursivo para arrays.
+  void _ensureTomlValueHelper() {
+    if (_tomlValueFn != null) return;
+    final intTryParse = _coreTypes.intClass.procedures
+      .firstWhere((p) => p.name.text == 'tryParse');
+    final dblTryParse = _coreTypes.doubleClass.procedures
+      .firstWhere((p) => p.name.text == 'tryParse');
+
+    final rawParam = k.VariableDeclaration('raw',
+      type: const k.DynamicType(), isFinal: true);
+    // shell primeiro (para auto-referencia via StaticInvocation)
+    final proc = k.Procedure(k.Name('ita_tomlValue'), k.ProcedureKind.Method,
+      k.FunctionNode(k.ReturnStatement(k.NullLiteral()),
+        positionalParameters: [rawParam], returnType: const k.DynamicType()),
+      isStatic: true, fileUri: _fileUri);
+    _tomlValueFn = proc;
+    _library.addProcedure(proc);
+
+    k.Expression charAt(k.Expression s, k.Expression i) => _di(s, '[]', [i]);
+    k.Expression sl(String s) => k.StringLiteral(s);
+    k.Expression il(int i) => k.IntLiteral(i);
+    k.Expression selfCall(k.Expression arg) =>
+      k.StaticInvocation(_tomlValueFn!, k.Arguments([arg]));
+
+    final sVar = _dv('_s', _di(_vg(rawParam), 'trim'));
+    k.Expression len() => _dg(_vg(sVar), 'length');
+    final c0 = _dv('_c0', charAt(_vg(sVar), il(0)), isFinal: true);
+
+    // --- basic string "..." → unescape char-a-char ---
+    final inV = _dv('_in', sl(''));
+    final biV = _dv('_bi', il(1));
+    final beV = _dv('_be', _dynamicOp(len(), '-', il(1)), isFinal: true);
+    final bcV = _dv('_bc', charAt(_vg(sVar), _vg(biV)), isFinal: true);
+    final nchV = _dv('_nc', charAt(_vg(sVar), _dynamicOp(_vg(biV), '+', il(1))), isFinal: true);
+    final mappedEsc = k.ConditionalExpression(_eqc(_vg(nchV), sl('n')), sl('\n'),
+      k.ConditionalExpression(_eqc(_vg(nchV), sl('t')), sl('\t'),
+        k.ConditionalExpression(_eqc(_vg(nchV), sl('"')), sl('"'),
+          k.ConditionalExpression(_eqc(_vg(nchV), sl('\\')), sl('\\'),
+            _vg(nchV), const k.DynamicType()),
+          const k.DynamicType()),
+        const k.DynamicType()),
+      const k.DynamicType());
+    final basicLoop = k.WhileStatement(_dynamicOp(_vg(biV), '<', _vg(beV)),
+      k.Block([
+        bcV,
+        k.IfStatement(
+          _andc(_eqc(_vg(bcV), sl('\\')),
+            _dynamicOp(_dynamicOp(_vg(biV), '+', il(1)), '<', _vg(beV))),
+          k.Block([nchV, _setv(inV, _dynamicOp(_vg(inV), '+', mappedEsc)), _addn(biV, 2)]),
+          k.Block([_setv(inV, _dynamicOp(_vg(inV), '+', _vg(bcV))), _addn(biV, 1)])),
+      ]));
+    final basicStringBlock = k.Block([inV, biV, beV, basicLoop, k.ReturnStatement(_vg(inV))]);
+
+    // --- array [...] → split top-level por virgula (aware de string/depth) ---
+    final arrV = _dv('_arr', k.ListLiteral([], typeArgument: const k.DynamicType()));
+    final aInner = _dv('_ai', _di(_vg(sVar), 'substring',
+      [il(1), _dynamicOp(len(), '-', il(1))]), isFinal: true);
+    final bufV = _dv('_buf', sl(''));
+    final depthV = _dv('_dp', il(0));
+    final aStrV = _dv('_as', k.BoolLiteral(false));
+    final aqV = _dv('_aq', sl(''));
+    final aiV = _dv('_aidx', il(0));
+    final anV = _dv('_an', _dg(_vg(aInner), 'length'), isFinal: true);
+    final achV = _dv('_ach', charAt(_vg(aInner), _vg(aiV)), isFinal: true);
+    k.Statement bufPlus(k.Expression e) => _setv(bufV, _dynamicOp(_vg(bufV), '+', e));
+    // dentro de string do array
+    final aInStr = k.Block([
+      bufPlus(_vg(achV)),
+      k.IfStatement(_eqc(_vg(achV), _vg(aqV)),
+        k.Block([_setv(aStrV, k.BoolLiteral(false)), _addn(aiV, 1)]),
+        k.Block([_addn(aiV, 1)])),
+    ]);
+    final flushBuf = k.IfStatement(
+      _dynamicOp(_dg(_di(_vg(bufV), 'trim'), 'length'), '>', il(0)),
+      k.ExpressionStatement(_di(_vg(arrV), 'add', [selfCall(_vg(bufV))])), null);
+    final aOutStr = k.IfStatement(
+      _orc(_eqc(_vg(achV), sl('"')), _eqc(_vg(achV), sl('\''))),
+      k.Block([_setv(aStrV, k.BoolLiteral(true)), _setv(aqV, _vg(achV)), bufPlus(_vg(achV)), _addn(aiV, 1)]),
+      k.IfStatement(_eqc(_vg(achV), sl('[')),
+        k.Block([_setv(depthV, _dynamicOp(_vg(depthV), '+', il(1))), bufPlus(_vg(achV)), _addn(aiV, 1)]),
+        k.IfStatement(_eqc(_vg(achV), sl(']')),
+          k.Block([_setv(depthV, _dynamicOp(_vg(depthV), '-', il(1))), bufPlus(_vg(achV)), _addn(aiV, 1)]),
+          k.IfStatement(_andc(_eqc(_vg(achV), sl(',')), _eqc(_vg(depthV), il(0))),
+            k.Block([flushBuf, _setv(bufV, sl('')), _addn(aiV, 1)]),
+            k.Block([bufPlus(_vg(achV)), _addn(aiV, 1)])))));
+    final arrayLoop = k.WhileStatement(_dynamicOp(_vg(aiV), '<', _vg(anV)),
+      k.Block([achV, k.IfStatement(_vg(aStrV), aInStr, aOutStr)]));
+    final flushBuf2 = k.IfStatement(
+      _dynamicOp(_dg(_di(_vg(bufV), 'trim'), 'length'), '>', il(0)),
+      k.ExpressionStatement(_di(_vg(arrV), 'add', [selfCall(_vg(bufV))])), null);
+    final arrayBlock = k.Block([arrV, aInner, bufV, depthV, aStrV, aqV, aiV, anV,
+      arrayLoop, flushBuf2, k.ReturnStatement(_vg(arrV))]);
+
+    // --- numbers ---
+    final cleanedV = _dv('_cl', _di(_vg(sVar), 'replaceAll', [sl('_'), sl('')]), isFinal: true);
+    final ivV = _dv('_iv', k.StaticInvocation(intTryParse, k.Arguments([_vg(cleanedV)])), isFinal: true);
+    final dvV = _dv('_dvl', k.StaticInvocation(dblTryParse, k.Arguments([_vg(cleanedV)])), isFinal: true);
+
+    final body = k.Block([
+      sVar,
+      k.IfStatement(_eqc(len(), il(0)), k.ReturnStatement(sl('')), null),
+      c0,
+      k.IfStatement(_eqc(_vg(c0), sl('"')), basicStringBlock, null),
+      k.IfStatement(_eqc(_vg(c0), sl('\'')),
+        k.ReturnStatement(_di(_vg(sVar), 'substring', [il(1), _dynamicOp(len(), '-', il(1))])), null),
+      k.IfStatement(_eqc(_vg(c0), sl('[')), arrayBlock, null),
+      k.IfStatement(_eqc(_vg(sVar), sl('true')), k.ReturnStatement(k.BoolLiteral(true)), null),
+      k.IfStatement(_eqc(_vg(sVar), sl('false')), k.ReturnStatement(k.BoolLiteral(false)), null),
+      cleanedV,
+      ivV,
+      k.IfStatement(k.Not(_eqc(_vg(ivV), k.NullLiteral())), k.ReturnStatement(_vg(ivV)), null),
+      dvV,
+      k.IfStatement(k.Not(_eqc(_vg(dvV), k.NullLiteral())), k.ReturnStatement(_vg(dvV)), null),
+      k.ReturnStatement(_vg(sVar)),
+    ]);
+    proc.function.body = body;
+    body.parent = proc.function;
+  }
+
+  /// Parser TOML principal: retorna Map<String,dynamic> ANINHADO e TIPADO.
+  /// Loop de linhas: strip de comentario `#` (string-aware), `[a.b.c]` desce/cria
+  /// tabelas aninhadas, `key = value` grava valor tipado (ita_tomlValue) na
+  /// tabela corrente.
+  k.Statement _buildTomlParser(k.VariableDeclaration inputParam) {
+    _ensureTomlValueHelper();
+    k.Expression sl(String s) => k.StringLiteral(s);
+    k.Expression il(int i) => k.IntLiteral(i);
+    k.Expression charAt(k.Expression s, k.Expression i) => _di(s, '[]', [i]);
+    k.Expression valueOf(k.Expression arg) =>
+      k.StaticInvocation(_tomlValueFn!, k.Arguments([arg]));
+
+    final rootV = _dv('_root',
+      k.MapLiteral([], keyType: const k.DynamicType(), valueType: const k.DynamicType()));
+    final curV = _dv('_cur', _vg(rootV));
+    final linesV = _dv('_lns', _di(_vg(inputParam), 'split', [sl('\n')]), isFinal: true);
+    final liV = _dv('_li', il(0));
+
+    // strip comment (# fora de string) da linha bruta
+    final rawLineV = _dv('_rl', _di(_vg(linesV), '[]', [_vg(liV)]), isFinal: true);
+    final coutV = _dv('_co', sl(''));
+    final ciV = _dv('_ci', il(0));
+    final cnV = _dv('_cn', _dg(_vg(rawLineV), 'length'), isFinal: true);
+    final cinStrV = _dv('_cis', k.BoolLiteral(false));
+    final cqV = _dv('_cq', sl(''));
+    final cdoneV = _dv('_cd', k.BoolLiteral(false));
+    final cchV = _dv('_cc', charAt(_vg(rawLineV), _vg(ciV)), isFinal: true);
+    final commentInStr = k.Block([
+      _setv(coutV, _dynamicOp(_vg(coutV), '+', _vg(cchV))),
+      k.IfStatement(_eqc(_vg(cchV), _vg(cqV)),
+        k.Block([_setv(cinStrV, k.BoolLiteral(false)), _addn(ciV, 1)]),
+        k.Block([_addn(ciV, 1)])),
+    ]);
+    final commentOutStr = k.IfStatement(
+      _orc(_eqc(_vg(cchV), sl('"')), _eqc(_vg(cchV), sl('\''))),
+      k.Block([_setv(cinStrV, k.BoolLiteral(true)), _setv(cqV, _vg(cchV)),
+        _setv(coutV, _dynamicOp(_vg(coutV), '+', _vg(cchV))), _addn(ciV, 1)]),
+      k.IfStatement(_eqc(_vg(cchV), sl('#')),
+        _setv(cdoneV, k.BoolLiteral(true)),
+        k.Block([_setv(coutV, _dynamicOp(_vg(coutV), '+', _vg(cchV))), _addn(ciV, 1)])));
+    final commentLoop = k.WhileStatement(
+      _andc(_dynamicOp(_vg(ciV), '<', _vg(cnV)), k.Not(_vg(cdoneV))),
+      k.Block([cchV, k.IfStatement(_vg(cinStrV), commentInStr, commentOutStr)]));
+    // lineV = coutV.trim()
+    final lineV = _dv('_line', sl(''));
+
+    // --- [section] → desce/cria tabelas ---
+    final secNameV = _dv('_sn', _di(_vg(lineV), 'substring',
+      [il(1), _di(_vg(lineV), 'indexOf', [sl(']')])]), isFinal: true);
+    final partsV = _dv('_pts', _di(_vg(secNameV), 'split', [sl('.')]), isFinal: true);
+    final mV = _dv('_m', _vg(rootV));
+    final piV = _dv('_pi', il(0));
+    final pV = _dv('_p', _di(_di(_vg(partsV), '[]', [_vg(piV)]), 'trim'), isFinal: true);
+    final navLoop = k.WhileStatement(_dynamicOp(_vg(piV), '<', _dg(_vg(partsV), 'length')),
+      k.Block([
+        pV,
+        k.IfStatement(_eqc(_di(_vg(mV), '[]', [_vg(pV)]), k.NullLiteral()),
+          k.ExpressionStatement(_di(_vg(mV), '[]=', [_vg(pV),
+            k.MapLiteral([], keyType: const k.DynamicType(), valueType: const k.DynamicType())])),
+          null),
+        _setv(mV, _di(_vg(mV), '[]', [_vg(pV)])),
+        _addn(piV, 1),
+      ]));
+    final sectionBlock = k.Block([secNameV, partsV, mV, piV, navLoop, _setv(curV, _vg(mV))]);
+
+    // --- key = value ---
+    final eqIdxV = _dv('_eq', _di(_vg(lineV), 'indexOf', [sl('=')]), isFinal: true);
+    final keyV = _dv('_key', _di(_di(_vg(lineV), 'substring', [il(0), _vg(eqIdxV)]), 'trim'), isFinal: true);
+    final valStrV = _dv('_vs', _di(_vg(lineV), 'substring',
+      [_dynamicOp(_vg(eqIdxV), '+', il(1))]), isFinal: true);
+    final kvBlock = k.Block([eqIdxV,
+      k.IfStatement(_dynamicOp(_vg(eqIdxV), '>', il(0)),
+        k.Block([keyV, valStrV,
+          k.ExpressionStatement(_di(_vg(curV), '[]=', [_vg(keyV), valueOf(_vg(valStrV))]))]),
+        null)]);
+
+    final mainLoop = k.WhileStatement(
+      _dynamicOp(_vg(liV), '<', _dg(_vg(linesV), 'length')),
+      k.Block([
+        rawLineV, coutV, ciV, cnV, cinStrV, cqV, cdoneV, commentLoop,
+        lineV, _setv(lineV, _di(_vg(coutV), 'trim')),
+        _addn(liV, 1),
+        k.IfStatement(_dynamicOp(_dg(_vg(lineV), 'length'), '>', il(0)),
+          k.IfStatement(_eqc(charAt(_vg(lineV), il(0)), sl('[')),
+            sectionBlock,
+            kvBlock),
+          null),
+      ]));
+
+    return k.Block([rootV, curV, linesV, liV, mainLoop, k.ReturnStatement(_vg(rootV))]);
+  }
+
+  /// ita_tomlValStr(v) -> String: formata um valor TIPADO em sintaxe TOML.
+  /// String→"...", bool→true/false, List→[...] (recursivo), int/double crus.
+  void _ensureTomlValStrHelper() {
+    if (_tomlValStrFn != null) return;
+    final vParam = k.VariableDeclaration('v', type: const k.DynamicType(), isFinal: true);
+    final proc = k.Procedure(k.Name('ita_tomlValStr'), k.ProcedureKind.Method,
+      k.FunctionNode(k.ReturnStatement(k.NullLiteral()),
+        positionalParameters: [vParam], returnType: const k.DynamicType()),
+      isStatic: true, fileUri: _fileUri);
+    _tomlValStrFn = proc;
+    _library.addProcedure(proc);
+
+    k.Expression sl(String s) => k.StringLiteral(s);
+    k.Expression il(int i) => k.IntLiteral(i);
+    final isString = k.IsExpression(_vg(vParam), _coreTypes.stringNonNullableRawType);
+    final isBool = k.IsExpression(_vg(vParam), _coreTypes.boolNonNullableRawType);
+    final isList = k.IsExpression(_vg(vParam),
+      k.InterfaceType(_coreTypes.listClass, k.Nullability.nonNullable, const [k.DynamicType()]));
+
+    // string → '"' + escape(\ e ") + '"'
+    final strExpr = _dynamicOp(_dynamicOp(sl('"'), '+',
+      _di(_di(_vg(vParam), 'replaceAll', [sl('\\'), sl('\\\\')]),
+        'replaceAll', [sl('"'), sl('\\"')])), '+', sl('"'));
+    // bool → v ? "true" : "false"
+    final boolExpr = k.ConditionalExpression(_vg(vParam), sl('true'), sl('false'),
+      const k.DynamicType());
+    // list → "[" + join(", ") recursivo + "]"
+    final partsV = _dv('_parts', sl(''));
+    final liV = _dv('_li', il(0));
+    final lnV = _dv('_ln', _dg(_vg(vParam), 'length'), isFinal: true);
+    final elemStr = k.StaticInvocation(_tomlValStrFn!,
+      k.Arguments([_di(_vg(vParam), '[]', [_vg(liV)])]));
+    final listLoop = k.WhileStatement(_dynamicOp(_vg(liV), '<', _vg(lnV)),
+      k.Block([
+        _setv(partsV, _dynamicOp(_vg(partsV), '+', elemStr)),
+        k.IfStatement(_dynamicOp(_dynamicOp(_vg(liV), '+', il(1)), '<', _vg(lnV)),
+          _setv(partsV, _dynamicOp(_vg(partsV), '+', sl(', '))), null),
+        _addn(liV, 1),
+      ]));
+    final listBlock = k.Block([partsV, liV, lnV, listLoop,
+      k.ReturnStatement(_dynamicOp(_dynamicOp(sl('['), '+', _vg(partsV)), '+', sl(']')))]);
+
+    final body = k.Block([
+      k.IfStatement(isString, k.ReturnStatement(strExpr), null),
+      k.IfStatement(isBool, k.ReturnStatement(boolExpr), null),
+      k.IfStatement(isList, listBlock, null),
+      k.ReturnStatement(_di(_vg(vParam), 'toString')),  // int/double
+    ]);
+    proc.function.body = body;
+    body.parent = proc.function;
+  }
+
+  /// ita_tomlStringify(data) -> String TOML. Emite scalars do root primeiro,
+  /// depois [section] por sub-tabela (Map). Round-trippable com _buildTomlParser.
+  /// TODO(toml): sub-tabelas aninhadas (a.b), arrays-of-tables.
+  void _ensureTomlStringifyHelper() {
+    if (_tomlStringifyFn != null) return;
+    _ensureTomlValStrHelper();
+    final dataParam = k.VariableDeclaration('data', type: const k.DynamicType(), isFinal: true);
+
+    k.Expression sl(String s) => k.StringLiteral(s);
+    k.Expression il(int i) => k.IntLiteral(i);
+    k.Expression valStr(k.Expression e) => k.StaticInvocation(_tomlValStrFn!, k.Arguments([e]));
+    final mapType = k.InterfaceType(_coreTypes.mapClass, k.Nullability.nonNullable,
+      const [k.DynamicType(), k.DynamicType()]);
+
+    final outV = _dv('_out', sl(''));
+    final keysV = _dv('_ks', _di(_dg(_vg(dataParam), 'keys'), 'toList'), isFinal: true);
+
+    // pass 1: scalars (nao-Map)
+    final i1 = _dv('_i1', il(0));
+    final k1 = _dv('_k1', _di(_vg(keysV), '[]', [_vg(i1)]), isFinal: true);
+    final v1 = _dv('_v1', _di(_vg(dataParam), '[]', [_vg(k1)]), isFinal: true);
+    final scalarLoop = k.WhileStatement(_dynamicOp(_vg(i1), '<', _dg(_vg(keysV), 'length')),
+      k.Block([k1, v1,
+        k.IfStatement(k.Not(k.IsExpression(_vg(v1), mapType)),
+          _setv(outV, _dynamicOp(_dynamicOp(_dynamicOp(_dynamicOp(_vg(outV), '+', _vg(k1)),
+            '+', sl(' = ')), '+', valStr(_vg(v1))), '+', sl('\n'))),
+          null),
+        _addn(i1, 1)]));
+
+    // pass 2: sub-tabelas (Map) → [section]
+    final i2 = _dv('_i2', il(0));
+    final k2 = _dv('_k2', _di(_vg(keysV), '[]', [_vg(i2)]), isFinal: true);
+    final v2 = _dv('_v2', _di(_vg(dataParam), '[]', [_vg(k2)]), isFinal: true);
+    final skV = _dv('_sk', _di(_dg(_vg(v2), 'keys'), 'toList'), isFinal: true);
+    final j2 = _dv('_j2', il(0));
+    final skk = _dv('_skk', _di(_vg(skV), '[]', [_vg(j2)]), isFinal: true);
+    final subLoop = k.WhileStatement(_dynamicOp(_vg(j2), '<', _dg(_vg(skV), 'length')),
+      k.Block([skk,
+        _setv(outV, _dynamicOp(_dynamicOp(_dynamicOp(_dynamicOp(_vg(outV), '+', _vg(skk)),
+          '+', sl(' = ')), '+', valStr(_di(_vg(v2), '[]', [_vg(skk)]))), '+', sl('\n'))),
+        _addn(j2, 1)]));
+    final sectionLoop = k.WhileStatement(_dynamicOp(_vg(i2), '<', _dg(_vg(keysV), 'length')),
+      k.Block([k2, v2,
+        k.IfStatement(k.IsExpression(_vg(v2), mapType),
+          k.Block([
+            _setv(outV, _dynamicOp(_dynamicOp(_dynamicOp(_vg(outV), '+', sl('[')),
+              '+', _vg(k2)), '+', sl(']\n'))),
+            skV, j2, subLoop,
+          ]),
+          null),
+        _addn(i2, 1)]));
+
+    final body = k.Block([outV, keysV, i1, scalarLoop, i2, sectionLoop,
+      k.ReturnStatement(_vg(outV))]);
+    _tomlStringifyFn = k.Procedure(k.Name('ita_tomlStringify'), k.ProcedureKind.Method,
+      k.FunctionNode(body, positionalParameters: [dataParam], returnType: const k.DynamicType()),
+      isStatic: true, fileUri: _fileUri);
+    _library.addProcedure(_tomlStringifyFn!);
   }
 
   /// YAML básico: key: value (flat, sem nesting profundo)
