@@ -32,7 +32,7 @@ fecha.** Cada case = um `examples/<fmt>.tu` que gera o arquivo + validação ext
 |---|---|---|---|
 | WAV (PCM) | áudio | — | ✅ `wav.tu`, validado por `file(1)` |
 | BMP (24-bit) | imagem | — (LE, sem compressão) | ✅ `bmp.tu`, validado por `file(1)` (PC bitmap 10×10×24, com padding de linha a 4 bytes) |
-| TAR | arquivo | — (ASCII/octal, checksum simples) | ⬜ |
+| TAR (USTAR) | arquivo | — (ASCII/octal, checksum) | ✅ `tar.tu`, round-trip via `tar(1)` real (`tar -tvf` lista com metadados corretos, `tar -xO` extrai o conteúdo; checksum validado) |
 | PNG | imagem | **CRC32** (→ `Checksum`) | ⬜ |
 | MessagePack | dados | varint + `Bytes` reader (round-trip encode/decode) | ⬜ |
 | GIF / ZIP | img/arquivo | LZW / deflate | ⬜ (avançado, opcional) |
