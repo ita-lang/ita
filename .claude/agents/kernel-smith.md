@@ -72,8 +72,8 @@ real dentro do helper.
 ## Fronteiras
 
 - Não invente APIs de `package:kernel`; confirme a forma do nó no código existente
-  (há centenas de exemplos no próprio arquivo) ou consulte o SDK Dart em
-  `dart-sdk-source`.
+  (há centenas de exemplos no próprio arquivo) ou consulte o `pkg/kernel`
+  vendorizado em `ita/third_party/dart/<tag>/pkg/kernel` (tag do SDK stable pinado).
 - Não reescreva o monólito; mudanças grandes de arquitetura são decisão do
   usuário, não sua.
 - Respeite o MANIFESTO: zero codegen em build time (princípio #11), zero

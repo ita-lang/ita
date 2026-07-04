@@ -19,28 +19,23 @@
 #     bash compiler/tool/gen_toml_runtime.sh
 #   # ou via Makefile:  make runtime
 #
-# Mecanismo: gen_kernel precisa de um `main`, entao geramos um wrapper
-# efemero que importa toml.dart; `--no-link-platform` mantem o .dill sem a
-# plataforma (que o VM injeta via --dfe em runtime).
+# Mecanismo: `dart compile kernel` precisa de um `main`, entao geramos um
+# wrapper efemero que importa toml.dart; `--no-link-platform` mantem o .dill
+# sem a plataforma (que o VM injeta via --dfe em runtime).
 # ===========================================================================
 set -euo pipefail
 
-DART="${ITA_DART_BIN:-/Users/gabriel_aderaldo/Desktop/Projetos/dev/google_tools/dart-sdk-source/sdk/xcodebuild/ReleaseARM64/dart}"
-PLAT="${ITA_PLATFORM_DILL:-/Users/gabriel_aderaldo/Desktop/Projetos/dev/google_tools/dart-sdk-source/sdk/xcodebuild/ReleaseARM64/vm_platform.dill}"
-PKG="${ITA_PACKAGES:-/Users/gabriel_aderaldo/Desktop/Projetos/dev/google_tools/dart-sdk-source/sdk/.dart_tool/package_config.json}"
-
 # compiler/ = pai do diretorio tool/
 COMPILER_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-# sdk/ = dois niveis acima do vm_platform.dill (.../sdk/xcodebuild/ReleaseARM64/vm_platform.dill)
-SDK_DIR="$(cd "$(dirname "$PLAT")/../.." && pwd)"
-GEN_KERNEL="$SDK_DIR/pkg/vm/bin/gen_kernel.dart"
+# SDK stable pinado (ver ita/dart-sdk.pin). Fallback = SDK baixado em ita/.dart-sdk/.
+PINNED_SDK="$COMPILER_DIR/../.dart-sdk/3.12.2/dart-sdk"
+DART="${ITA_DART_BIN:-$PINNED_SDK/bin/dart}"
 
 TOML_SRC="$COMPILER_DIR/lib/toml/toml.dart"
 OUT_DILL="$COMPILER_DIR/lib/toml/toml.runtime.dill"
 
-[ -f "$TOML_SRC" ]   || { echo "FATAL: nao achei $TOML_SRC" >&2; exit 1; }
-[ -f "$GEN_KERNEL" ] || { echo "FATAL: nao achei gen_kernel.dart em $GEN_KERNEL" >&2; exit 1; }
-[ -f "$PLAT" ]       || { echo "FATAL: platform.dill nao encontrado: $PLAT" >&2; exit 1; }
+[ -f "$TOML_SRC" ] || { echo "FATAL: nao achei $TOML_SRC" >&2; exit 1; }
+[ -x "$DART" ]     || { echo "FATAL: dart pinado nao encontrado: $DART (rode ita/tools/pin-dart.sh)" >&2; exit 1; }
 
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
@@ -51,10 +46,10 @@ import '$TOML_SRC';
 void main() { parseToml; }
 EOF
 
-"$DART" --packages="$PKG" "$GEN_KERNEL" \
-  --platform "$PLAT" \
-  --no-link-platform \
-  -o "$OUT_DILL" \
-  "$TMP/rt_entry.dart"
+# `dart compile kernel` e o frontend suportado presente em qualquer SDK stable
+# (substitui o gen_kernel.dart do source-tree do fork). --no-link-platform
+# mantem o .dill sem a plataforma (o VM injeta via --dfe em runtime); o codegen
+# mergeia essa lib no Component de saida. O formato de Kernel casa com o SDK.
+"$DART" compile kernel --no-link-platform -o "$OUT_DILL" "$TMP/rt_entry.dart"
 
 echo "RUNTIME-LIB gerado: $OUT_DILL ($(wc -c < "$OUT_DILL" | tr -d ' ') bytes)"

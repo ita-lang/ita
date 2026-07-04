@@ -1,9 +1,10 @@
 # Makefile para Itá SDK
 
 # --- Ferramentas ---
-DART_BIN ?= /Users/gabriel_aderaldo/Desktop/Projetos/dev/google_tools/dart-sdk-source/sdk/xcodebuild/ReleaseARM64/dart
-PLATFORM_DILL ?= /Users/gabriel_aderaldo/Desktop/Projetos/dev/google_tools/dart-sdk-source/sdk/xcodebuild/ReleaseARM64/vm_platform.dill
-PACKAGES ?= /Users/gabriel_aderaldo/Desktop/Projetos/dev/google_tools/dart-sdk-source/sdk/.dart_tool/package_config.json
+# SDK stable pinado (ver dart-sdk.pin). Paths relativos a ita/ (raiz do Makefile).
+DART_BIN ?= .dart-sdk/3.12.2/dart-sdk/bin/dart
+PLATFORM_DILL ?= .dart-sdk/3.12.2/dart-sdk/lib/_internal/vm_platform.dill
+PACKAGES ?= compiler/.dart_tool/package_config.json
 
 # --- Diretórios ---
 COMPILER = compiler/bin/itac.dart

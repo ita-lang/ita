@@ -1,0 +1,22 @@
+# ===========================================================================
+# dart-sdk.pin — pin do backend do Itá no Dart stable OFICIAL
+# ===========================================================================
+# O Itá compila .tu -> Dart Kernel (.dill) e roda na Dart VM. O numero do
+# FORMATO BINARIO de Kernel e um contrato interno SEM SemVer: muda a cada
+# poucos meses e a VM so carrega um .dill cujo formato bate exatamente com o
+# `dart` + o vm_platform.dill usados. Por isso os TRES tem que vir da MESMA
+# versao stable:
+#   1. binario `dart`            -> ita/.dart-sdk/<DART_VERSION>/dart-sdk/bin/dart
+#   2. vm_platform.dill          -> .../dart-sdk/lib/_internal/vm_platform.dill
+#   3. pkg/kernel (+ _fe_...)    -> ita/third_party/dart/<DART_KERNEL_TAG>/pkg
+#
+# Bump: rode `ita/tools/pin-dart.sh <nova_versao>` e so troque este arquivo
+# quando a suite ficar 100% verde. Historico do formato: 3.11.x=127, 3.12.x=130.
+# ===========================================================================
+DART_CHANNEL=stable
+DART_VERSION=3.12.2
+DART_KERNEL_TAG=3.12.2
+EXPECTED_KERNEL_FORMAT=130
+SDK_ZIP_URL=https://storage.googleapis.com/dart-archive/channels/stable/release/3.12.2/sdk/dartsdk-macos-arm64-release.zip
+# sha256 do zip macos-arm64 (especifico de plataforma; recalcule ao trocar de OS/arch)
+SDK_ZIP_SHA256=cd8753928e77b6b665bd70dce0e64b4ec6d2e2fde141d6409bb716c8ac1f1c0a
