@@ -108,6 +108,41 @@ class _OffsetNormalizer extends k.RecursiveVisitor {
   }
 }
 
+/// Passe final: atribui um LocalFunctionId distinto (>= 1) a cada
+/// FunctionExpression / FunctionDeclaration, sequencial POR MEMBER (resetado a
+/// cada Procedure/Constructor/Field).
+///
+/// Sem isso, toda closure fica com LocalFunctionId.invalid (== 0). A Dart VM com
+/// formato de Kernel 130 (>= Dart 3.12 stable) passou a keyar o
+/// `ClosureFunctionsCache` por `local_function_id` (era `kernel_offset` no
+/// formato 128/fork) — ver runtime/vm/closure_functions_cache.cc. Com todas as
+/// closures em id 0, o cache COLAPSA todas as de um mesmo member na chave 0: a
+/// 2ª closure passa a executar o corpo da 1ª. Isso quebrava composição (`>>`),
+/// currying e qualquer função com 2+ closures. O CFE oficial atribui esses ids
+/// via LocalFunctionIdGenerator; aqui replicamos o mesmo invariante.
+class _LocalFunctionIdAssigner extends k.RecursiveVisitor {
+  int _next = 1;
+
+  @override
+  void visitProcedure(k.Procedure node) { _next = 1; super.visitProcedure(node); }
+  @override
+  void visitConstructor(k.Constructor node) { _next = 1; super.visitConstructor(node); }
+  @override
+  void visitField(k.Field node) { _next = 1; super.visitField(node); }
+
+  @override
+  void visitFunctionExpression(k.FunctionExpression node) {
+    node.id = k.LocalFunctionId(_next++);
+    super.visitFunctionExpression(node);
+  }
+
+  @override
+  void visitFunctionDeclaration(k.FunctionDeclaration node) {
+    node.id = k.LocalFunctionId(_next++);
+    super.visitFunctionDeclaration(node);
+  }
+}
+
 class CodeGenerator {
   final String platformPath;
   final String sourcePath; // path do arquivo fonte (pra resolver imports)
@@ -347,6 +382,7 @@ class CodeGenerator {
     // (Bus error / BUS_ADRALN) ao finalizar classes cujos nos estao em -1,
     // de forma cumulativa (so estoura quando ha nos suficientes no .dill).
     _component.accept(_OffsetNormalizer());
+    _component.accept(_LocalFunctionIdAssigner());
 
     _component.computeCanonicalNames();
     return _component;
@@ -2336,21 +2372,20 @@ class CodeGenerator {
       }
     }
 
-    // Função top-level como valor → wrapper closure: (args...) => fn(args...)
+    // Função top-level como valor → tear-off CONSTANTE (StaticTearOffConstant),
+    // igual ao que o CFE oficial emite (`f = #C1`).
+    //
+    // NÃO usar um FunctionExpression wrapper `(args) => fn(args)`: uma closure
+    // NÃO-CAPTURANTE construída à mão via package:kernel serializa num encoding
+    // que o loader da Dart VM (formato de Kernel 130, >= 3.12 stable) COLAPSA —
+    // a closure passa a executar o corpo de OUTRA closure irmã. Em composição
+    // (`double >> increment`) e afins, `(double >> increment)(5)` chamava só
+    // `double` (increment dropado) ou crashava. O tear-off constante referencia
+    // o tear-off canônico da função e não cria uma closure fresca por site.
+    // [PROVADO: v130 — wrapper dá 20/10; StaticTearOffConstant dá 11.]
     if (_functions.containsKey(expr.name)) {
       final proc = _functions[expr.name]!;
-      final paramCount = _fnParamTypes[expr.name]?.length ?? 0;
-      final params = <k.VariableDeclaration>[];
-      for (var i = 0; i < paramCount; i++) {
-        params.add(k.VariableDeclaration('_a$i',
-          type: const k.DynamicType(), isFinal: true));
-      }
-      return k.FunctionExpression(k.FunctionNode(
-        k.ReturnStatement(k.StaticInvocation(proc,
-          k.Arguments(params.map((p) => k.VariableGet(p)).toList()))),
-        positionalParameters: params,
-        returnType: const k.DynamicType(),
-      ));
+      return k.ConstantExpression(k.StaticTearOffConstant(proc));
     }
 
     // Tipo (struct, class, enum) usado como valor — pode ser referência em MemberExpr
