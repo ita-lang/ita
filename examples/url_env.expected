@@ -11,5 +11,5 @@ encoded: hello%20world%20%26%20special%3Dchars
 decoded: hello world & special=chars
 === Env (.env file) ===
 {DB_HOST: localhost, DB_PORT: 5432, DB_NAME: myapp, SECRET_KEY: abc123, DEBUG: true}
-HOME: /Users/gabriel_aderaldo
+HOME set: true
 === Done! ===

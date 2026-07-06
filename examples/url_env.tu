@@ -33,8 +33,10 @@ fn main() {
   File.delete("/tmp/ita_test.env")
 
   // Env do sistema
+  // O valor de HOME varia por máquina — imprime só a presença, pra ser
+  // determinístico em qualquer host (incl. o CI).
   let home = Env.get("HOME")
-  print("HOME: ${home}")
+  print("HOME set: ${home.isNotEmpty}")
 
   print("=== Done! ===")
 }
