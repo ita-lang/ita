@@ -33,7 +33,7 @@ jobs:
     timeout-minutes: 30
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Ler dart-sdk.pin
         id: pin
@@ -45,7 +45,7 @@ jobs:
       # O SDK stable (~200 MB) e gitignored e reproduzivel via pin-dart.sh.
       # Cacheado pela sha256 do zip -> invalida sozinho num bump de versao.
       - name: Cache do Dart SDK stable (.dart-sdk/)
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: .dart-sdk
           key: dart-sdk-${{ runner.os }}-${{ runner.arch }}-${{ steps.pin.outputs.sha }}
