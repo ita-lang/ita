@@ -33,9 +33,9 @@ fi
 cd "$REPO_ROOT" || { echo "FATAL: não achei a raiz do repo Itá"; exit 1; }
 
 # --- defaults idênticos aos do bin/itac -----------------------------------
-ITA_DART_BIN="${ITA_DART_BIN:-/Users/gabriel_aderaldo/Desktop/Projetos/dev/google_tools/dart-sdk-source/sdk/xcodebuild/ReleaseARM64/dart}"
-ITA_PLATFORM_DILL="${ITA_PLATFORM_DILL:-/Users/gabriel_aderaldo/Desktop/Projetos/dev/google_tools/dart-sdk-source/sdk/xcodebuild/ReleaseARM64/vm_platform.dill}"
-ITA_PACKAGES="${ITA_PACKAGES:-/Users/gabriel_aderaldo/Desktop/Projetos/dev/google_tools/dart-sdk-source/sdk/.dart_tool/package_config.json}"
+ITA_DART_BIN="${ITA_DART_BIN:-$REPO_ROOT/.dart-sdk/3.12.2/dart-sdk/bin/dart}"
+ITA_PLATFORM_DILL="${ITA_PLATFORM_DILL:-$REPO_ROOT/.dart-sdk/3.12.2/dart-sdk/lib/_internal/vm_platform.dill}"
+ITA_PACKAGES="${ITA_PACKAGES:-$REPO_ROOT/compiler/.dart_tool/package_config.json}"
 export ITA_DART_BIN ITA_PLATFORM_DILL ITA_PACKAGES
 
 if [ ! -x "$ITA_DART_BIN" ]; then

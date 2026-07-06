@@ -26,9 +26,9 @@ fi
 cd "$REPO_ROOT" || { echo "FATAL: não achei a raiz do repo Itá"; exit 1; }
 
 # --- defaults idênticos aos do bin/itac -----------------------------------
-DEFAULT_DART_BIN="/Users/gabriel_aderaldo/Desktop/Projetos/dev/google_tools/dart-sdk-source/sdk/xcodebuild/ReleaseARM64/dart"
-DEFAULT_PLATFORM_DILL="/Users/gabriel_aderaldo/Desktop/Projetos/dev/google_tools/dart-sdk-source/sdk/xcodebuild/ReleaseARM64/vm_platform.dill"
-DEFAULT_PACKAGES="/Users/gabriel_aderaldo/Desktop/Projetos/dev/google_tools/dart-sdk-source/sdk/.dart_tool/package_config.json"
+DEFAULT_DART_BIN="$REPO_ROOT/.dart-sdk/3.12.2/dart-sdk/bin/dart"
+DEFAULT_PLATFORM_DILL="$REPO_ROOT/.dart-sdk/3.12.2/dart-sdk/lib/_internal/vm_platform.dill"
+DEFAULT_PACKAGES="$REPO_ROOT/compiler/.dart_tool/package_config.json"
 
 ITA_DART_BIN="${ITA_DART_BIN:-$DEFAULT_DART_BIN}"
 ITA_PLATFORM_DILL="${ITA_PLATFORM_DILL:-$DEFAULT_PLATFORM_DILL}"
@@ -64,7 +64,7 @@ fi
 
 # === 3. drift de paths default =============================================
 hdr "3. Drift de configuração (paths default)"
-needle="xcodebuild/ReleaseARM64/dart"
+needle=".dart-sdk/3.12.2/dart-sdk"
 for f in Makefile bin/itac CLAUDE.md; do
   if [ ! -f "$f" ]; then warn "$f não existe"; continue; fi
   if grep -q "$needle" "$f"; then
@@ -100,6 +100,61 @@ else
     fail "não compilou examples/hello.tu"
   fi
   rm -f "$tmp_dill"
+fi
+
+# === 6. Pin do Dart stable =================================================
+hdr "6. Pin do Dart stable (dart-sdk.pin)"
+PIN_FILE="$REPO_ROOT/dart-sdk.pin"
+kver() { python3 -c "import struct,sys; print(struct.unpack('>II', open(sys.argv[1],'rb').read(8))[1])" "$1" 2>/dev/null; }
+if [ ! -f "$PIN_FILE" ]; then
+  warn "dart-sdk.pin ausente — backend sem pin de versao"
+else
+  DART_VERSION="$(grep -E '^DART_VERSION=' "$PIN_FILE" | cut -d= -f2)"
+  EXPECTED_KERNEL_FORMAT="$(grep -E '^EXPECTED_KERNEL_FORMAT=' "$PIN_FILE" | cut -d= -f2)"
+  ok "pin: Dart $DART_VERSION, formato de Kernel esperado $EXPECTED_KERNEL_FORMAT"
+
+  # 6a. dart --version bate com o pin
+  if "$ITA_DART_BIN" --version 2>&1 | grep -q "version: $DART_VERSION "; then
+    ok "dart --version == pin ($DART_VERSION)"
+  else
+    fail "dart --version != pin: $("$ITA_DART_BIN" --version 2>&1 | head -1)"
+  fi
+
+  # 6b. header do vm_platform.dill == formato esperado
+  pver="$(kver "$ITA_PLATFORM_DILL")"
+  if [ "$pver" = "$EXPECTED_KERNEL_FORMAT" ]; then
+    ok "vm_platform.dill formato $pver == esperado"
+  else
+    fail "vm_platform.dill formato ${pver:-?} != esperado $EXPECTED_KERNEL_FORMAT"
+  fi
+
+  # 6c. header de um hello.dill recem-compilado == formato esperado
+  if [ -f examples/hello.tu ]; then
+    pin_dill="$(mktemp -t ita_pin_XXXX).dill"
+    if "$ITA_DART_BIN" --packages="$ITA_PACKAGES" compiler/bin/itac.dart \
+         examples/hello.tu "$pin_dill" "$ITA_PLATFORM_DILL" >/dev/null 2>&1; then
+      dver="$(kver "$pin_dill")"
+      if [ "$dver" = "$EXPECTED_KERNEL_FORMAT" ]; then
+        ok "hello.dill emitido formato $dver == esperado"
+      else
+        fail "hello.dill emitido formato ${dver:-?} != esperado $EXPECTED_KERNEL_FORMAT"
+      fi
+    else
+      warn "nao compilou hello.tu para checar formato do .dill"
+    fi
+    rm -f "$pin_dill"
+  fi
+
+  # 6d. toml.runtime.dill (mergeado no Component) == formato esperado
+  trt="$REPO_ROOT/compiler/lib/toml/toml.runtime.dill"
+  if [ -f "$trt" ]; then
+    tver="$(kver "$trt")"
+    if [ "$tver" = "$EXPECTED_KERNEL_FORMAT" ]; then
+      ok "toml.runtime.dill formato $tver == esperado"
+    else
+      fail "toml.runtime.dill formato ${tver:-?} != esperado $EXPECTED_KERNEL_FORMAT (rode compiler/tool/gen_toml_runtime.sh)"
+    fi
+  fi
 fi
 
 # === resumo ================================================================

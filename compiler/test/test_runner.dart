@@ -47,6 +47,10 @@ void main(List<String> args) async {
     exit(1);
   }
 
+  // Garante build/ (gitignored → ausente em checkout limpo, ex.: no CI). Sem
+  // isso, o itac crasha ao escrever build/test_*.dill (PathNotFoundException).
+  Directory('build').createSync(recursive: true);
+
   // Encontrar todos os .tu (excluir módulos auxiliares que não tem main)
   final auxiliaryModules = {'math.tu', 'greetings.tu'};
 

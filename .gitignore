@@ -15,3 +15,11 @@ Thumbs.db
 .idea/
 .vscode/
 *.swp
+
+# --- Backend Dart stable pinado (ver dart-sdk.pin) ---
+# SDK stable baixado: reproduzivel via tools/pin-dart.sh -> NAO versionar (~200MB)
+/.dart-sdk/
+# toml.runtime.dill (v130) e mergeado pelo codegen no Component de saida:
+# VERSIONAR apesar do `*.dill` acima. Regenerar com compiler/tool/gen_toml_runtime.sh.
+!compiler/lib/toml/toml.runtime.dill
+# (o vendor do pkg/kernel em third_party/ e versionado — nao existe no pub.dev)

@@ -2,11 +2,21 @@ name: ita_compiler
 description: Itá language compiler
 version: 0.1.0
 
+# Backend pinado ao Dart stable oficial — ver ita/dart-sdk.pin (DART_VERSION).
+# kernel/_fe_analyzer_shared sao vendorizados de dart-lang/sdk@<DART_KERNEL_TAG>
+# em ita/third_party/dart/<versao>/pkg (nao existem no pub.dev; a versao do
+# formato de Kernel precisa casar com o `dart` + vm_platform.dill do SDK pinado).
 environment:
-  sdk: '>=3.0.0 <4.0.0'
+  sdk: '>=3.9.0 <4.0.0'
 
 dependencies:
   kernel:
-    path: /Users/gabriel_aderaldo/Desktop/Projetos/dev/google_tools/dart-sdk-source/sdk/pkg/kernel
+    path: ../third_party/dart/3.12.2/pkg/kernel
   _fe_analyzer_shared:
-    path: /Users/gabriel_aderaldo/Desktop/Projetos/dev/google_tools/dart-sdk-source/sdk/pkg/_fe_analyzer_shared
+    path: ../third_party/dart/3.12.2/pkg/_fe_analyzer_shared
+
+# kernel declara `_fe_analyzer_shared: any` (fonte hosted), mas o pacote nao
+# existe no pub.dev; forcamos a fonte path via override (fix provado).
+dependency_overrides:
+  _fe_analyzer_shared:
+    path: ../third_party/dart/3.12.2/pkg/_fe_analyzer_shared

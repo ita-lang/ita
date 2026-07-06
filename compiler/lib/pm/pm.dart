@@ -38,6 +38,8 @@
 
 import 'dart:io';
 
+import '../toml/toml.dart';
+
 // =============================================================================
 // Configuracao de paths
 // =============================================================================
@@ -410,72 +412,56 @@ Map<String, Map<String, String>> _readDependencies() {
   return _parseDependenciesFromContent(tomlFile.readAsStringSync());
 }
 
+/// Extrai `[dependencies]` + `[dev-dependencies]` de um ita.toml.
+///
+/// O parsing agora usa o parser TOML 1.0 robusto (`../toml/toml.dart`) em vez
+/// do scanner ad-hoc line-based que existia aqui. O documento INTEIRO é
+/// parseado com [parseToml]; daí extraímos as duas seções e adaptamos para a
+/// forma histórica `Map<String, Map<String, String>>` que install/deps/add
+/// consomem:
+///   - dep = "1.2.3"                 -> { version: "1.2.3" }
+///   - dep = { git = "...", rev="x" } -> { git: "...", rev: "x" }   (inline table)
+///   - [dependencies.dep] com campos  -> { campo: valor, ... }       (sub-tabela)
+/// Valores não-string (int/bool/array) são convertidos para String.
 Map<String, Map<String, String>> _parseDependenciesFromContent(String content) {
   final deps = <String, Map<String, String>>{};
-  final lines = content.split('\n');
-  var inDeps = false;
-  var inDevDeps = false;
 
-  for (final line in lines) {
-    final trimmed = line.trim();
-    if (trimmed.isEmpty || trimmed.startsWith('#')) continue;
+  Map<String, dynamic> toml;
+  try {
+    toml = parseToml(content);
+  } on FormatException catch (e) {
+    stderr.writeln('Warning: ita.toml parse error: ${e.message}');
+    return deps;
+  }
 
-    if (trimmed == '[dependencies]') {
-      inDeps = true;
-      inDevDeps = false;
-      continue;
-    }
-    if (trimmed == '[dev-dependencies]') {
-      inDeps = false;
-      inDevDeps = true;
-      continue;
-    }
-    if (trimmed.startsWith('[')) {
-      inDeps = false;
-      inDevDeps = false;
-      continue;
-    }
-
-    if (!inDeps && !inDevDeps) continue;
-
-    final eqIdx = trimmed.indexOf('=');
-    if (eqIdx < 0) continue;
-
-    final name = trimmed.substring(0, eqIdx).trim();
-    var value = trimmed.substring(eqIdx + 1).trim();
-
-    if (value.startsWith('{')) {
-      deps[name] = _parseInlineTable(value);
-    } else {
-      if (value.startsWith('"') && value.endsWith('"')) {
-        value = value.substring(1, value.length - 1);
-      }
-      deps[name] = {'version': value};
-    }
+  for (final section in const ['dependencies', 'dev-dependencies']) {
+    final tbl = toml[section];
+    if (tbl is! Map) continue;
+    tbl.forEach((name, value) {
+      deps[name as String] = _depToStringMap(value);
+    });
   }
 
   return deps;
 }
 
-Map<String, String> _parseInlineTable(String input) {
-  final result = <String, String>{};
-  var s = input.trim();
-  if (s.startsWith('{')) s = s.substring(1);
-  if (s.endsWith('}')) s = s.substring(0, s.length - 1);
-
-  for (final part in s.split(',')) {
-    final trimmed = part.trim();
-    if (trimmed.isEmpty) continue;
-    final eqIdx = trimmed.indexOf('=');
-    if (eqIdx < 0) continue;
-    final key = trimmed.substring(0, eqIdx).trim();
-    var val = trimmed.substring(eqIdx + 1).trim();
-    if (val.startsWith('"') && val.endsWith('"')) {
-      val = val.substring(1, val.length - 1);
-    }
-    result[key] = val;
+/// Converte o valor de uma dependência (String de versão OU tabela) num
+/// `Map<String, String>`.
+Map<String, String> _depToStringMap(dynamic value) {
+  if (value is Map) {
+    final m = <String, String>{};
+    value.forEach((k, v) => m[k as String] = _stringifyTomlValue(v));
+    return m;
   }
-  return result;
+  // Versão simples: "1.2.3" (ou int/bool solto viram String).
+  return {'version': _stringifyTomlValue(value)};
+}
+
+/// Achata um valor TOML tipado para String (para caber em Map<String,String>).
+String _stringifyTomlValue(dynamic v) {
+  if (v is String) return v;
+  if (v is List) return v.map(_stringifyTomlValue).join(',');
+  return v.toString(); // int, double, bool, TomlDateTime
 }
 
 // =============================================================================

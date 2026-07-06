@@ -108,6 +108,41 @@ class _OffsetNormalizer extends k.RecursiveVisitor {
   }
 }
 
+/// Passe final: atribui um LocalFunctionId distinto (>= 1) a cada
+/// FunctionExpression / FunctionDeclaration, sequencial POR MEMBER (resetado a
+/// cada Procedure/Constructor/Field).
+///
+/// Sem isso, toda closure fica com LocalFunctionId.invalid (== 0). A Dart VM com
+/// formato de Kernel 130 (>= Dart 3.12 stable) passou a keyar o
+/// `ClosureFunctionsCache` por `local_function_id` (era `kernel_offset` no
+/// formato 128/fork) — ver runtime/vm/closure_functions_cache.cc. Com todas as
+/// closures em id 0, o cache COLAPSA todas as de um mesmo member na chave 0: a
+/// 2ª closure passa a executar o corpo da 1ª. Isso quebrava composição (`>>`),
+/// currying e qualquer função com 2+ closures. O CFE oficial atribui esses ids
+/// via LocalFunctionIdGenerator; aqui replicamos o mesmo invariante.
+class _LocalFunctionIdAssigner extends k.RecursiveVisitor {
+  int _next = 1;
+
+  @override
+  void visitProcedure(k.Procedure node) { _next = 1; super.visitProcedure(node); }
+  @override
+  void visitConstructor(k.Constructor node) { _next = 1; super.visitConstructor(node); }
+  @override
+  void visitField(k.Field node) { _next = 1; super.visitField(node); }
+
+  @override
+  void visitFunctionExpression(k.FunctionExpression node) {
+    node.id = k.LocalFunctionId(_next++);
+    super.visitFunctionExpression(node);
+  }
+
+  @override
+  void visitFunctionDeclaration(k.FunctionDeclaration node) {
+    node.id = k.LocalFunctionId(_next++);
+    super.visitFunctionDeclaration(node);
+  }
+}
+
 class CodeGenerator {
   final String platformPath;
   final String sourcePath; // path do arquivo fonte (pra resolver imports)
@@ -117,6 +152,11 @@ class CodeGenerator {
   late k.Component _component;
   late k.Library _library;
   late CoreTypes _coreTypes;
+  // Plataforma carregada uma unica vez. O _component COMPARTILHA seu canonical
+  // -name root (_platform.root), de modo que libs runtime-lib (ex: o parser
+  // TOML de compiler/lib/toml/toml.dart) mergeadas na plataforma resolvem suas
+  // refs a dart:core contra nos AST ja bound — condicao pra serializar o .dill.
+  late k.Component _platform;
 
   // Referências da plataforma
   late k.Procedure _printProcedure;
@@ -172,6 +212,7 @@ class CodeGenerator {
   late k.Procedure _processRunSync;
   late k.Procedure _jsonEncode;
   late k.Procedure _jsonDecode;
+  late k.Constructor _jsonEncoderWithIndent;
   late k.Class _regExpClass;
   late k.Procedure _stdoutGetter;
   late k.Procedure _stderrGetter;
@@ -341,6 +382,7 @@ class CodeGenerator {
     // (Bus error / BUS_ADRALN) ao finalizar classes cujos nos estao em -1,
     // de forma cumulativa (so estoura quando ha nos suficientes no .dill).
     _component.accept(_OffsetNormalizer());
+    _component.accept(_LocalFunctionIdAssigner());
 
     _component.computeCanonicalNames();
     return _component;
@@ -356,7 +398,8 @@ class CodeGenerator {
   // ============================================================
 
   void _initPlatform() {
-    final platform = k.loadComponentFromBinary(platformPath);
+    _platform = k.loadComponentFromBinary(platformPath);
+    final platform = _platform;
     final dartCore = platform.libraries.firstWhere(
       (lib) => lib.importUri.toString() == 'dart:core',
     );
@@ -507,6 +550,8 @@ class CodeGenerator {
       (lib) => lib.importUri.toString() == 'dart:convert');
     _jsonEncode = dartConvert.procedures.firstWhere((p) => p.name.text == 'jsonEncode');
     _jsonDecode = dartConvert.procedures.firstWhere((p) => p.name.text == 'jsonDecode');
+    _jsonEncoderWithIndent = dartConvert.classes.firstWhere((c) => c.name == 'JsonEncoder')
+      .constructors.firstWhere((c) => c.name.text == 'withIndent');
 
     // dart:core RegExp
     _regExpClass = dartCore.classes.firstWhere((c) => c.name == 'RegExp');
@@ -518,14 +563,18 @@ class CodeGenerator {
   }
 
   void _initComponent() {
-    _component = k.Component();
+    // Compartilha o canonical-name root da plataforma (ver _platform). Isso
+    // mantem _library, plataforma e qualquer runtime-lib mergeada num unico
+    // universo de canonical names, sem conflito de rebind. O .dill de saida
+    // ainda serializa apenas _component.libraries (a plataforma fica de fora,
+    // injetada pelo VM via --dfe em runtime).
+    _component = k.Component(nameRoot: _platform.root);
     _library = k.Library(_libUri, fileUri: _fileUri);
     _component.libraries.add(_library);
     _library.parent = _component;
 
-    // Adicionar dependências necessárias
-    final platform = k.loadComponentFromBinary(platformPath);
-    final dartIsolateLib = platform.libraries.firstWhere(
+    // Adicionar dependências necessárias (reusa a plataforma ja carregada)
+    final dartIsolateLib = _platform.libraries.firstWhere(
       (lib) => lib.importUri.toString() == 'dart:isolate',
     );
     _library.addDependency(k.LibraryDependency.import(dartIsolateLib));
@@ -2323,21 +2372,20 @@ class CodeGenerator {
       }
     }
 
-    // Função top-level como valor → wrapper closure: (args...) => fn(args...)
+    // Função top-level como valor → tear-off CONSTANTE (StaticTearOffConstant),
+    // igual ao que o CFE oficial emite (`f = #C1`).
+    //
+    // NÃO usar um FunctionExpression wrapper `(args) => fn(args)`: uma closure
+    // NÃO-CAPTURANTE construída à mão via package:kernel serializa num encoding
+    // que o loader da Dart VM (formato de Kernel 130, >= 3.12 stable) COLAPSA —
+    // a closure passa a executar o corpo de OUTRA closure irmã. Em composição
+    // (`double >> increment`) e afins, `(double >> increment)(5)` chamava só
+    // `double` (increment dropado) ou crashava. O tear-off constante referencia
+    // o tear-off canônico da função e não cria uma closure fresca por site.
+    // [PROVADO: v130 — wrapper dá 20/10; StaticTearOffConstant dá 11.]
     if (_functions.containsKey(expr.name)) {
       final proc = _functions[expr.name]!;
-      final paramCount = _fnParamTypes[expr.name]?.length ?? 0;
-      final params = <k.VariableDeclaration>[];
-      for (var i = 0; i < paramCount; i++) {
-        params.add(k.VariableDeclaration('_a$i',
-          type: const k.DynamicType(), isFinal: true));
-      }
-      return k.FunctionExpression(k.FunctionNode(
-        k.ReturnStatement(k.StaticInvocation(proc,
-          k.Arguments(params.map((p) => k.VariableGet(p)).toList()))),
-        positionalParameters: params,
-        returnType: const k.DynamicType(),
-      ));
+      return k.ConstantExpression(k.StaticTearOffConstant(proc));
     }
 
     // Tipo (struct, class, enum) usado como valor — pode ser referência em MemberExpr
@@ -3586,9 +3634,44 @@ class CodeGenerator {
       case 'Json':
         switch (method) {
           case 'parse':
-            return k.StaticInvocation(_jsonDecode, k.Arguments(args));
+            return k.StaticInvocation(_jsonDecode,
+              k.Arguments([args.isNotEmpty ? args[0] : k.NullLiteral()]));
           case 'stringify':
-            return k.StaticInvocation(_jsonEncode, k.Arguments(args));
+            // Json.stringify(x[, pretty]). pretty==true → indentado; senao compacto.
+            if (args.length > 1) {
+              return k.ConditionalExpression(
+                k.EqualsCall(args[1], k.BoolLiteral(true),
+                  functionType: k.FunctionType([const k.DynamicType()],
+                    const k.DynamicType(), k.Nullability.nonNullable),
+                  interfaceTarget: _coreTypes.objectEquals),
+                // JsonEncoder.withIndent('  ').convert(x)
+                k.DynamicInvocation(k.DynamicAccessKind.Dynamic,
+                  k.ConstructorInvocation(_jsonEncoderWithIndent,
+                    k.Arguments([k.StringLiteral('  ')])),
+                  k.Name('convert'), k.Arguments([args[0]])),
+                k.StaticInvocation(_jsonEncode, k.Arguments([args[0]])),
+                const k.DynamicType());
+            }
+            return k.StaticInvocation(_jsonEncode,
+              k.Arguments([args.isNotEmpty ? args[0] : k.NullLiteral()]));
+          case 'parseFile':
+            // Json.parseFile(path) → jsonDecode(File(path).readAsStringSync())
+            if (args.isNotEmpty) {
+              return k.StaticInvocation(_jsonDecode, k.Arguments([
+                k.DynamicInvocation(k.DynamicAccessKind.Dynamic,
+                  k.StaticInvocation(_fileFactory, k.Arguments([args[0]])),
+                  k.Name('readAsStringSync'), k.Arguments([]))]));
+            }
+            return k.NullLiteral();
+          case 'writeFile':
+            // Json.writeFile(path, x) → File(path).writeAsStringSync(jsonEncode(x))
+            if (args.length >= 2) {
+              return k.DynamicInvocation(k.DynamicAccessKind.Dynamic,
+                k.StaticInvocation(_fileFactory, k.Arguments([args[0]])),
+                k.Name('writeAsStringSync'),
+                k.Arguments([k.StaticInvocation(_jsonEncode, k.Arguments([args[1]]))]));
+            }
+            return k.NullLiteral();
         }
 
       case 'Terminal':
@@ -4160,6 +4243,11 @@ class CodeGenerator {
   final Map<String, k.Procedure?> _formatParsers = {};
   final Map<String, k.Procedure?> _formatStringifiers = {};
 
+  // RUNTIME-LIB (TOML): procedure `parseToml` da lib toml.dart, ja mergeada no
+  // Component. Null enquanto nao resolvido; _tomlRuntimeTried evita retentar.
+  k.Procedure? _tomlRuntimeParse;
+  bool _tomlRuntimeTried = false;
+
   k.Expression _compileFormatCall(String format, String method, List<k.Expression> args) {
     switch (method) {
       case 'parse':
@@ -4171,6 +4259,26 @@ class CodeGenerator {
         return k.NullLiteral();
 
       case 'stringify':
+        // JSON5.stringify → jsonEncode (JSON e um subconjunto valido de JSON5).
+        // Antes retornava null silenciosamente (P0).
+        if (format == 'json5' && args.isNotEmpty) {
+          return k.StaticInvocation(_jsonEncode, k.Arguments([args[0]]));
+        }
+        // TOML.stringify → helper real (tipado + [section]). Antes null (P0).
+        if (format == 'toml' && args.isNotEmpty) {
+          _ensureTomlStringifyHelper();
+          return k.StaticInvocation(_tomlStringifyFn!, k.Arguments([args[0]]));
+        }
+        // YAML.stringify → helper real (indentacao por nivel). Antes null (P0).
+        if (format == 'yaml' && args.isNotEmpty) {
+          _ensureYamlStringifyHelper();
+          return k.StaticInvocation(_yamlStringifyFn!, k.Arguments([args[0]]));
+        }
+        // XML.stringify → helper real (tree → tags, escape). Antes null (P0).
+        if (format == 'xml' && args.isNotEmpty) {
+          _ensureXmlStringifyHelper();
+          return k.StaticInvocation(_xmlStringifyFn!, k.Arguments([args[0]]));
+        }
         _ensureFormatStringifier(format);
         final fn = _formatStringifiers[format];
         if (fn != null && args.isNotEmpty) {
@@ -4197,6 +4305,17 @@ class CodeGenerator {
   void _ensureFormatParser(String format) {
     if (_formatParsers.containsKey(format)) return;
 
+    // RUNTIME-LIB: Toml.parse usa o parser robusto (parseToml, TOML 1.0
+    // completo) linkado no Component, e nao o sintetizado _buildTomlParser
+    // (~37%). Se a runtime-lib nao estiver disponivel, cai no legacy abaixo.
+    if (format == 'toml') {
+      final rt = _ensureTomlRuntimeParser();
+      if (rt != null) {
+        _formatParsers['toml'] = rt;
+        return;
+      }
+    }
+
     final inputParam = k.VariableDeclaration('input',
       type: _coreTypes.stringNonNullableRawType, isFinal: true);
     final lParam = k.VariableDeclaration('l', type: _coreTypes.stringNonNullableRawType, isFinal: true);
@@ -4205,10 +4324,11 @@ class CodeGenerator {
 
     switch (format) {
       case 'toml':
+        // TOML real: tipado + aninhado (int/float/bool/string/array, [a.b.c]).
+        body = _buildTomlParser(inputParam);
       case 'ini':
-        // TOML/INI: key = value, [sections], # comments
-        // Parse as Map<String, dynamic> (sections = nested maps)
-        body = _buildKvParser(inputParam, format == 'toml' ? '=' : '=');
+        // INI: key = value, [sections], # comments (flat, tudo string)
+        body = _buildKvParser(inputParam, '=');
       case 'yaml':
         // YAML básico: key: value, indentation = nesting
         body = _buildYamlParser(inputParam);
@@ -4231,6 +4351,158 @@ class CodeGenerator {
       isStatic: true, fileUri: _fileUri);
     _library.addProcedure(proc);
     _formatParsers[format] = proc;
+  }
+
+  // ============================================================
+  // RUNTIME-LIB — parser TOML robusto linkado no Component
+  // ============================================================
+  // Em vez de sintetizar TOML no codegen (_buildTomlParser, ~37% do TOML 1.0),
+  // compilamos o parser real (compiler/lib/toml/toml.dart, `parseToml`, TOML
+  // 1.0 completo: inline tables, arrays-of-tables, datetimes, dotted keys...)
+  // para um Kernel `.dill`, mergeamos sua Library no Component de saida e
+  // fazemos Toml.parse(x) -> StaticInvocation(parseToml, [x]).
+  //
+  // Mecanica do merge (o "muro" resolvido): a lib do toml.dart referencia
+  // dart:core. Pra serializar essas refs, elas precisam estar bound a nos AST.
+  // Carregamos a runtime-lib DENTRO de _platform (loadComponentFromBinary com
+  // component alvo) — assim suas refs a dart:core resolvem contra a plataforma
+  // ja carregada — e movemos a Library pro _component, que compartilha o mesmo
+  // canonical-name root (_platform.root). O .dill final serializa so a lib do
+  // toml (a plataforma fica de fora, injetada pelo VM via --dfe).
+
+  /// Resolve/mergeia o `parseToml` da runtime-lib. Retorna o Procedure pronto
+  /// pra StaticInvocation, ou null se indisponivel (dai o codegen usa o parser
+  /// sintetizado legacy como fallback — sem regressao).
+  k.Procedure? _ensureTomlRuntimeParser() {
+    if (_tomlRuntimeParse != null) return _tomlRuntimeParse;
+    if (_tomlRuntimeTried) return null;
+    _tomlRuntimeTried = true;
+    // Kill-switch de debug: forca o parser sintetizado legacy.
+    if ((Platform.environment['ITA_DISABLE_TOML_RUNTIME'] ?? '').isNotEmpty) {
+      return null;
+    }
+    try {
+      final dill = _resolveTomlRuntimeDill();
+      if (dill == null) return null;
+
+      // Mergeia a runtime-lib na plataforma (bind das refs a dart:core).
+      k.loadComponentFromBinary(dill, _platform);
+
+      k.Library? tomlLib;
+      for (final lib in _platform.libraries) {
+        final uri = lib.importUri.toString();
+        if (uri.endsWith('/toml/toml.dart') || uri.endsWith('toml.dart')) {
+          // A lib do parser tem `parseToml`; ignora o wrapper (rt_entry.dart).
+          for (final p in lib.procedures) {
+            if (p.name.text == 'parseToml') { tomlLib = lib; break; }
+          }
+          if (tomlLib != null) break;
+        }
+      }
+      if (tomlLib == null) return null;
+
+      // Move a Library da plataforma para o Component de saida (root shared).
+      _platform.libraries.remove(tomlLib);
+      tomlLib.parent = _component;
+      _component.libraries.add(tomlLib);
+      final src = _platform.uriToSource[tomlLib.fileUri];
+      if (src != null) _component.uriToSource[tomlLib.fileUri] = src;
+
+      for (final p in tomlLib.procedures) {
+        if (p.name.text == 'parseToml') { _tomlRuntimeParse = p; break; }
+      }
+      return _tomlRuntimeParse;
+    } catch (_) {
+      // Qualquer falha (SDK ausente, gen_kernel, merge) -> fallback legacy.
+      return null;
+    }
+  }
+
+  /// Caminho do `toml.runtime.dill` (regenera on-demand se ausente/desatualizado).
+  /// Override explicito via env ITA_TOML_RUNTIME_DILL.
+  String? _resolveTomlRuntimeDill() {
+    final override = Platform.environment['ITA_TOML_RUNTIME_DILL'] ?? '';
+    if (override.isNotEmpty && File(override).existsSync()) return override;
+
+    final libDir = _compilerLibDir();
+    if (libDir == null) return null;
+    final tomlSrc = '$libDir/toml/toml.dart';
+    final dillPath = '$libDir/toml/toml.runtime.dill';
+    final dillF = File(dillPath);
+    final srcF = File(tomlSrc);
+    if (!srcF.existsSync()) return dillF.existsSync() ? dillPath : null;
+
+    final fresh = dillF.existsSync() &&
+        dillF.lastModifiedSync().isAfter(srcF.lastModifiedSync());
+    if (fresh) return dillPath;
+
+    if (_generateTomlRuntimeDill(tomlSrc, dillPath)) return dillPath;
+    return dillF.existsSync() ? dillPath : null; // stale, mas usavel
+  }
+
+  /// Localiza `compiler/lib` subindo a partir do script de entrada (itac.dart /
+  /// test_runner.dart). Override via env ITA_COMPILER_LIB.
+  String? _compilerLibDir() {
+    final override = Platform.environment['ITA_COMPILER_LIB'] ?? '';
+    if (override.isNotEmpty && File('$override/toml/toml.dart').existsSync()) {
+      return override;
+    }
+    Directory dir;
+    try {
+      dir = File.fromUri(Platform.script).parent;
+    } catch (_) {
+      return null;
+    }
+    for (var i = 0; i < 10; i++) {
+      if (File('${dir.path}/lib/toml/toml.dart').existsSync()) {
+        return '${dir.path}/lib';
+      }
+      final parent = dir.parent;
+      if (parent.path == dir.path) break;
+      dir = parent;
+    }
+    return null;
+  }
+
+  /// Regenera o toml.runtime.dill via gen_kernel (mesmo mecanismo do
+  /// compiler/tool/gen_toml_runtime.sh). gen_kernel exige um `main`, entao
+  /// escreve um wrapper efemero que importa toml.dart. `--no-link-platform`
+  /// mantem o .dill sem a plataforma. Retorna true em sucesso.
+  bool _generateTomlRuntimeDill(String tomlSrc, String dillPath) {
+    try {
+      final platFile = File(platformPath);
+      final platDir = platFile.parent;              // .../ReleaseARM64
+      final dartBin = (Platform.environment['ITA_DART_BIN'] ?? '').isNotEmpty
+          ? Platform.environment['ITA_DART_BIN']!
+          : '${platDir.path}/dart';
+      final sdkDir = platDir.parent.parent;          // .../sdk
+      final genKernel = '${sdkDir.path}/pkg/vm/bin/gen_kernel.dart';
+      final pkgs = (Platform.environment['ITA_PACKAGES'] ?? '').isNotEmpty
+          ? Platform.environment['ITA_PACKAGES']!
+          : '${sdkDir.path}/.dart_tool/package_config.json';
+      if (!File(genKernel).existsSync() || !File(dartBin).existsSync()) {
+        return false;
+      }
+      final tmp = Directory.systemTemp.createTempSync('ita_toml_rt');
+      try {
+        final wrapper = File('${tmp.path}/rt_entry.dart');
+        wrapper.writeAsStringSync(
+          "import '${Uri.file(tomlSrc)}';\nvoid main() { parseToml; }\n");
+        final res = Process.runSync(dartBin, [
+          if (pkgs.isNotEmpty) '--packages=$pkgs',
+          genKernel,
+          '--platform', platformPath,
+          '--no-link-platform',
+          '-o', dillPath,
+          wrapper.path,
+        ]);
+        return res.exitCode == 0 && File(dillPath).existsSync();
+      } finally {
+        try { tmp.deleteSync(recursive: true); } catch (_) {}
+      }
+    } catch (_) {
+      return false;
+    }
   }
 
   void _ensureFormatStringifier(String format) {
@@ -4356,63 +4628,1099 @@ class CodeGenerator {
       k.ReturnStatement(k.VariableGet(mapVar))]);
   }
 
-  /// YAML básico: key: value (flat, sem nesting profundo)
+  // ============================================================
+  // TOML parser real: Map<String,dynamic> TIPADO e ANINHADO.
+  // TODO(toml): inline tables {a=1}, [[array-of-tables]], datetime,
+  //             multiline """/''', chaves com aspas.
+  // ============================================================
+  k.Procedure? _tomlValueFn;
+  k.Procedure? _tomlValStrFn;
+  k.Procedure? _tomlStringifyFn;
+
+  // --- idiomas locais compartilhados (fechados sobre _coreTypes/_dynamicOp) ---
+  k.Expression _vg(k.VariableDeclaration v) => k.VariableGet(v);
+  k.Expression _di(k.Expression r, String m, [List<k.Expression> a = const []]) =>
+    k.DynamicInvocation(k.DynamicAccessKind.Dynamic, r, k.Name(m), k.Arguments(a));
+  k.Expression _dg(k.Expression r, String p) =>
+    k.DynamicGet(k.DynamicAccessKind.Dynamic, r, k.Name(p));
+  k.Expression _eqc(k.Expression l, k.Expression r) => k.EqualsCall(l, r,
+    functionType: k.FunctionType([const k.DynamicType()],
+      const k.DynamicType(), k.Nullability.nonNullable),
+    interfaceTarget: _coreTypes.objectEquals);
+  k.Expression _andc(k.Expression l, k.Expression r) =>
+    k.LogicalExpression(l, k.LogicalExpressionOperator.AND, r);
+  k.Expression _orc(k.Expression l, k.Expression r) =>
+    k.LogicalExpression(l, k.LogicalExpressionOperator.OR, r);
+  k.Statement _setv(k.VariableDeclaration v, k.Expression e) =>
+    k.ExpressionStatement(k.VariableSet(v, e));
+  k.Statement _addn(k.VariableDeclaration v, int by) => k.ExpressionStatement(
+    k.VariableSet(v, _dynamicOp(k.VariableGet(v), '+', k.IntLiteral(by))));
+  k.VariableDeclaration _dv(String name, k.Expression init, {bool isFinal = false}) =>
+    k.VariableDeclaration(name, initializer: init, type: const k.DynamicType(), isFinal: isFinal);
+
+  /// ita_tomlValue(raw) -> valor TIPADO (String/int/double/bool/List).
+  /// Tokeniza pelo 1o char: `"`=string basica (escapes), `'`=literal, `[`=array
+  /// (recursivo), `true`/`false`=bool, senao int.tryParse → double.tryParse →
+  /// fallback string crua. Auto-recursivo para arrays.
+  void _ensureTomlValueHelper() {
+    if (_tomlValueFn != null) return;
+    final intTryParse = _coreTypes.intClass.procedures
+      .firstWhere((p) => p.name.text == 'tryParse');
+    final dblTryParse = _coreTypes.doubleClass.procedures
+      .firstWhere((p) => p.name.text == 'tryParse');
+
+    final rawParam = k.VariableDeclaration('raw',
+      type: const k.DynamicType(), isFinal: true);
+    // shell primeiro (para auto-referencia via StaticInvocation)
+    final proc = k.Procedure(k.Name('ita_tomlValue'), k.ProcedureKind.Method,
+      k.FunctionNode(k.ReturnStatement(k.NullLiteral()),
+        positionalParameters: [rawParam], returnType: const k.DynamicType()),
+      isStatic: true, fileUri: _fileUri);
+    _tomlValueFn = proc;
+    _library.addProcedure(proc);
+
+    k.Expression charAt(k.Expression s, k.Expression i) => _di(s, '[]', [i]);
+    k.Expression sl(String s) => k.StringLiteral(s);
+    k.Expression il(int i) => k.IntLiteral(i);
+    k.Expression selfCall(k.Expression arg) =>
+      k.StaticInvocation(_tomlValueFn!, k.Arguments([arg]));
+
+    final sVar = _dv('_s', _di(_vg(rawParam), 'trim'));
+    k.Expression len() => _dg(_vg(sVar), 'length');
+    final c0 = _dv('_c0', charAt(_vg(sVar), il(0)), isFinal: true);
+
+    // --- basic string "..." → unescape char-a-char ---
+    final inV = _dv('_in', sl(''));
+    final biV = _dv('_bi', il(1));
+    final beV = _dv('_be', _dynamicOp(len(), '-', il(1)), isFinal: true);
+    final bcV = _dv('_bc', charAt(_vg(sVar), _vg(biV)), isFinal: true);
+    final nchV = _dv('_nc', charAt(_vg(sVar), _dynamicOp(_vg(biV), '+', il(1))), isFinal: true);
+    final mappedEsc = k.ConditionalExpression(_eqc(_vg(nchV), sl('n')), sl('\n'),
+      k.ConditionalExpression(_eqc(_vg(nchV), sl('t')), sl('\t'),
+        k.ConditionalExpression(_eqc(_vg(nchV), sl('"')), sl('"'),
+          k.ConditionalExpression(_eqc(_vg(nchV), sl('\\')), sl('\\'),
+            _vg(nchV), const k.DynamicType()),
+          const k.DynamicType()),
+        const k.DynamicType()),
+      const k.DynamicType());
+    final basicLoop = k.WhileStatement(_dynamicOp(_vg(biV), '<', _vg(beV)),
+      k.Block([
+        bcV,
+        k.IfStatement(
+          _andc(_eqc(_vg(bcV), sl('\\')),
+            _dynamicOp(_dynamicOp(_vg(biV), '+', il(1)), '<', _vg(beV))),
+          k.Block([nchV, _setv(inV, _dynamicOp(_vg(inV), '+', mappedEsc)), _addn(biV, 2)]),
+          k.Block([_setv(inV, _dynamicOp(_vg(inV), '+', _vg(bcV))), _addn(biV, 1)])),
+      ]));
+    final basicStringBlock = k.Block([inV, biV, beV, basicLoop, k.ReturnStatement(_vg(inV))]);
+
+    // --- array [...] → split top-level por virgula (aware de string/depth) ---
+    final arrV = _dv('_arr', k.ListLiteral([], typeArgument: const k.DynamicType()));
+    final aInner = _dv('_ai', _di(_vg(sVar), 'substring',
+      [il(1), _dynamicOp(len(), '-', il(1))]), isFinal: true);
+    final bufV = _dv('_buf', sl(''));
+    final depthV = _dv('_dp', il(0));
+    final aStrV = _dv('_as', k.BoolLiteral(false));
+    final aqV = _dv('_aq', sl(''));
+    final aiV = _dv('_aidx', il(0));
+    final anV = _dv('_an', _dg(_vg(aInner), 'length'), isFinal: true);
+    final achV = _dv('_ach', charAt(_vg(aInner), _vg(aiV)), isFinal: true);
+    k.Statement bufPlus(k.Expression e) => _setv(bufV, _dynamicOp(_vg(bufV), '+', e));
+    // dentro de string do array
+    final aInStr = k.Block([
+      bufPlus(_vg(achV)),
+      k.IfStatement(_eqc(_vg(achV), _vg(aqV)),
+        k.Block([_setv(aStrV, k.BoolLiteral(false)), _addn(aiV, 1)]),
+        k.Block([_addn(aiV, 1)])),
+    ]);
+    final flushBuf = k.IfStatement(
+      _dynamicOp(_dg(_di(_vg(bufV), 'trim'), 'length'), '>', il(0)),
+      k.ExpressionStatement(_di(_vg(arrV), 'add', [selfCall(_vg(bufV))])), null);
+    final aOutStr = k.IfStatement(
+      _orc(_eqc(_vg(achV), sl('"')), _eqc(_vg(achV), sl('\''))),
+      k.Block([_setv(aStrV, k.BoolLiteral(true)), _setv(aqV, _vg(achV)), bufPlus(_vg(achV)), _addn(aiV, 1)]),
+      k.IfStatement(_eqc(_vg(achV), sl('[')),
+        k.Block([_setv(depthV, _dynamicOp(_vg(depthV), '+', il(1))), bufPlus(_vg(achV)), _addn(aiV, 1)]),
+        k.IfStatement(_eqc(_vg(achV), sl(']')),
+          k.Block([_setv(depthV, _dynamicOp(_vg(depthV), '-', il(1))), bufPlus(_vg(achV)), _addn(aiV, 1)]),
+          k.IfStatement(_andc(_eqc(_vg(achV), sl(',')), _eqc(_vg(depthV), il(0))),
+            k.Block([flushBuf, _setv(bufV, sl('')), _addn(aiV, 1)]),
+            k.Block([bufPlus(_vg(achV)), _addn(aiV, 1)])))));
+    final arrayLoop = k.WhileStatement(_dynamicOp(_vg(aiV), '<', _vg(anV)),
+      k.Block([achV, k.IfStatement(_vg(aStrV), aInStr, aOutStr)]));
+    final flushBuf2 = k.IfStatement(
+      _dynamicOp(_dg(_di(_vg(bufV), 'trim'), 'length'), '>', il(0)),
+      k.ExpressionStatement(_di(_vg(arrV), 'add', [selfCall(_vg(bufV))])), null);
+    final arrayBlock = k.Block([arrV, aInner, bufV, depthV, aStrV, aqV, aiV, anV,
+      arrayLoop, flushBuf2, k.ReturnStatement(_vg(arrV))]);
+
+    // --- numbers ---
+    final cleanedV = _dv('_cl', _di(_vg(sVar), 'replaceAll', [sl('_'), sl('')]), isFinal: true);
+    final ivV = _dv('_iv', k.StaticInvocation(intTryParse, k.Arguments([_vg(cleanedV)])), isFinal: true);
+    final dvV = _dv('_dvl', k.StaticInvocation(dblTryParse, k.Arguments([_vg(cleanedV)])), isFinal: true);
+
+    final body = k.Block([
+      sVar,
+      k.IfStatement(_eqc(len(), il(0)), k.ReturnStatement(sl('')), null),
+      c0,
+      k.IfStatement(_eqc(_vg(c0), sl('"')), basicStringBlock, null),
+      k.IfStatement(_eqc(_vg(c0), sl('\'')),
+        k.ReturnStatement(_di(_vg(sVar), 'substring', [il(1), _dynamicOp(len(), '-', il(1))])), null),
+      k.IfStatement(_eqc(_vg(c0), sl('[')), arrayBlock, null),
+      k.IfStatement(_eqc(_vg(sVar), sl('true')), k.ReturnStatement(k.BoolLiteral(true)), null),
+      k.IfStatement(_eqc(_vg(sVar), sl('false')), k.ReturnStatement(k.BoolLiteral(false)), null),
+      cleanedV,
+      ivV,
+      k.IfStatement(k.Not(_eqc(_vg(ivV), k.NullLiteral())), k.ReturnStatement(_vg(ivV)), null),
+      dvV,
+      k.IfStatement(k.Not(_eqc(_vg(dvV), k.NullLiteral())), k.ReturnStatement(_vg(dvV)), null),
+      k.ReturnStatement(_vg(sVar)),
+    ]);
+    proc.function.body = body;
+    body.parent = proc.function;
+  }
+
+  /// Parser TOML principal: retorna Map<String,dynamic> ANINHADO e TIPADO.
+  /// Loop de linhas: strip de comentario `#` (string-aware), `[a.b.c]` desce/cria
+  /// tabelas aninhadas, `key = value` grava valor tipado (ita_tomlValue) na
+  /// tabela corrente.
+  k.Statement _buildTomlParser(k.VariableDeclaration inputParam) {
+    _ensureTomlValueHelper();
+    k.Expression sl(String s) => k.StringLiteral(s);
+    k.Expression il(int i) => k.IntLiteral(i);
+    k.Expression charAt(k.Expression s, k.Expression i) => _di(s, '[]', [i]);
+    k.Expression valueOf(k.Expression arg) =>
+      k.StaticInvocation(_tomlValueFn!, k.Arguments([arg]));
+
+    final rootV = _dv('_root',
+      k.MapLiteral([], keyType: const k.DynamicType(), valueType: const k.DynamicType()));
+    final curV = _dv('_cur', _vg(rootV));
+    final linesV = _dv('_lns', _di(_vg(inputParam), 'split', [sl('\n')]), isFinal: true);
+    final liV = _dv('_li', il(0));
+
+    // strip comment (# fora de string) da linha bruta
+    final rawLineV = _dv('_rl', _di(_vg(linesV), '[]', [_vg(liV)]), isFinal: true);
+    final coutV = _dv('_co', sl(''));
+    final ciV = _dv('_ci', il(0));
+    final cnV = _dv('_cn', _dg(_vg(rawLineV), 'length'), isFinal: true);
+    final cinStrV = _dv('_cis', k.BoolLiteral(false));
+    final cqV = _dv('_cq', sl(''));
+    final cdoneV = _dv('_cd', k.BoolLiteral(false));
+    final cchV = _dv('_cc', charAt(_vg(rawLineV), _vg(ciV)), isFinal: true);
+    final commentInStr = k.Block([
+      _setv(coutV, _dynamicOp(_vg(coutV), '+', _vg(cchV))),
+      k.IfStatement(_eqc(_vg(cchV), _vg(cqV)),
+        k.Block([_setv(cinStrV, k.BoolLiteral(false)), _addn(ciV, 1)]),
+        k.Block([_addn(ciV, 1)])),
+    ]);
+    final commentOutStr = k.IfStatement(
+      _orc(_eqc(_vg(cchV), sl('"')), _eqc(_vg(cchV), sl('\''))),
+      k.Block([_setv(cinStrV, k.BoolLiteral(true)), _setv(cqV, _vg(cchV)),
+        _setv(coutV, _dynamicOp(_vg(coutV), '+', _vg(cchV))), _addn(ciV, 1)]),
+      k.IfStatement(_eqc(_vg(cchV), sl('#')),
+        _setv(cdoneV, k.BoolLiteral(true)),
+        k.Block([_setv(coutV, _dynamicOp(_vg(coutV), '+', _vg(cchV))), _addn(ciV, 1)])));
+    final commentLoop = k.WhileStatement(
+      _andc(_dynamicOp(_vg(ciV), '<', _vg(cnV)), k.Not(_vg(cdoneV))),
+      k.Block([cchV, k.IfStatement(_vg(cinStrV), commentInStr, commentOutStr)]));
+    // lineV = coutV.trim()
+    final lineV = _dv('_line', sl(''));
+
+    // --- [section] → desce/cria tabelas ---
+    final secNameV = _dv('_sn', _di(_vg(lineV), 'substring',
+      [il(1), _di(_vg(lineV), 'indexOf', [sl(']')])]), isFinal: true);
+    final partsV = _dv('_pts', _di(_vg(secNameV), 'split', [sl('.')]), isFinal: true);
+    final mV = _dv('_m', _vg(rootV));
+    final piV = _dv('_pi', il(0));
+    final pV = _dv('_p', _di(_di(_vg(partsV), '[]', [_vg(piV)]), 'trim'), isFinal: true);
+    final navLoop = k.WhileStatement(_dynamicOp(_vg(piV), '<', _dg(_vg(partsV), 'length')),
+      k.Block([
+        pV,
+        k.IfStatement(_eqc(_di(_vg(mV), '[]', [_vg(pV)]), k.NullLiteral()),
+          k.ExpressionStatement(_di(_vg(mV), '[]=', [_vg(pV),
+            k.MapLiteral([], keyType: const k.DynamicType(), valueType: const k.DynamicType())])),
+          null),
+        _setv(mV, _di(_vg(mV), '[]', [_vg(pV)])),
+        _addn(piV, 1),
+      ]));
+    final sectionBlock = k.Block([secNameV, partsV, mV, piV, navLoop, _setv(curV, _vg(mV))]);
+
+    // --- key = value ---
+    final eqIdxV = _dv('_eq', _di(_vg(lineV), 'indexOf', [sl('=')]), isFinal: true);
+    final keyV = _dv('_key', _di(_di(_vg(lineV), 'substring', [il(0), _vg(eqIdxV)]), 'trim'), isFinal: true);
+    final valStrV = _dv('_vs', _di(_vg(lineV), 'substring',
+      [_dynamicOp(_vg(eqIdxV), '+', il(1))]), isFinal: true);
+    final kvBlock = k.Block([eqIdxV,
+      k.IfStatement(_dynamicOp(_vg(eqIdxV), '>', il(0)),
+        k.Block([keyV, valStrV,
+          k.ExpressionStatement(_di(_vg(curV), '[]=', [_vg(keyV), valueOf(_vg(valStrV))]))]),
+        null)]);
+
+    final mainLoop = k.WhileStatement(
+      _dynamicOp(_vg(liV), '<', _dg(_vg(linesV), 'length')),
+      k.Block([
+        rawLineV, coutV, ciV, cnV, cinStrV, cqV, cdoneV, commentLoop,
+        lineV, _setv(lineV, _di(_vg(coutV), 'trim')),
+        _addn(liV, 1),
+        k.IfStatement(_dynamicOp(_dg(_vg(lineV), 'length'), '>', il(0)),
+          k.IfStatement(_eqc(charAt(_vg(lineV), il(0)), sl('[')),
+            sectionBlock,
+            kvBlock),
+          null),
+      ]));
+
+    return k.Block([rootV, curV, linesV, liV, mainLoop, k.ReturnStatement(_vg(rootV))]);
+  }
+
+  /// ita_tomlValStr(v) -> String: formata um valor TIPADO em sintaxe TOML.
+  /// String→"...", bool→true/false, List→[...] (recursivo), int/double crus.
+  void _ensureTomlValStrHelper() {
+    if (_tomlValStrFn != null) return;
+    final vParam = k.VariableDeclaration('v', type: const k.DynamicType(), isFinal: true);
+    final proc = k.Procedure(k.Name('ita_tomlValStr'), k.ProcedureKind.Method,
+      k.FunctionNode(k.ReturnStatement(k.NullLiteral()),
+        positionalParameters: [vParam], returnType: const k.DynamicType()),
+      isStatic: true, fileUri: _fileUri);
+    _tomlValStrFn = proc;
+    _library.addProcedure(proc);
+
+    k.Expression sl(String s) => k.StringLiteral(s);
+    k.Expression il(int i) => k.IntLiteral(i);
+    final isString = k.IsExpression(_vg(vParam), _coreTypes.stringNonNullableRawType);
+    final isBool = k.IsExpression(_vg(vParam), _coreTypes.boolNonNullableRawType);
+    final isList = k.IsExpression(_vg(vParam),
+      k.InterfaceType(_coreTypes.listClass, k.Nullability.nonNullable, const [k.DynamicType()]));
+
+    // string → '"' + escape(\ e ") + '"'
+    final strExpr = _dynamicOp(_dynamicOp(sl('"'), '+',
+      _di(_di(_vg(vParam), 'replaceAll', [sl('\\'), sl('\\\\')]),
+        'replaceAll', [sl('"'), sl('\\"')])), '+', sl('"'));
+    // bool → v ? "true" : "false"
+    final boolExpr = k.ConditionalExpression(_vg(vParam), sl('true'), sl('false'),
+      const k.DynamicType());
+    // list → "[" + join(", ") recursivo + "]"
+    final partsV = _dv('_parts', sl(''));
+    final liV = _dv('_li', il(0));
+    final lnV = _dv('_ln', _dg(_vg(vParam), 'length'), isFinal: true);
+    final elemStr = k.StaticInvocation(_tomlValStrFn!,
+      k.Arguments([_di(_vg(vParam), '[]', [_vg(liV)])]));
+    final listLoop = k.WhileStatement(_dynamicOp(_vg(liV), '<', _vg(lnV)),
+      k.Block([
+        _setv(partsV, _dynamicOp(_vg(partsV), '+', elemStr)),
+        k.IfStatement(_dynamicOp(_dynamicOp(_vg(liV), '+', il(1)), '<', _vg(lnV)),
+          _setv(partsV, _dynamicOp(_vg(partsV), '+', sl(', '))), null),
+        _addn(liV, 1),
+      ]));
+    final listBlock = k.Block([partsV, liV, lnV, listLoop,
+      k.ReturnStatement(_dynamicOp(_dynamicOp(sl('['), '+', _vg(partsV)), '+', sl(']')))]);
+
+    final body = k.Block([
+      k.IfStatement(isString, k.ReturnStatement(strExpr), null),
+      k.IfStatement(isBool, k.ReturnStatement(boolExpr), null),
+      k.IfStatement(isList, listBlock, null),
+      k.ReturnStatement(_di(_vg(vParam), 'toString')),  // int/double
+    ]);
+    proc.function.body = body;
+    body.parent = proc.function;
+  }
+
+  /// ita_tomlStringify(data) -> String TOML. Emite scalars do root primeiro,
+  /// depois [section] por sub-tabela (Map). Round-trippable com _buildTomlParser.
+  /// TODO(toml): sub-tabelas aninhadas (a.b), arrays-of-tables.
+  void _ensureTomlStringifyHelper() {
+    if (_tomlStringifyFn != null) return;
+    _ensureTomlValStrHelper();
+    final dataParam = k.VariableDeclaration('data', type: const k.DynamicType(), isFinal: true);
+
+    k.Expression sl(String s) => k.StringLiteral(s);
+    k.Expression il(int i) => k.IntLiteral(i);
+    k.Expression valStr(k.Expression e) => k.StaticInvocation(_tomlValStrFn!, k.Arguments([e]));
+    final mapType = k.InterfaceType(_coreTypes.mapClass, k.Nullability.nonNullable,
+      const [k.DynamicType(), k.DynamicType()]);
+
+    final outV = _dv('_out', sl(''));
+    final keysV = _dv('_ks', _di(_dg(_vg(dataParam), 'keys'), 'toList'), isFinal: true);
+
+    // pass 1: scalars (nao-Map)
+    final i1 = _dv('_i1', il(0));
+    final k1 = _dv('_k1', _di(_vg(keysV), '[]', [_vg(i1)]), isFinal: true);
+    final v1 = _dv('_v1', _di(_vg(dataParam), '[]', [_vg(k1)]), isFinal: true);
+    final scalarLoop = k.WhileStatement(_dynamicOp(_vg(i1), '<', _dg(_vg(keysV), 'length')),
+      k.Block([k1, v1,
+        k.IfStatement(k.Not(k.IsExpression(_vg(v1), mapType)),
+          _setv(outV, _dynamicOp(_dynamicOp(_dynamicOp(_dynamicOp(_vg(outV), '+', _vg(k1)),
+            '+', sl(' = ')), '+', valStr(_vg(v1))), '+', sl('\n'))),
+          null),
+        _addn(i1, 1)]));
+
+    // pass 2: sub-tabelas (Map) → [section]
+    final i2 = _dv('_i2', il(0));
+    final k2 = _dv('_k2', _di(_vg(keysV), '[]', [_vg(i2)]), isFinal: true);
+    final v2 = _dv('_v2', _di(_vg(dataParam), '[]', [_vg(k2)]), isFinal: true);
+    final skV = _dv('_sk', _di(_dg(_vg(v2), 'keys'), 'toList'), isFinal: true);
+    final j2 = _dv('_j2', il(0));
+    final skk = _dv('_skk', _di(_vg(skV), '[]', [_vg(j2)]), isFinal: true);
+    final subLoop = k.WhileStatement(_dynamicOp(_vg(j2), '<', _dg(_vg(skV), 'length')),
+      k.Block([skk,
+        _setv(outV, _dynamicOp(_dynamicOp(_dynamicOp(_dynamicOp(_vg(outV), '+', _vg(skk)),
+          '+', sl(' = ')), '+', valStr(_di(_vg(v2), '[]', [_vg(skk)]))), '+', sl('\n'))),
+        _addn(j2, 1)]));
+    final sectionLoop = k.WhileStatement(_dynamicOp(_vg(i2), '<', _dg(_vg(keysV), 'length')),
+      k.Block([k2, v2,
+        k.IfStatement(k.IsExpression(_vg(v2), mapType),
+          k.Block([
+            _setv(outV, _dynamicOp(_dynamicOp(_dynamicOp(_vg(outV), '+', sl('[')),
+              '+', _vg(k2)), '+', sl(']\n'))),
+            skV, j2, subLoop,
+          ]),
+          null),
+        _addn(i2, 1)]));
+
+    final body = k.Block([outV, keysV, i1, scalarLoop, i2, sectionLoop,
+      k.ReturnStatement(_vg(outV))]);
+    _tomlStringifyFn = k.Procedure(k.Name('ita_tomlStringify'), k.ProcedureKind.Method,
+      k.FunctionNode(body, positionalParameters: [dataParam], returnType: const k.DynamicType()),
+      isStatic: true, fileUri: _fileUri);
+    _library.addProcedure(_tomlStringifyFn!);
+  }
+
+  // ============================================================
+  // YAML parser real: Map/List TIPADO e ANINHADO por INDENTACAO (stack).
+  // TODO(yaml): anchors/aliases (&/*), multi-doc ---, block scalars |/>,
+  //             flow inline {}/[]/, tags, listas no root, mapa dentro de item.
+  // ============================================================
+  k.Procedure? _yamlStripFn;
+  k.Procedure? _yamlIndentFn;
+  k.Procedure? _yamlValueFn;
+  k.Procedure? _yamlPeekFn;
+  k.Procedure? _yamlScalarFn;
+  k.Procedure? _yamlEmitFn;
+  k.Procedure? _yamlStringifyFn;
+
+  /// Bloco reutilizavel: unescape de string basica "..." em [sVar] → retorna o
+  /// miolo (com \n \t \" \\). Termina em ReturnStatement.
+  k.Statement _basicStringUnescapeBlock(k.VariableDeclaration sVar) {
+    k.Expression sl(String s) => k.StringLiteral(s);
+    k.Expression il(int i) => k.IntLiteral(i);
+    k.Expression len() => _dg(_vg(sVar), 'length');
+    k.Expression charAt(k.Expression i) => _di(_vg(sVar), '[]', [i]);
+    final inV = _dv('_in', sl(''));
+    final biV = _dv('_bi', il(1));
+    final beV = _dv('_be', _dynamicOp(len(), '-', il(1)), isFinal: true);
+    final bcV = _dv('_bc', charAt(_vg(biV)), isFinal: true);
+    final nchV = _dv('_nc', charAt(_dynamicOp(_vg(biV), '+', il(1))), isFinal: true);
+    final mapped = k.ConditionalExpression(_eqc(_vg(nchV), sl('n')), sl('\n'),
+      k.ConditionalExpression(_eqc(_vg(nchV), sl('t')), sl('\t'),
+        k.ConditionalExpression(_eqc(_vg(nchV), sl('"')), sl('"'),
+          k.ConditionalExpression(_eqc(_vg(nchV), sl('\\')), sl('\\'),
+            _vg(nchV), const k.DynamicType()),
+          const k.DynamicType()),
+        const k.DynamicType()),
+      const k.DynamicType());
+    final loop = k.WhileStatement(_dynamicOp(_vg(biV), '<', _vg(beV)),
+      k.Block([bcV,
+        k.IfStatement(
+          _andc(_eqc(_vg(bcV), sl('\\')),
+            _dynamicOp(_dynamicOp(_vg(biV), '+', il(1)), '<', _vg(beV))),
+          k.Block([nchV, _setv(inV, _dynamicOp(_vg(inV), '+', mapped)), _addn(biV, 2)]),
+          k.Block([_setv(inV, _dynamicOp(_vg(inV), '+', _vg(bcV))), _addn(biV, 1)]))]));
+    return k.Block([inV, biV, beV, loop, k.ReturnStatement(_vg(inV))]);
+  }
+
+  /// Cria um Procedure sincrono simples (1..N params dinamicos, retorno dyn).
+  k.Procedure _mkProc(String name, List<k.VariableDeclaration> params, k.Statement body) {
+    final p = k.Procedure(k.Name(name), k.ProcedureKind.Method,
+      k.FunctionNode(body, positionalParameters: params, returnType: const k.DynamicType()),
+      isStatic: true, fileUri: _fileUri);
+    _library.addProcedure(p);
+    return p;
+  }
+
+  /// ita_yamlStrip(line) → linha sem comentario `#` (string-aware; preserva
+  /// indentacao inicial). `#` dentro de "..."/'...' nao conta.
+  void _ensureYamlStripHelper() {
+    if (_yamlStripFn != null) return;
+    k.Expression sl(String s) => k.StringLiteral(s);
+    k.Expression il(int i) => k.IntLiteral(i);
+    final lineP = k.VariableDeclaration('line', type: const k.DynamicType(), isFinal: true);
+    final outV = _dv('_o', sl(''));
+    final iV = _dv('_i', il(0));
+    final nV = _dv('_n', _dg(_vg(lineP), 'length'), isFinal: true);
+    final inSV = _dv('_is', k.BoolLiteral(false));
+    final qV = _dv('_q', sl(''));
+    final dnV = _dv('_dn', k.BoolLiteral(false));
+    final cV = _dv('_c', _di(_vg(lineP), '[]', [_vg(iV)]), isFinal: true);
+    final inStr = k.Block([
+      _setv(outV, _dynamicOp(_vg(outV), '+', _vg(cV))),
+      k.IfStatement(_eqc(_vg(cV), _vg(qV)),
+        k.Block([_setv(inSV, k.BoolLiteral(false)), _addn(iV, 1)]),
+        k.Block([_addn(iV, 1)]))]);
+    final outStr = k.IfStatement(
+      _orc(_eqc(_vg(cV), sl('"')), _eqc(_vg(cV), sl('\''))),
+      k.Block([_setv(inSV, k.BoolLiteral(true)), _setv(qV, _vg(cV)),
+        _setv(outV, _dynamicOp(_vg(outV), '+', _vg(cV))), _addn(iV, 1)]),
+      k.IfStatement(_eqc(_vg(cV), sl('#')),
+        _setv(dnV, k.BoolLiteral(true)),
+        k.Block([_setv(outV, _dynamicOp(_vg(outV), '+', _vg(cV))), _addn(iV, 1)])));
+    final loop = k.WhileStatement(
+      _andc(_dynamicOp(_vg(iV), '<', _vg(nV)), k.Not(_vg(dnV))),
+      k.Block([cV, k.IfStatement(_vg(inSV), inStr, outStr)]));
+    _yamlStripFn = _mkProc('ita_yamlStrip', [lineP],
+      k.Block([outV, iV, nV, inSV, qV, dnV, loop, k.ReturnStatement(_vg(outV))]));
+  }
+
+  /// ita_yamlIndent(line) → nº de espacos iniciais (largura da indentacao).
+  void _ensureYamlIndentHelper() {
+    if (_yamlIndentFn != null) return;
+    final lineP = k.VariableDeclaration('line', type: const k.DynamicType(), isFinal: true);
+    final iV = _dv('_i', k.IntLiteral(0));
+    final nV = _dv('_n', _dg(_vg(lineP), 'length'), isFinal: true);
+    final loop = k.WhileStatement(
+      _andc(_dynamicOp(_vg(iV), '<', _vg(nV)),
+        _eqc(_di(_vg(lineP), '[]', [_vg(iV)]), k.StringLiteral(' '))),
+      k.Block([_addn(iV, 1)]));
+    _yamlIndentFn = _mkProc('ita_yamlIndent', [lineP],
+      k.Block([iV, nV, loop, k.ReturnStatement(_vg(iV))]));
+  }
+
+  /// ita_yamlValue(raw) → valor TIPADO. Norway (YAML 1.2): SO true/false sao
+  /// bool; yes/no/on/off ficam STRING. null/~/vazio → null. int/float tryParse.
+  void _ensureYamlValueHelper() {
+    if (_yamlValueFn != null) return;
+    final intTP = _coreTypes.intClass.procedures.firstWhere((p) => p.name.text == 'tryParse');
+    final dblTP = _coreTypes.doubleClass.procedures.firstWhere((p) => p.name.text == 'tryParse');
+    k.Expression sl(String s) => k.StringLiteral(s);
+    k.Expression il(int i) => k.IntLiteral(i);
+    final rawP = k.VariableDeclaration('raw', type: const k.DynamicType(), isFinal: true);
+    final sV = _dv('_s', _di(_vg(rawP), 'trim'));
+    k.Expression len() => _dg(_vg(sV), 'length');
+    final c0 = _dv('_c0', _di(_vg(sV), '[]', [il(0)]), isFinal: true);
+    final cleanedV = _dv('_cl', _di(_vg(sV), 'replaceAll', [sl('_'), sl('')]), isFinal: true);
+    final ivV = _dv('_iv', k.StaticInvocation(intTP, k.Arguments([_vg(cleanedV)])), isFinal: true);
+    final dvV = _dv('_dvl', k.StaticInvocation(dblTP, k.Arguments([_vg(cleanedV)])), isFinal: true);
+    _yamlValueFn = _mkProc('ita_yamlValue', [rawP], k.Block([
+      sV,
+      k.IfStatement(_eqc(len(), il(0)), k.ReturnStatement(k.NullLiteral()), null),
+      k.IfStatement(_eqc(_vg(sV), sl('null')), k.ReturnStatement(k.NullLiteral()), null),
+      k.IfStatement(_eqc(_vg(sV), sl('~')), k.ReturnStatement(k.NullLiteral()), null),
+      k.IfStatement(_eqc(_vg(sV), sl('true')), k.ReturnStatement(k.BoolLiteral(true)), null),
+      k.IfStatement(_eqc(_vg(sV), sl('false')), k.ReturnStatement(k.BoolLiteral(false)), null),
+      c0,
+      k.IfStatement(_eqc(_vg(c0), sl('"')), _basicStringUnescapeBlock(sV), null),
+      k.IfStatement(_eqc(_vg(c0), sl('\'')),
+        k.ReturnStatement(_di(_vg(sV), 'substring', [il(1), _dynamicOp(len(), '-', il(1))])), null),
+      cleanedV, ivV,
+      k.IfStatement(k.Not(_eqc(_vg(ivV), k.NullLiteral())), k.ReturnStatement(_vg(ivV)), null),
+      dvV,
+      k.IfStatement(k.Not(_eqc(_vg(dvV), k.NullLiteral())), k.ReturnStatement(_vg(dvV)), null),
+      k.ReturnStatement(_vg(sV)),   // bare string (incl. no/yes/on/off — Norway)
+    ]));
+  }
+
+  /// ita_yamlPeek(lines, from, curIndent) → bool: a proxima linha de conteudo
+  /// esta mais indentada E comeca com "- " (→ o bloco filho e uma List).
+  void _ensureYamlPeekHelper() {
+    if (_yamlPeekFn != null) return;
+    _ensureYamlStripHelper();
+    _ensureYamlIndentHelper();
+    k.Expression sl(String s) => k.StringLiteral(s);
+    k.Expression il(int i) => k.IntLiteral(i);
+    final linesP = k.VariableDeclaration('lines', type: const k.DynamicType(), isFinal: true);
+    final fromP = k.VariableDeclaration('from', type: const k.DynamicType(), isFinal: true);
+    final ciP = k.VariableDeclaration('curInd', type: const k.DynamicType(), isFinal: true);
+    final jV = _dv('_j', _vg(fromP));
+    final nV = _dv('_n', _dg(_vg(linesP), 'length'), isFinal: true);
+    final retV = _dv('_r', k.BoolLiteral(false));
+    final doneV = _dv('_d', k.BoolLiteral(false));
+    final sV = _dv('_s', k.StaticInvocation(_yamlStripFn!,
+      k.Arguments([_di(_vg(linesP), '[]', [_vg(jV)])])), isFinal: true);
+    final tV = _dv('_t', _di(_vg(sV), 'trim'), isFinal: true);
+    final indV = _dv('_ind', k.StaticInvocation(_yamlIndentFn!, k.Arguments([_vg(sV)])), isFinal: true);
+    final loop = k.WhileStatement(
+      _andc(_dynamicOp(_vg(jV), '<', _vg(nV)), k.Not(_vg(doneV))),
+      k.Block([sV, tV,
+        k.IfStatement(_dynamicOp(_dg(_vg(tV), 'length'), '>', il(0)),
+          k.Block([indV,
+            k.IfStatement(_dynamicOp(_vg(indV), '>', _vg(ciP)),
+              k.Block([_setv(retV, _di(_vg(tV), 'startsWith', [sl('- ')])), _setv(doneV, k.BoolLiteral(true))]),
+              _setv(doneV, k.BoolLiteral(true)))]),
+          _addn(jV, 1))]));
+    _yamlPeekFn = _mkProc('ita_yamlPeek', [linesP, fromP, ciP],
+      k.Block([jV, nV, retV, doneV, loop, k.ReturnStatement(_vg(retV))]));
+  }
+
+  /// Parser YAML principal: Map/List aninhado por indentacao (stack).
   k.Statement _buildYamlParser(k.VariableDeclaration inputParam) {
-    // Reusar KV parser mas com ":" como separador e trim de "-" pra lists
-    return _buildKvParser(inputParam, ':');
+    _ensureYamlStripHelper();
+    _ensureYamlIndentHelper();
+    _ensureYamlValueHelper();
+    _ensureYamlPeekHelper();
+    k.Expression sl(String s) => k.StringLiteral(s);
+    k.Expression il(int i) => k.IntLiteral(i);
+    k.Expression strip(k.Expression e) => k.StaticInvocation(_yamlStripFn!, k.Arguments([e]));
+    k.Expression indentOf(k.Expression e) => k.StaticInvocation(_yamlIndentFn!, k.Arguments([e]));
+    k.Expression valOf(k.Expression e) => k.StaticInvocation(_yamlValueFn!, k.Arguments([e]));
+
+    final rootV = _dv('_root',
+      k.MapLiteral([], keyType: const k.DynamicType(), valueType: const k.DynamicType()));
+    final stkIndV = _dv('_si', k.ListLiteral([il(-1)], typeArgument: const k.DynamicType()));
+    final stkConV = _dv('_sc', k.ListLiteral([_vg(rootV)], typeArgument: const k.DynamicType()));
+    final linesV = _dv('_lns', _di(_vg(inputParam), 'split', [sl('\n')]), isFinal: true);
+    final liV = _dv('_li', il(0));
+    final nLinesV = _dv('_nl', _dg(_vg(linesV), 'length'), isFinal: true);
+
+    // por iteracao
+    final strippedV = _dv('_st', strip(_di(_vg(linesV), '[]', [_vg(liV)])), isFinal: true);
+    final trimmedV = _dv('_tr', _di(_vg(strippedV), 'trim'), isFinal: true);
+    final indentV = _dv('_ind', indentOf(_vg(strippedV)), isFinal: true);
+    final contV = _dv('_cont', _dg(_vg(stkConV), 'last'));
+    // pop loop
+    final popLoop = k.WhileStatement(
+      _andc(_dynamicOp(_dg(_vg(stkIndV), 'length'), '>', il(1)),
+        _dynamicOp(_vg(indentV), '<=', _dg(_vg(stkIndV), 'last'))),
+      k.Block([
+        k.ExpressionStatement(_di(_vg(stkIndV), 'removeLast')),
+        k.ExpressionStatement(_di(_vg(stkConV), 'removeLast')),
+      ]));
+
+    // list item "- x"
+    final itemStrV = _dv('_it', _di(_di(_vg(trimmedV), 'substring', [il(2)]), 'trim'), isFinal: true);
+    final listItemBlock = k.Block([itemStrV,
+      k.IfStatement(_dynamicOp(_dg(_vg(itemStrV), 'length'), '>', il(0)),
+        k.ExpressionStatement(_di(_vg(contV), 'add', [valOf(_vg(itemStrV))])), null)]);
+
+    // key: value
+    final ciV = _dv('_ci', _di(_vg(trimmedV), 'indexOf', [sl(':')]), isFinal: true);
+    final keyV = _dv('_key', _di(_di(_vg(trimmedV), 'substring', [il(0), _vg(ciV)]), 'trim'), isFinal: true);
+    final vsV = _dv('_vs', _di(_di(_vg(trimmedV), 'substring', [_dynamicOp(_vg(ciV), '+', il(1))]), 'trim'), isFinal: true);
+    final isListV = _dv('_isl', k.StaticInvocation(_yamlPeekFn!,
+      k.Arguments([_vg(linesV), _vg(liV), _vg(indentV)])), isFinal: true);
+    final childV = _dv('_child', k.ConditionalExpression(_vg(isListV),
+      k.ListLiteral([], typeArgument: const k.DynamicType()),
+      k.MapLiteral([], keyType: const k.DynamicType(), valueType: const k.DynamicType()),
+      const k.DynamicType()), isFinal: true);
+    final emptyValBlock = k.Block([isListV, childV,
+      k.ExpressionStatement(_di(_vg(contV), '[]=', [_vg(keyV), _vg(childV)])),
+      k.ExpressionStatement(_di(_vg(stkIndV), 'add', [_vg(indentV)])),
+      k.ExpressionStatement(_di(_vg(stkConV), 'add', [_vg(childV)]))]);
+    final kvBlock = k.Block([ciV,
+      k.IfStatement(_dynamicOp(_vg(ciV), '>=', il(0)),
+        k.Block([keyV, vsV,
+          k.IfStatement(_eqc(_dg(_vg(vsV), 'length'), il(0)),
+            emptyValBlock,
+            k.ExpressionStatement(_di(_vg(contV), '[]=', [_vg(keyV), valOf(_vg(vsV))])))]),
+        null)]);
+
+    final mainLoop = k.WhileStatement(_dynamicOp(_vg(liV), '<', _vg(nLinesV)),
+      k.Block([
+        strippedV, trimmedV,
+        _addn(liV, 1),
+        k.IfStatement(_dynamicOp(_dg(_vg(trimmedV), 'length'), '>', il(0)),
+          k.Block([indentV, popLoop, contV,
+            k.IfStatement(_di(_vg(trimmedV), 'startsWith', [sl('- ')]),
+              listItemBlock, kvBlock)]),
+          null)]));
+
+    return k.Block([rootV, stkIndV, stkConV, linesV, liV, nLinesV, mainLoop,
+      k.ReturnStatement(_vg(rootV))]);
+  }
+
+  /// ita_yamlScalar(v) → String: null→null, String→"...", bool→true/false,
+  /// int/double crus. Strings sempre quotadas (round-trip seguro: "3"/"no"
+  /// voltam como string).
+  void _ensureYamlScalarHelper() {
+    if (_yamlScalarFn != null) return;
+    k.Expression sl(String s) => k.StringLiteral(s);
+    final vP = k.VariableDeclaration('v', type: const k.DynamicType(), isFinal: true);
+    final strExpr = _dynamicOp(_dynamicOp(sl('"'), '+',
+      _di(_di(_vg(vP), 'replaceAll', [sl('\\'), sl('\\\\')]),
+        'replaceAll', [sl('"'), sl('\\"')])), '+', sl('"'));
+    _yamlScalarFn = _mkProc('ita_yamlScalar', [vP], k.Block([
+      k.IfStatement(_eqc(_vg(vP), k.NullLiteral()), k.ReturnStatement(sl('null')), null),
+      k.IfStatement(k.IsExpression(_vg(vP), _coreTypes.stringNonNullableRawType),
+        k.ReturnStatement(strExpr), null),
+      k.IfStatement(k.IsExpression(_vg(vP), _coreTypes.boolNonNullableRawType),
+        k.ReturnStatement(k.ConditionalExpression(_vg(vP), sl('true'), sl('false'),
+          const k.DynamicType())), null),
+      k.ReturnStatement(_di(_vg(vP), 'toString')),
+    ]));
+  }
+
+  /// ita_yamlEmit(m, ind) → String: emite um Map com indentacao [ind].
+  /// Sub-Map → "key:\n" + emit(sub, ind+"  "); List → "key:\n" + "  - item";
+  /// scalar → "key: value". Auto-recursivo (nesting arbitrario).
+  void _ensureYamlEmitHelper() {
+    if (_yamlEmitFn != null) return;
+    _ensureYamlScalarHelper();
+    k.Expression sl(String s) => k.StringLiteral(s);
+    k.Expression il(int i) => k.IntLiteral(i);
+    final mP = k.VariableDeclaration('m', type: const k.DynamicType(), isFinal: true);
+    final indP = k.VariableDeclaration('ind', type: const k.DynamicType(), isFinal: true);
+    final proc = k.Procedure(k.Name('ita_yamlEmit'), k.ProcedureKind.Method,
+      k.FunctionNode(k.ReturnStatement(k.NullLiteral()),
+        positionalParameters: [mP, indP], returnType: const k.DynamicType()),
+      isStatic: true, fileUri: _fileUri);
+    _yamlEmitFn = proc;
+    _library.addProcedure(proc);
+
+    k.Expression scalar(k.Expression e) => k.StaticInvocation(_yamlScalarFn!, k.Arguments([e]));
+    k.Expression selfEmit(k.Expression m, k.Expression ind) =>
+      k.StaticInvocation(_yamlEmitFn!, k.Arguments([m, ind]));
+    final mapType = k.InterfaceType(_coreTypes.mapClass, k.Nullability.nonNullable,
+      const [k.DynamicType(), k.DynamicType()]);
+    final listType = k.InterfaceType(_coreTypes.listClass, k.Nullability.nonNullable,
+      const [k.DynamicType()]);
+    // concat helper
+    k.Expression cat(List<k.Expression> parts) {
+      var e = parts.first;
+      for (var i = 1; i < parts.length; i++) { e = _dynamicOp(e, '+', parts[i]); }
+      return e;
+    }
+
+    final outV = _dv('_out', sl(''));
+    final keysV = _dv('_ks', _di(_dg(_vg(mP), 'keys'), 'toList'), isFinal: true);
+    final iV = _dv('_i', il(0));
+    final kV = _dv('_k', _di(_vg(keysV), '[]', [_vg(iV)]), isFinal: true);
+    final vV = _dv('_v', _di(_vg(mP), '[]', [_vg(kV)]), isFinal: true);
+    // list branch
+    final jV = _dv('_j', il(0));
+    final childIndV = _dv('_ci2', _dynamicOp(_vg(indP), '+', sl('  ')), isFinal: true);
+    final listLoop = k.WhileStatement(_dynamicOp(_vg(jV), '<', _dg(_vg(vV), 'length')),
+      k.Block([
+        _setv(outV, cat([_vg(outV), _vg(indP), sl('  - '),
+          scalar(_di(_vg(vV), '[]', [_vg(jV)])), sl('\n')])),
+        _addn(jV, 1)]));
+    final loop = k.WhileStatement(_dynamicOp(_vg(iV), '<', _dg(_vg(keysV), 'length')),
+      k.Block([kV, vV,
+        k.IfStatement(k.IsExpression(_vg(vV), mapType),
+          k.Block([childIndV,
+            _setv(outV, cat([_vg(outV), _vg(indP), _vg(kV), sl(':\n'),
+              selfEmit(_vg(vV), _vg(childIndV))]))]),
+          k.IfStatement(k.IsExpression(_vg(vV), listType),
+            k.Block([
+              _setv(outV, cat([_vg(outV), _vg(indP), _vg(kV), sl(':\n')])),
+              jV, listLoop]),
+            _setv(outV, cat([_vg(outV), _vg(indP), _vg(kV), sl(': '),
+              scalar(_vg(vV)), sl('\n')])))),
+        _addn(iV, 1)]));
+    final body = k.Block([outV, keysV, iV, loop, k.ReturnStatement(_vg(outV))]);
+    proc.function.body = body;
+    body.parent = proc.function;
+  }
+
+  /// ita_yamlStringify(data) → String YAML (emit com indentacao "").
+  void _ensureYamlStringifyHelper() {
+    if (_yamlStringifyFn != null) return;
+    _ensureYamlEmitHelper();
+    final dataP = k.VariableDeclaration('data', type: const k.DynamicType(), isFinal: true);
+    _yamlStringifyFn = _mkProc('ita_yamlStringify', [dataP],
+      k.ReturnStatement(k.StaticInvocation(_yamlEmitFn!,
+        k.Arguments([_vg(dataP), k.StringLiteral('')]))));
   }
 
   /// XML parser simplificado: extrai texto entre tags como Map
-  k.Statement _buildXmlParser(k.VariableDeclaration inputParam) {
-    // XML completo é muito complexo. Retorna o JSON do resultado do parse via shell
-    // Fallback: retornar a string raw (o dev usa regex/string ops pra extrair)
-    return k.ReturnStatement(k.VariableGet(inputParam));
+  // ============================================================
+  // XML parser real: arvore de nos {tag, attrs, children, text}.
+  // SECURITY: sem DTD/custom entities -> sem XXE/billion-laughs (imune por
+  // omissao). So as 5 entidades predefinidas (&lt; &gt; &amp; &quot; &apos;).
+  // TODO(xml): CDATA, PIs <?...?> (puladas), namespaces (prefixo literal no
+  //            tag), <?xml?> decl (pulada), nuances de mixed content, matching
+  //            de nome no fecha-tag, atributos sem valor.
+  // ============================================================
+  k.Procedure? _xmlUnescapeFn;
+  k.Procedure? _xmlParseTagFn;
+  k.Procedure? _xmlEmitFn;
+  k.Procedure? _xmlStringifyFn;
+
+  /// ita_xmlUnescape(s) → resolve as 5 entidades XML predefinidas. `&amp;` por
+  /// ultimo (senao re-expandiria as outras).
+  void _ensureXmlUnescapeHelper() {
+    if (_xmlUnescapeFn != null) return;
+    final sP = k.VariableDeclaration('s', type: const k.DynamicType(), isFinal: true);
+    k.Expression rep(k.Expression e, String from, String to) =>
+      _di(e, 'replaceAll', [k.StringLiteral(from), k.StringLiteral(to)]);
+    _xmlUnescapeFn = _mkProc('ita_xmlUnescape', [sP], k.ReturnStatement(
+      rep(rep(rep(rep(rep(_vg(sP), '&lt;', '<'), '&gt;', '>'),
+        '&quot;', '"'), '&apos;', '\''), '&amp;', '&')));
   }
 
-  /// JSON5: strip // comments, /* */ comments, trailing commas, then jsonDecode
+  /// ita_xmlParseTag(content) → no {tag, attrs, children:[], text:""} a partir
+  /// do interior de uma tag de abertura ("tag attr=\"x\" y='z'").
+  void _ensureXmlParseTagHelper() {
+    if (_xmlParseTagFn != null) return;
+    _ensureXmlUnescapeHelper();
+    k.Expression sl(String s) => k.StringLiteral(s);
+    k.Expression il(int i) => k.IntLiteral(i);
+    final contentP = k.VariableDeclaration('content', type: const k.DynamicType(), isFinal: true);
+    final cV = _dv('_c', _di(_vg(contentP), 'trim'), isFinal: true);
+    k.Expression len() => _dg(_vg(cV), 'length');
+    final iV = _dv('_i', il(0));
+    final nV = _dv('_n', len(), isFinal: true);
+    final tagV = _dv('_tag', sl(''));
+    final attrsV = _dv('_attrs',
+      k.MapLiteral([], keyType: const k.DynamicType(), valueType: const k.DynamicType()), isFinal: true);
+    k.Expression at(k.Expression idx) => _di(_vg(cV), '[]', [idx]);
+    k.Expression ch() => at(_vg(iV));
+    k.Expression isWs(k.Expression c) => _orc(_eqc(c, sl(' ')),
+      _orc(_eqc(c, sl('\t')), _orc(_eqc(c, sl('\n')), _eqc(c, sl('\r')))));
+    k.Statement skipWs() => k.WhileStatement(
+      _andc(_dynamicOp(_vg(iV), '<', _vg(nV)), isWs(ch())), k.Block([_addn(iV, 1)]));
+    k.Expression unesc(k.Expression e) => k.StaticInvocation(_xmlUnescapeFn!, k.Arguments([e]));
+
+    // tag name: ate whitespace
+    final tagLoop = k.WhileStatement(
+      _andc(_dynamicOp(_vg(iV), '<', _vg(nV)), k.Not(isWs(ch()))),
+      k.Block([_setv(tagV, _dynamicOp(_vg(tagV), '+', ch())), _addn(iV, 1)]));
+
+    // attrs
+    final nameV = _dv('_name', sl(''));
+    // q = char de aspa corrente (inicializa lendo ch() no inicio do valueBranch)
+    final qV = _dv('_q', ch(), isFinal: true);
+    final valV = _dv('_val', sl(''));
+    final nameLoop = k.WhileStatement(
+      _andc(_dynamicOp(_vg(iV), '<', _vg(nV)),
+        _andc(k.Not(_eqc(ch(), sl('='))), k.Not(isWs(ch())))),
+      k.Block([_setv(nameV, _dynamicOp(_vg(nameV), '+', ch())), _addn(iV, 1)]));
+    final valLoop = k.WhileStatement(
+      _andc(_dynamicOp(_vg(iV), '<', _vg(nV)), k.Not(_eqc(ch(), _vg(qV)))),
+      k.Block([_setv(valV, _dynamicOp(_vg(valV), '+', ch())), _addn(iV, 1)]));
+    final valueBranch = k.Block([
+      qV, _addn(iV, 1),           // q = quote; skip open quote
+      valV, valLoop, _addn(iV, 1), // read até quote; skip close quote
+      k.IfStatement(_dynamicOp(_dg(_vg(nameV), 'length'), '>', il(0)),
+        k.ExpressionStatement(_di(_vg(attrsV), '[]=', [_vg(nameV), unesc(_vg(valV))])), null),
+    ]);
+    // qV/valV são declarados dentro de valueBranch; mas qV é setado após decl.
+    final attrLoop = k.WhileStatement(_dynamicOp(_vg(iV), '<', _vg(nV)),
+      k.Block([
+        skipWs(),
+        nameV, _setv(nameV, sl('')),
+        nameLoop,
+        skipWs(),
+        k.IfStatement(_andc(_dynamicOp(_vg(iV), '<', _vg(nV)), _eqc(ch(), sl('='))),
+          k.Block([
+            _addn(iV, 1), skipWs(),   // skip '=' e ws
+            k.IfStatement(_andc(_dynamicOp(_vg(iV), '<', _vg(nV)),
+              _orc(_eqc(ch(), sl('"')), _eqc(ch(), sl('\'')))),
+              valueBranch, null),
+          ]),
+          null),
+      ]));
+
+    // return {tag, attrs, children:[], text:""}
+    final node = k.MapLiteral([
+      k.MapLiteralEntry(sl('tag'), _vg(tagV)),
+      k.MapLiteralEntry(sl('attrs'), _vg(attrsV)),
+      k.MapLiteralEntry(sl('children'), k.ListLiteral([], typeArgument: const k.DynamicType())),
+      k.MapLiteralEntry(sl('text'), sl('')),
+    ], keyType: const k.DynamicType(), valueType: const k.DynamicType());
+
+    _xmlParseTagFn = _mkProc('ita_xmlParseTag', [contentP],
+      k.Block([cV, iV, nV, tagV, attrsV, tagLoop, attrLoop, k.ReturnStatement(node)]));
+  }
+
+  /// Parser XML principal: arvore via stack de elementos abertos.
+  k.Statement _buildXmlParser(k.VariableDeclaration inputParam) {
+    _ensureXmlUnescapeHelper();
+    _ensureXmlParseTagHelper();
+    k.Expression sl(String s) => k.StringLiteral(s);
+    k.Expression il(int i) => k.IntLiteral(i);
+    final inp = _vg(inputParam);
+    k.Expression at(k.Expression idx) => _di(inp, '[]', [idx]);
+    k.Expression parseTag(k.Expression e) => k.StaticInvocation(_xmlParseTagFn!, k.Arguments([e]));
+    k.Expression unesc(k.Expression e) => k.StaticInvocation(_xmlUnescapeFn!, k.Arguments([e]));
+    k.Expression indexOf(k.Expression needle, k.Expression from) =>
+      _di(inp, 'indexOf', [needle, from]);
+
+    final rootV = _dv('_root',
+      k.MapLiteral([], keyType: const k.DynamicType(), valueType: const k.DynamicType()));
+    final hasRootV = _dv('_hr', k.BoolLiteral(false));
+    final stackV = _dv('_stk', k.ListLiteral([], typeArgument: const k.DynamicType()), isFinal: true);
+    final iV = _dv('_i', il(0));
+    final nV = _dv('_n', _dg(inp, 'length'), isFinal: true);
+    k.Expression cur() => at(_vg(iV));
+    k.Expression stkTop() => _dg(_vg(stackV), 'last');
+
+    // --- tag: acha o fim (respeitando aspas) ---
+    final jV = _dv('_j', _dynamicOp(_vg(iV), '+', il(1)));
+    final tqV = _dv('_tq', sl(''));
+    final tinqV = _dv('_tinq', k.BoolLiteral(false));
+    final tfoundV = _dv('_tf', k.BoolLiteral(false));
+    final cjV = _dv('_cj', at(_vg(jV)), isFinal: true);
+    final tagEndLoop = k.WhileStatement(
+      _andc(_dynamicOp(_vg(jV), '<', _vg(nV)), k.Not(_vg(tfoundV))),
+      k.Block([cjV,
+        k.IfStatement(_vg(tinqV),
+          k.Block([k.IfStatement(_eqc(_vg(cjV), _vg(tqV)),
+            _setv(tinqV, k.BoolLiteral(false)), null), _addn(jV, 1)]),
+          k.IfStatement(_orc(_eqc(_vg(cjV), sl('"')), _eqc(_vg(cjV), sl('\''))),
+            k.Block([_setv(tinqV, k.BoolLiteral(true)), _setv(tqV, _vg(cjV)), _addn(jV, 1)]),
+            k.IfStatement(_eqc(_vg(cjV), sl('>')),
+              _setv(tfoundV, k.BoolLiteral(true)),
+              _addn(jV, 1))))]));
+    final contentV = _dv('_ct', _di(inp, 'substring', [_dynamicOp(_vg(iV), '+', il(1)), _vg(jV)]), isFinal: true);
+    // no de abertura/self-close
+    final scV = _dv('_sc', _di(_vg(contentV), 'endsWith', [sl('/')]), isFinal: true);
+    final ctrimV = _dv('_ctr', k.ConditionalExpression(_vg(scV),
+      _di(_vg(contentV), 'substring', [il(0), _dynamicOp(_dg(_vg(contentV), 'length'), '-', il(1))]),
+      _vg(contentV), const k.DynamicType()), isFinal: true);
+    final nodeV = _dv('_nd', parseTag(_vg(ctrimV)), isFinal: true);
+    final openTagBlock = k.Block([scV, ctrimV, nodeV,
+      k.IfStatement(_dg(_vg(stackV), 'isNotEmpty'),
+        k.ExpressionStatement(_di(_di(stkTop(), '[]', [sl('children')]), 'add', [_vg(nodeV)])),
+        k.IfStatement(k.Not(_vg(hasRootV)),
+          k.Block([_setv(rootV, _vg(nodeV)), _setv(hasRootV, k.BoolLiteral(true))]), null)),
+      k.IfStatement(k.Not(_vg(scV)),
+        k.ExpressionStatement(_di(_vg(stackV), 'add', [_vg(nodeV)])), null)]);
+    final tagBlock = k.Block([jV, tqV, tinqV, tfoundV, tagEndLoop, contentV,
+      _setv(iV, _dynamicOp(_vg(jV), '+', il(1))),
+      k.IfStatement(_di(_vg(contentV), 'startsWith', [sl('/')]),
+        // fecha tag → pop
+        k.IfStatement(_dg(_vg(stackV), 'isNotEmpty'),
+          k.ExpressionStatement(_di(_vg(stackV), 'removeLast')), null),
+        openTagBlock)]);
+
+    // --- comentario / PI ---
+    final ceV = _dv('_ce', indexOf(sl('-->'), _vg(iV)), isFinal: true);
+    final commentBlock = k.Block([ceV,
+      _setv(iV, k.ConditionalExpression(_dynamicOp(_vg(ceV), '<', il(0)),
+        _vg(nV), _dynamicOp(_vg(ceV), '+', il(3)), const k.DynamicType()))]);
+    final peV = _dv('_pe', indexOf(sl('?>'), _vg(iV)), isFinal: true);
+    final piBlock = k.Block([peV,
+      _setv(iV, k.ConditionalExpression(_dynamicOp(_vg(peV), '<', il(0)),
+        _vg(nV), _dynamicOp(_vg(peV), '+', il(2)), const k.DynamicType()))]);
+
+    // dispatch em '<'
+    final ltBlock = k.IfStatement(
+      _di(inp, 'startsWith', [sl('<!--'), _vg(iV)]),
+      commentBlock,
+      k.IfStatement(
+        _andc(_dynamicOp(_dynamicOp(_vg(iV), '+', il(1)), '<', _vg(nV)),
+          _eqc(at(_dynamicOp(_vg(iV), '+', il(1))), sl('?'))),
+        piBlock,
+        tagBlock));
+
+    // --- texto ate '<' ---
+    final tsV = _dv('_ts', _vg(iV), isFinal: true);
+    final txtV = _dv('_txt', sl(''), isFinal: false);
+    final trimmedV = _dv('_tm', sl(''));
+    final textScan = k.WhileStatement(
+      _andc(_dynamicOp(_vg(iV), '<', _vg(nV)), k.Not(_eqc(cur(), sl('<')))),
+      k.Block([_addn(iV, 1)]));
+    final textBlock = k.Block([tsV, textScan,
+      txtV, _setv(txtV, _di(inp, 'substring', [_vg(tsV), _vg(iV)])),
+      trimmedV, _setv(trimmedV, _di(_vg(txtV), 'trim')),
+      k.IfStatement(_andc(_dynamicOp(_dg(_vg(trimmedV), 'length'), '>', il(0)),
+        _dg(_vg(stackV), 'isNotEmpty')),
+        k.ExpressionStatement(_di(stkTop(), '[]=', [sl('text'),
+          _dynamicOp(_di(stkTop(), '[]', [sl('text')]), '+', unesc(_vg(trimmedV)))])),
+        null)]);
+
+    final mainLoop = k.WhileStatement(_dynamicOp(_vg(iV), '<', _vg(nV)),
+      k.Block([k.IfStatement(_eqc(cur(), sl('<')), ltBlock, textBlock)]));
+
+    return k.Block([rootV, hasRootV, stackV, iV, nV, mainLoop,
+      k.ReturnStatement(_vg(rootV))]);
+  }
+
+  /// ita_xmlEmit(node) → String XML. Self-close se sem filhos/texto.
+  /// ESCAPE XML no texto (& < >) e nos attrs (& < > "). Auto-recursivo.
+  void _ensureXmlEmitHelper() {
+    if (_xmlEmitFn != null) return;
+    k.Expression sl(String s) => k.StringLiteral(s);
+    k.Expression il(int i) => k.IntLiteral(i);
+    final nodeP = k.VariableDeclaration('node', type: const k.DynamicType(), isFinal: true);
+    final proc = k.Procedure(k.Name('ita_xmlEmit'), k.ProcedureKind.Method,
+      k.FunctionNode(k.ReturnStatement(k.NullLiteral()),
+        positionalParameters: [nodeP], returnType: const k.DynamicType()),
+      isStatic: true, fileUri: _fileUri);
+    _xmlEmitFn = proc;
+    _library.addProcedure(proc);
+
+    k.Expression get(String key) => _di(_vg(nodeP), '[]', [sl(key)]);
+    k.Expression escText(k.Expression e) => _di(_di(_di(e, 'replaceAll', [sl('&'), sl('&amp;')]),
+      'replaceAll', [sl('<'), sl('&lt;')]), 'replaceAll', [sl('>'), sl('&gt;')]);
+    k.Expression escAttr(k.Expression e) => _di(escText(e), 'replaceAll', [sl('"'), sl('&quot;')]);
+    k.Expression cat(List<k.Expression> parts) {
+      var e = parts.first;
+      for (var i = 1; i < parts.length; i++) { e = _dynamicOp(e, '+', parts[i]); }
+      return e;
+    }
+    k.Expression selfEmit(k.Expression n) => k.StaticInvocation(_xmlEmitFn!, k.Arguments([n]));
+
+    final tagV = _dv('_tag', get('tag'), isFinal: true);
+    final attrsV = _dv('_at', get('attrs'), isFinal: true);
+    final childV = _dv('_ch', get('children'), isFinal: true);
+    final textV = _dv('_tx', get('text'), isFinal: true);
+    final outV = _dv('_out', _dynamicOp(sl('<'), '+', _vg(tagV)));
+    // attrs
+    final akV = _dv('_ak', _di(_dg(_vg(attrsV), 'keys'), 'toList'), isFinal: true);
+    final aiV = _dv('_ai', il(0));
+    final kV = _dv('_k', _di(_vg(akV), '[]', [_vg(aiV)]), isFinal: true);
+    final attrLoop = k.WhileStatement(_dynamicOp(_vg(aiV), '<', _dg(_vg(akV), 'length')),
+      k.Block([kV,
+        _setv(outV, cat([_vg(outV), sl(' '), _vg(kV), sl('="'),
+          escAttr(_di(_vg(attrsV), '[]', [_vg(kV)])), sl('"')])),
+        _addn(aiV, 1)]));
+    // body: self-close ou children/text
+    final jV = _dv('_j', il(0));
+    final childLoop = k.WhileStatement(_dynamicOp(_vg(jV), '<', _dg(_vg(childV), 'length')),
+      k.Block([
+        _setv(outV, _dynamicOp(_vg(outV), '+', selfEmit(_di(_vg(childV), '[]', [_vg(jV)])))),
+        _addn(jV, 1)]));
+    final bodyBranch = k.IfStatement(
+      _andc(_eqc(_dg(_vg(childV), 'length'), il(0)), _eqc(_dg(_vg(textV), 'length'), il(0))),
+      _setv(outV, _dynamicOp(_vg(outV), '+', sl('/>'))),
+      k.Block([
+        _setv(outV, cat([_vg(outV), sl('>'), escText(_vg(textV))])),
+        jV, childLoop,
+        _setv(outV, cat([_vg(outV), sl('</'), _vg(tagV), sl('>')]))]));
+
+    final body = k.Block([tagV, attrsV, childV, textV, outV, akV, aiV, attrLoop,
+      bodyBranch, k.ReturnStatement(_vg(outV))]);
+    proc.function.body = body;
+    body.parent = proc.function;
+  }
+
+  /// ita_xmlStringify(node) → String XML (= emit do no raiz).
+  void _ensureXmlStringifyHelper() {
+    if (_xmlStringifyFn != null) return;
+    _ensureXmlEmitHelper();
+    final nodeP = k.VariableDeclaration('node', type: const k.DynamicType(), isFinal: true);
+    _xmlStringifyFn = _mkProc('ita_xmlStringify', [nodeP],
+      k.ReturnStatement(k.StaticInvocation(_xmlEmitFn!, k.Arguments([_vg(nodeP)]))));
+  }
+
+  /// JSON5: passe char-a-char STRING-AWARE que remove comentarios e trailing
+  /// commas SEM tocar no conteudo de strings, depois jsonDecode.
+  ///
+  /// O antigo strip por regex (`//[^\n]*`, `/*...*/`, `,\s*}`) NAO tinha
+  /// consciencia de string e corrompia JSON valido: `"http://x"` virava
+  /// `"http:` e qualquer `//`/`/*`/`,}` dentro de uma string era destruido.
+  ///
+  /// TODO: JSON5 full (single-quote, unquoted keys, hex, +/-Infinity).
   k.Statement _buildJson5Parser(k.VariableDeclaration inputParam) {
-    // Strip // line comments
-    final step1 = k.VariableDeclaration('_s1',
-      initializer: k.DynamicInvocation(k.DynamicAccessKind.Dynamic,
-        k.VariableGet(inputParam), k.Name('replaceAll'),
-        k.Arguments([
-          k.StaticInvocation(
-            _regExpClass.procedures.firstWhere((p) => p.isFactory && p.name.text == ''),
-            k.Arguments([k.StringLiteral(r'//[^\n]*')])),
-          k.StringLiteral('')])),
-      type: const k.DynamicType(), isFinal: true);
+    // --- idiomas locais ---
+    k.Expression vg(k.VariableDeclaration v) => k.VariableGet(v);
+    k.Expression charAt(k.Expression s, k.Expression i) =>
+      k.DynamicInvocation(k.DynamicAccessKind.Dynamic, s, k.Name('[]'), k.Arguments([i]));
+    k.Expression lenOf(k.Expression e) =>
+      k.DynamicGet(k.DynamicAccessKind.Dynamic, e, k.Name('length'));
+    k.Expression eq(k.Expression l, k.Expression r) => k.EqualsCall(l, r,
+      functionType: k.FunctionType([const k.DynamicType()],
+        const k.DynamicType(), k.Nullability.nonNullable),
+      interfaceTarget: _coreTypes.objectEquals);
+    k.Expression and(k.Expression l, k.Expression r) =>
+      k.LogicalExpression(l, k.LogicalExpressionOperator.AND, r);
+    k.Expression or(k.Expression l, k.Expression r) =>
+      k.LogicalExpression(l, k.LogicalExpressionOperator.OR, r);
+    k.Statement addI(k.VariableDeclaration v, int by) => k.ExpressionStatement(
+      k.VariableSet(v, _dynamicOp(k.VariableGet(v), '+', k.IntLiteral(by))));
+    k.Statement setV(k.VariableDeclaration v, k.Expression e) =>
+      k.ExpressionStatement(k.VariableSet(v, e));
 
-    // Strip /* */ block comments
-    final step2 = k.VariableDeclaration('_s2',
-      initializer: k.DynamicInvocation(k.DynamicAccessKind.Dynamic,
-        k.VariableGet(step1), k.Name('replaceAll'),
-        k.Arguments([
-          k.StaticInvocation(
-            _regExpClass.procedures.firstWhere((p) => p.isFactory && p.name.text == ''),
-            k.Arguments([k.StringLiteral(r'/\*[\s\S]*?\*/')])),
-          k.StringLiteral('')])),
-      type: const k.DynamicType(), isFinal: true);
+    final inp = vg(inputParam);
+    // char em input[expr]
+    k.Expression cAt(k.Expression i) => charAt(inp, i);
+    // i + k
+    k.Expression iPlus(k.VariableDeclaration i, int by) =>
+      _dynamicOp(vg(i), '+', k.IntLiteral(by));
 
-    // Strip trailing commas before } or ]
-    final reFactory = _regExpClass.procedures.firstWhere((p) => p.isFactory && p.name.text == '');
-    final step3a = k.VariableDeclaration('_s3a',
-      initializer: k.DynamicInvocation(k.DynamicAccessKind.Dynamic,
-        k.VariableGet(step2), k.Name('replaceAll'),
-        k.Arguments([
-          k.StaticInvocation(reFactory, k.Arguments([k.StringLiteral(r',\s*\}')])),
-          k.StringLiteral('}')])),
-      type: const k.DynamicType(), isFinal: true);
-    final step3 = k.VariableDeclaration('_s3',
-      initializer: k.DynamicInvocation(k.DynamicAccessKind.Dynamic,
-        k.VariableGet(step3a), k.Name('replaceAll'),
-        k.Arguments([
-          k.StaticInvocation(reFactory, k.Arguments([k.StringLiteral(r',\s*\]')])),
-          k.StringLiteral(']')])),
-      type: const k.DynamicType(), isFinal: true);
+    final outVar = k.VariableDeclaration('_o',
+      initializer: k.StringLiteral(''), type: const k.DynamicType(), isFinal: false);
+    final iVar = k.VariableDeclaration('_i',
+      initializer: k.IntLiteral(0), type: const k.DynamicType(), isFinal: false);
+    final nVar = k.VariableDeclaration('_n',
+      initializer: lenOf(inp), type: const k.DynamicType(), isFinal: true);
+    final inStrVar = k.VariableDeclaration('_inS',
+      initializer: k.BoolLiteral(false), type: const k.DynamicType(), isFinal: false);
+    final quoteVar = k.VariableDeclaration('_q',
+      initializer: k.StringLiteral(''), type: const k.DynamicType(), isFinal: false);
+    final cVar = k.VariableDeclaration('_c',
+      initializer: cAt(vg(iVar)), type: const k.DynamicType(), isFinal: true);
 
-    // jsonDecode
-    return k.Block([step1, step2, step3a, step3,
-      k.ReturnStatement(k.StaticInvocation(_jsonDecode, k.Arguments([k.VariableGet(step3)])))]);
+    // out = out + expr
+    k.Statement appendOut(k.Expression e) =>
+      setV(outVar, _dynamicOp(vg(outVar), '+', e));
+
+    // --- Dentro de string: copia literal; \ escapa; a aspa fecha ---
+    final inStringBody = k.Block([
+      appendOut(vg(cVar)),
+      k.IfStatement(eq(vg(cVar), k.StringLiteral('\\')),
+        // escape: copia o proximo char literal, avanca 2
+        k.IfStatement(_dynamicOp(iPlus(iVar, 1), '<', vg(nVar)),
+          k.Block([appendOut(cAt(iPlus(iVar, 1))), addI(iVar, 2)]),
+          k.Block([addI(iVar, 1)])),
+        // else: aspa correspondente fecha; senao segue na string
+        k.IfStatement(eq(vg(cVar), vg(quoteVar)),
+          k.Block([setV(inStrVar, k.BoolLiteral(false)), addI(iVar, 1)]),
+          k.Block([addI(iVar, 1)]))),
+    ]);
+
+    // --- Skip loops (fora de string) ---
+    // line comment: pula ate \n (deixa o \n pra copia normal)
+    final lineSkip = k.WhileStatement(
+      and(_dynamicOp(vg(iVar), '<', vg(nVar)),
+        k.Not(eq(cAt(vg(iVar)), k.StringLiteral('\n')))),
+      k.Block([addI(iVar, 1)]));
+    // block comment: pula ate */
+    final blockSkip = k.WhileStatement(
+      and(_dynamicOp(iPlus(iVar, 1), '<', vg(nVar)),
+        k.Not(and(eq(cAt(vg(iVar)), k.StringLiteral('*')),
+          eq(cAt(iPlus(iVar, 1)), k.StringLiteral('/'))))),
+      k.Block([addI(iVar, 1)]));
+
+    // trailing comma: olha adiante passando whitespace ate } ou ]
+    final jVar = k.VariableDeclaration('_j',
+      initializer: iPlus(iVar, 1), type: const k.DynamicType(), isFinal: false);
+    k.Expression isWs(k.Expression ch) => or(eq(ch, k.StringLiteral(' ')),
+      or(eq(ch, k.StringLiteral('\t')),
+        or(eq(ch, k.StringLiteral('\n')), eq(ch, k.StringLiteral('\r')))));
+    final wsSkip = k.WhileStatement(
+      and(_dynamicOp(vg(jVar), '<', vg(nVar)), isWs(cAt(vg(jVar)))),
+      k.Block([addI(jVar, 1)]));
+    final commaBranch = k.Block([
+      jVar, wsSkip,
+      k.IfStatement(
+        and(_dynamicOp(vg(jVar), '<', vg(nVar)),
+          or(eq(cAt(vg(jVar)), k.StringLiteral('}')),
+            eq(cAt(vg(jVar)), k.StringLiteral(']')))),
+        // trailing comma → dropa a virgula (nao copia), avanca 1
+        k.Block([addI(iVar, 1)]),
+        // senao copia a virgula
+        k.Block([appendOut(vg(cVar)), addI(iVar, 1)])),
+    ]);
+
+    // --- Fora de string ---
+    final outStringBody = k.IfStatement(
+      or(eq(vg(cVar), k.StringLiteral('"')), eq(vg(cVar), k.StringLiteral('\''))),
+      // abre string
+      k.Block([setV(inStrVar, k.BoolLiteral(true)), setV(quoteVar, vg(cVar)),
+        appendOut(vg(cVar)), addI(iVar, 1)]),
+      k.IfStatement(
+        // c == '/' && s[i+1] == '/'  → comentario de linha
+        and(eq(vg(cVar), k.StringLiteral('/')),
+          and(_dynamicOp(iPlus(iVar, 1), '<', vg(nVar)),
+            eq(cAt(iPlus(iVar, 1)), k.StringLiteral('/')))),
+        k.Block([addI(iVar, 2), lineSkip]),
+        k.IfStatement(
+          // c == '/' && s[i+1] == '*'  → comentario de bloco
+          and(eq(vg(cVar), k.StringLiteral('/')),
+            and(_dynamicOp(iPlus(iVar, 1), '<', vg(nVar)),
+              eq(cAt(iPlus(iVar, 1)), k.StringLiteral('*')))),
+          k.Block([addI(iVar, 2), blockSkip, addI(iVar, 2)]),
+          k.IfStatement(
+            eq(vg(cVar), k.StringLiteral(',')),
+            commaBranch,
+            // resto: copia
+            k.Block([appendOut(vg(cVar)), addI(iVar, 1)])))));
+
+    final loop = k.WhileStatement(
+      _dynamicOp(vg(iVar), '<', vg(nVar)),
+      k.Block([cVar, k.IfStatement(vg(inStrVar), inStringBody, outStringBody)]));
+
+    return k.Block([outVar, iVar, nVar, inStrVar, quoteVar, loop,
+      k.ReturnStatement(k.StaticInvocation(_jsonDecode, k.Arguments([vg(outVar)])))]);
   }
 
   // ============================================================
@@ -4452,7 +5760,14 @@ class CodeGenerator {
     // [text](url) → <a href="url">text</a>
     // \n → <br>
     final reFactory = _regExpClass.procedures.firstWhere((p) => p.isFactory && p.name.text == '');
-    k.Expression result = input;
+
+    // FIX XSS: escapa HTML do input ANTES das regras markdown. `&` primeiro
+    // (senao `&lt;`/`&gt;` seriam duplo-escapados). Assim <script> do usuario
+    // vira &lt;script&gt;; as tags que as regras INSEREM (geradas depois) sao reais.
+    k.Expression esc(k.Expression e, String from, String to) =>
+      k.DynamicInvocation(k.DynamicAccessKind.Dynamic, e, k.Name('replaceAll'),
+        k.Arguments([k.StringLiteral(from), k.StringLiteral(to)]));
+    k.Expression result = esc(esc(esc(input, '&', '&amp;'), '<', '&lt;'), '>', '&gt;');
 
     // replaceAllMapped com closures que extraem group(1)
     for (final (pattern, prefix, suffix, groupIdx) in <(String, String, String, int)>[
@@ -4479,6 +5794,30 @@ class CodeGenerator {
           k.StaticInvocation(reFactory, k.Arguments([k.StringLiteral(pattern)])),
           replacer]));
     }
+
+    // [text](url) → <a href="url">text</a>  (group(2)=url, group(1)=text)
+    final linkParam = k.VariableDeclaration('m', type: const k.DynamicType(), isFinal: true);
+    final linkReplacer = k.FunctionExpression(k.FunctionNode(
+      k.ReturnStatement(k.StringConcatenation([
+        k.StringLiteral('<a href="'),
+        k.DynamicInvocation(k.DynamicAccessKind.Dynamic,
+          k.VariableGet(linkParam), k.Name('group'), k.Arguments([k.IntLiteral(2)])),
+        k.StringLiteral('">'),
+        k.DynamicInvocation(k.DynamicAccessKind.Dynamic,
+          k.VariableGet(linkParam), k.Name('group'), k.Arguments([k.IntLiteral(1)])),
+        k.StringLiteral('</a>')])),
+      positionalParameters: [linkParam],
+      returnType: _coreTypes.stringNonNullableRawType));
+    result = k.DynamicInvocation(k.DynamicAccessKind.Dynamic,
+      result, k.Name('replaceAllMapped'),
+      k.Arguments([
+        k.StaticInvocation(reFactory, k.Arguments([k.StringLiteral(r'\[([^\]]+)\]\(([^)]+)\)')])),
+        linkReplacer]));
+
+    // \n → <br>
+    result = k.DynamicInvocation(k.DynamicAccessKind.Dynamic,
+      result, k.Name('replaceAll'),
+      k.Arguments([k.StringLiteral('\n'), k.StringLiteral('<br>')]));
 
     return result;
   }
@@ -6519,50 +7858,129 @@ class CodeGenerator {
     final delimParam = k.VariableDeclaration('delim',
       type: const k.DynamicType(), isFinal: true);
 
-    // Closure params (cada um independente)
-    final lParam = k.VariableDeclaration('l', type: _coreTypes.stringNonNullableRawType, isFinal: true);
-    final lineParam = k.VariableDeclaration('line', type: _coreTypes.stringNonNullableRawType, isFinal: true);
-    final fParam = k.VariableDeclaration('f', type: _coreTypes.stringNonNullableRawType, isFinal: true);
+    // --- idiomas locais (reduzem verbosidade) ---
+    k.Expression vg(k.VariableDeclaration v) => k.VariableGet(v);
+    k.Expression charAt(k.Expression s, k.Expression i) =>
+      k.DynamicInvocation(k.DynamicAccessKind.Dynamic, s, k.Name('[]'), k.Arguments([i]));
+    k.Expression lenOf(k.Expression e) =>
+      k.DynamicGet(k.DynamicAccessKind.Dynamic, e, k.Name('length'));
+    k.Expression eq(k.Expression l, k.Expression r) => k.EqualsCall(l, r,
+      functionType: k.FunctionType([const k.DynamicType()],
+        const k.DynamicType(), k.Nullability.nonNullable),
+      interfaceTarget: _coreTypes.objectEquals);
+    k.Statement addI(k.VariableDeclaration v, int by) => k.ExpressionStatement(
+      k.VariableSet(v, _dynamicOp(k.VariableGet(v), '+', k.IntLiteral(by))));
+    k.Statement setStr(k.VariableDeclaration v, k.Expression e) =>
+      k.ExpressionStatement(k.VariableSet(v, e));
 
-    // (f) => f.replaceAll('"', '').trim()
-    final trimQuotes = k.FunctionExpression(k.FunctionNode(
-      k.ReturnStatement(k.DynamicInvocation(k.DynamicAccessKind.Dynamic,
-        k.DynamicInvocation(k.DynamicAccessKind.Dynamic,
-          k.VariableGet(fParam),
-          k.Name('replaceAll'), k.Arguments([k.StringLiteral('"'), k.StringLiteral('')])),
-        k.Name('trim'), k.Arguments([]))),
-      positionalParameters: [fParam], returnType: const k.DynamicType()));
+    // RFC-4180: maquina de estados char-a-char (NAO split).
+    //   var s = input; if (BOM) s = s.substring(1);
+    //   var rows=[]; var row=[]; var field=""; var inQ=false; var i=0;
+    final sVar = k.VariableDeclaration('_s',
+      initializer: vg(inputParam), type: const k.DynamicType(), isFinal: false);
+    // Strip BOM (U+FEFF) se for o 1o char.
+    final bomIf = k.IfStatement(
+      k.LogicalExpression(
+        _dynamicOp(lenOf(vg(sVar)), '>', k.IntLiteral(0)),
+        k.LogicalExpressionOperator.AND,
+        eq(charAt(vg(sVar), k.IntLiteral(0)), k.StringLiteral('\uFEFF'))),
+      setStr(sVar, k.DynamicInvocation(k.DynamicAccessKind.Dynamic,
+        vg(sVar), k.Name('substring'), k.Arguments([k.IntLiteral(1)]))),
+      null);
+    final nVar = k.VariableDeclaration('_n',
+      initializer: lenOf(vg(sVar)), type: const k.DynamicType(), isFinal: true);
+    final rowsVar = k.VariableDeclaration('_rows',
+      initializer: k.ListLiteral([], typeArgument: const k.DynamicType()),
+      type: const k.DynamicType(), isFinal: true);
+    final rowVar = k.VariableDeclaration('_row',
+      initializer: k.ListLiteral([], typeArgument: const k.DynamicType()),
+      type: const k.DynamicType(), isFinal: false);
+    final fieldVar = k.VariableDeclaration('_field',
+      initializer: k.StringLiteral(''), type: const k.DynamicType(), isFinal: false);
+    final inQVar = k.VariableDeclaration('_inq',
+      initializer: k.BoolLiteral(false), type: const k.DynamicType(), isFinal: false);
+    final iVar = k.VariableDeclaration('_i',
+      initializer: k.IntLiteral(0), type: const k.DynamicType(), isFinal: false);
 
-    // (line) => line.split(delim).map(trimQuotes).toList()
-    final splitLine = k.FunctionExpression(k.FunctionNode(
-      k.ReturnStatement(k.DynamicInvocation(k.DynamicAccessKind.Dynamic,
-        k.DynamicInvocation(k.DynamicAccessKind.Dynamic,
-          k.DynamicInvocation(k.DynamicAccessKind.Dynamic,
-            k.VariableGet(lineParam), k.Name('split'),
-            k.Arguments([k.VariableGet(delimParam)])),
-          k.Name('map'), k.Arguments([trimQuotes])),
-        k.Name('toList'), k.Arguments([]))),
-      positionalParameters: [lineParam], returnType: const k.DynamicType()));
+    final cVar = k.VariableDeclaration('_c',
+      initializer: charAt(vg(sVar), vg(iVar)),
+      type: const k.DynamicType(), isFinal: true);
 
-    // (l) => l.trim().isNotEmpty
-    final notEmpty = k.FunctionExpression(k.FunctionNode(
-      k.ReturnStatement(k.DynamicGet(k.DynamicAccessKind.Dynamic,
-        k.DynamicInvocation(k.DynamicAccessKind.Dynamic,
-          k.VariableGet(lParam), k.Name('trim'), k.Arguments([])),
-        k.Name('isNotEmpty'))),
-      positionalParameters: [lParam], returnType: _coreTypes.boolNonNullableRawType));
+    // field = field + c
+    k.Statement accumChar() =>
+      setStr(fieldVar, _dynamicOp(vg(fieldVar), '+', vg(cVar)));
+    // row.add(field)
+    k.Statement pushField() => k.ExpressionStatement(k.DynamicInvocation(
+      k.DynamicAccessKind.Dynamic, vg(rowVar), k.Name('add'), k.Arguments([vg(fieldVar)])));
+    // rows.add(row)
+    k.Statement pushRow() => k.ExpressionStatement(k.DynamicInvocation(
+      k.DynamicAccessKind.Dynamic, vg(rowsVar), k.Name('add'), k.Arguments([vg(rowVar)])));
+    // field = ""
+    k.Statement clearField() => setStr(fieldVar, k.StringLiteral(''));
+    // row = []
+    k.Statement clearRow() => setStr(rowVar,
+      k.ListLiteral([], typeArgument: const k.DynamicType()));
 
-    // input.split("\n").where(notEmpty).map(splitLine).toList()
-    final body = k.ReturnStatement(
-      k.DynamicInvocation(k.DynamicAccessKind.Dynamic,
-        k.DynamicInvocation(k.DynamicAccessKind.Dynamic,
-          k.DynamicInvocation(k.DynamicAccessKind.Dynamic,
-            k.DynamicInvocation(k.DynamicAccessKind.Dynamic,
-              k.VariableGet(inputParam), k.Name('split'),
-              k.Arguments([k.StringLiteral('\n')])),
-            k.Name('where'), k.Arguments([notEmpty])),
-          k.Name('map'), k.Arguments([splitLine])),
-        k.Name('toList'), k.Arguments([])));
+    // Dentro de aspas.
+    final inQuotesBody = k.IfStatement(
+      eq(vg(cVar), k.StringLiteral('"')),
+      // c == '"': aspa escapada ("") ou fecha aspas
+      k.IfStatement(
+        k.LogicalExpression(
+          _dynamicOp(_dynamicOp(vg(iVar), '+', k.IntLiteral(1)), '<', vg(nVar)),
+          k.LogicalExpressionOperator.AND,
+          eq(charAt(vg(sVar), _dynamicOp(vg(iVar), '+', k.IntLiteral(1))),
+            k.StringLiteral('"'))),
+        // "" → aspa literal, avanca 2
+        k.Block([
+          setStr(fieldVar, _dynamicOp(vg(fieldVar), '+', k.StringLiteral('"'))),
+          addI(iVar, 2),
+        ]),
+        // " sozinho → fecha aspas, avanca 1
+        k.Block([
+          setStr(inQVar, k.BoolLiteral(false)),
+          addI(iVar, 1),
+        ])),
+      // outro char → acumula literal (incl. delim, \n)
+      k.Block([accumChar(), addI(iVar, 1)]));
+
+    // Fora de aspas.
+    final outQuotesBody = k.IfStatement(
+      eq(vg(cVar), k.StringLiteral('"')),
+      // " abre aspas
+      k.Block([setStr(inQVar, k.BoolLiteral(true)), addI(iVar, 1)]),
+      k.IfStatement(
+        eq(vg(cVar), vg(delimParam)),
+        // delim fecha campo
+        k.Block([pushField(), clearField(), addI(iVar, 1)]),
+        k.IfStatement(
+          eq(vg(cVar), k.StringLiteral('\n')),
+          // \n fecha campo + linha
+          k.Block([pushField(), clearField(), pushRow(), clearRow(), addI(iVar, 1)]),
+          k.IfStatement(
+            eq(vg(cVar), k.StringLiteral('\r')),
+            // \r ignorado (CRLF)
+            k.Block([addI(iVar, 1)]),
+            // outro char acumula
+            k.Block([accumChar(), addI(iVar, 1)])))));
+
+    final loop = k.WhileStatement(
+      _dynamicOp(vg(iVar), '<', vg(nVar)),
+      k.Block([cVar, k.IfStatement(vg(inQVar), inQuotesBody, outQuotesBody)]));
+
+    // No fim: fecha ultimo campo/linha se houver conteudo pendente.
+    final flush = k.IfStatement(
+      k.LogicalExpression(
+        _dynamicOp(lenOf(vg(fieldVar)), '>', k.IntLiteral(0)),
+        k.LogicalExpressionOperator.OR,
+        _dynamicOp(lenOf(vg(rowVar)), '>', k.IntLiteral(0))),
+      k.Block([pushField(), pushRow()]),
+      null);
+
+    final body = k.Block([
+      sVar, bomIf, nVar, rowsVar, rowVar, fieldVar, inQVar, iVar,
+      loop, flush, k.ReturnStatement(vg(rowsVar)),
+    ]);
 
     _csvParseFn = k.Procedure(
       k.Name('ita_csvParse'), k.ProcedureKind.Method,
@@ -6574,6 +7992,8 @@ class CodeGenerator {
   }
 
   /// Gera helper: ita_csvStringify(List<List> data, String delim) → String
+  /// RFC-4180: quota campo se contem delim/"/\n/\r ("" escapa aspas dentro).
+  /// Round-trippable com ita_csvParse.
   void _ensureCsvStringifyHelper() {
     if (_csvStringifyFn != null) return;
 
@@ -6582,29 +8002,91 @@ class CodeGenerator {
     final delimParam = k.VariableDeclaration('delim',
       type: const k.DynamicType(), isFinal: true);
 
-    final fParam = k.VariableDeclaration('f', type: const k.DynamicType(), isFinal: true);
-    final rowParam = k.VariableDeclaration('row', type: const k.DynamicType(), isFinal: true);
+    k.Expression vg(k.VariableDeclaration v) => k.VariableGet(v);
+    k.Expression lenOf(k.Expression e) =>
+      k.DynamicGet(k.DynamicAccessKind.Dynamic, e, k.Name('length'));
+    k.Expression idx(k.Expression e, k.Expression i) =>
+      k.DynamicInvocation(k.DynamicAccessKind.Dynamic, e, k.Name('[]'), k.Arguments([i]));
+    k.Expression contains(k.Expression s, k.Expression needle) =>
+      k.DynamicInvocation(k.DynamicAccessKind.Dynamic, s, k.Name('contains'), k.Arguments([needle]));
+    k.Statement addI(k.VariableDeclaration v, int by) => k.ExpressionStatement(
+      k.VariableSet(v, _dynamicOp(k.VariableGet(v), '+', k.IntLiteral(by))));
+    k.Statement setV(k.VariableDeclaration v, k.Expression e) =>
+      k.ExpressionStatement(k.VariableSet(v, e));
 
-    // (f) => f.toString()
-    final toStr = k.FunctionExpression(k.FunctionNode(
-      k.ReturnStatement(k.DynamicInvocation(k.DynamicAccessKind.Dynamic,
-        k.VariableGet(fParam), k.Name('toString'), k.Arguments([]))),
-      positionalParameters: [fParam], returnType: const k.DynamicType()));
+    // var out=""; var ri=0; final rn=data.length;
+    final outVar = k.VariableDeclaration('_out',
+      initializer: k.StringLiteral(''), type: const k.DynamicType(), isFinal: false);
+    final riVar = k.VariableDeclaration('_ri',
+      initializer: k.IntLiteral(0), type: const k.DynamicType(), isFinal: false);
+    final rnVar = k.VariableDeclaration('_rn',
+      initializer: lenOf(vg(dataParam)), type: const k.DynamicType(), isFinal: true);
 
-    // (row) => row.map(toStr).join(delim)
-    final joinRow = k.FunctionExpression(k.FunctionNode(
-      k.ReturnStatement(k.DynamicInvocation(k.DynamicAccessKind.Dynamic,
-        k.DynamicInvocation(k.DynamicAccessKind.Dynamic,
-          k.VariableGet(rowParam), k.Name('map'), k.Arguments([toStr])),
-        k.Name('join'), k.Arguments([k.VariableGet(delimParam)]))),
-      positionalParameters: [rowParam], returnType: const k.DynamicType()));
+    // inner loop vars (por linha)
+    final rowVar = k.VariableDeclaration('_row',
+      initializer: idx(vg(dataParam), vg(riVar)),
+      type: const k.DynamicType(), isFinal: true);
+    final lineVar = k.VariableDeclaration('_line',
+      initializer: k.StringLiteral(''), type: const k.DynamicType(), isFinal: false);
+    final ciVar = k.VariableDeclaration('_ci',
+      initializer: k.IntLiteral(0), type: const k.DynamicType(), isFinal: false);
+    final cnVar = k.VariableDeclaration('_cn',
+      initializer: lenOf(vg(rowVar)), type: const k.DynamicType(), isFinal: true);
+    final sfVar = k.VariableDeclaration('_sf',
+      initializer: k.DynamicInvocation(k.DynamicAccessKind.Dynamic,
+        idx(vg(rowVar), vg(ciVar)), k.Name('toString'), k.Arguments([])),
+      type: const k.DynamicType(), isFinal: false);
 
-    // data.map(joinRow).join("\n")
-    final body = k.ReturnStatement(
-      k.DynamicInvocation(k.DynamicAccessKind.Dynamic,
-        k.DynamicInvocation(k.DynamicAccessKind.Dynamic,
-          k.VariableGet(dataParam), k.Name('map'), k.Arguments([joinRow])),
-        k.Name('join'), k.Arguments([k.StringLiteral('\n')])));
+    // needsQuote = s.contains(delim) || s.contains('"') || s.contains('\n') || s.contains('\r')
+    final needsQuote = k.LogicalExpression(
+      contains(vg(sfVar), vg(delimParam)),
+      k.LogicalExpressionOperator.OR,
+      k.LogicalExpression(
+        contains(vg(sfVar), k.StringLiteral('"')),
+        k.LogicalExpressionOperator.OR,
+        k.LogicalExpression(
+          contains(vg(sfVar), k.StringLiteral('\n')),
+          k.LogicalExpressionOperator.OR,
+          contains(vg(sfVar), k.StringLiteral('\r')))));
+    // s = '"' + s.replaceAll('"','""') + '"'
+    final quoteIf = k.IfStatement(needsQuote,
+      setV(sfVar, k.StringConcatenation([
+        k.StringLiteral('"'),
+        k.DynamicInvocation(k.DynamicAccessKind.Dynamic, vg(sfVar),
+          k.Name('replaceAll'), k.Arguments([k.StringLiteral('"'), k.StringLiteral('""')])),
+        k.StringLiteral('"')])),
+      null);
+
+    final innerLoop = k.WhileStatement(
+      _dynamicOp(vg(ciVar), '<', vg(cnVar)),
+      k.Block([
+        sfVar,
+        quoteIf,
+        // line = line + s
+        setV(lineVar, k.StringConcatenation([vg(lineVar), vg(sfVar)])),
+        // if (ci + 1 < cn) line = line + delim
+        k.IfStatement(
+          _dynamicOp(_dynamicOp(vg(ciVar), '+', k.IntLiteral(1)), '<', vg(cnVar)),
+          setV(lineVar, k.StringConcatenation([vg(lineVar), vg(delimParam)])),
+          null),
+        addI(ciVar, 1),
+      ]));
+
+    final outerLoop = k.WhileStatement(
+      _dynamicOp(vg(riVar), '<', vg(rnVar)),
+      k.Block([
+        rowVar, lineVar, ciVar, cnVar, innerLoop,
+        // out = out + line
+        setV(outVar, k.StringConcatenation([vg(outVar), vg(lineVar)])),
+        // if (ri + 1 < rn) out = out + "\n"
+        k.IfStatement(
+          _dynamicOp(_dynamicOp(vg(riVar), '+', k.IntLiteral(1)), '<', vg(rnVar)),
+          setV(outVar, k.StringConcatenation([vg(outVar), k.StringLiteral('\n')])),
+          null),
+        addI(riVar, 1),
+      ]));
+
+    final body = k.Block([outVar, riVar, rnVar, outerLoop, k.ReturnStatement(vg(outVar))]);
 
     _csvStringifyFn = k.Procedure(
       k.Name('ita_csvStringify'), k.ProcedureKind.Method,
