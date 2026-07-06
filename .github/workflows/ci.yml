@@ -1,0 +1,68 @@
+# ===========================================================================
+# CI do compilador Itá — valida o backend pinado no Dart stable 3.12.2
+# ===========================================================================
+# O Itá compila .tu -> Dart Kernel (.dill) e roda na Dart VM. O numero do
+# FORMATO BINARIO de Kernel e um contrato interno SEM SemVer (ver dart-sdk.pin):
+# a VM so carrega um .dill cujo formato bate EXATAMENTE com o `dart` +
+# vm_platform.dill + pkg/kernel usados. Este CI existe para pegar version-skew
+# desse formato e regressoes na suite antes de chegarem ao main.
+#
+# Runner: macOS arm64 (macos-14 = Apple Silicon). O dart-sdk.pin fixa o zip
+# `dartsdk-macos-arm64-release.zip` com sha256 especifico de plataforma, entao
+# o CI roda no MESMO OS/arch do pin — reproduz o ambiente byte-a-byte. Trocar
+# para Linux exigiria estender o pin com URL/sha por plataforma.
+# ===========================================================================
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+# Cancela runs obsoletos do mesmo ref quando chega um push novo.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-test:
+    name: build + suite (Dart stable pinado)
+    runs-on: macos-14 # Apple Silicon (arm64): casa com o SDK do dart-sdk.pin
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Ler dart-sdk.pin
+        id: pin
+        run: |
+          set -euo pipefail
+          echo "ver=$(grep -E '^DART_VERSION=' dart-sdk.pin | cut -d= -f2-)" >> "$GITHUB_OUTPUT"
+          echo "sha=$(grep -E '^SDK_ZIP_SHA256=' dart-sdk.pin | cut -d= -f2-)" >> "$GITHUB_OUTPUT"
+
+      # O SDK stable (~200 MB) e gitignored e reproduzivel via pin-dart.sh.
+      # Cacheado pela sha256 do zip -> invalida sozinho num bump de versao.
+      - name: Cache do Dart SDK stable (.dart-sdk/)
+        uses: actions/cache@v4
+        with:
+          path: .dart-sdk
+          key: dart-sdk-${{ runner.os }}-${{ runner.arch }}-${{ steps.pin.outputs.sha }}
+
+      # Materializa e VALIDA o pin: baixa+verifica o SDK (sha256), regenera o
+      # toml.runtime.dill e faz ASSERT do formato de Kernel == 130, compila
+      # hello.tu e confere o formato emitido. Falha o CI em qualquer skew.
+      # O vendor pkg/kernel ja vem versionado no checkout, entao o passo de
+      # sparse-checkout do pin e pulado (sem dependencia de rede pra isso).
+      - name: Materializar + validar o pin (pin-dart.sh)
+        run: bash tools/pin-dart.sh
+
+      # Suite de examples: 48 programas .tu (exclui os 2 modulos sem main;
+      # os 5 servers/listeners sao compile-only). Sai !=0 em qualquer regressao.
+      - name: Suite de examples
+        run: bash .claude/skills/ita-test/test.sh examples
+
+      # Testes unitarios: itac test sobre test/**/*_test.tu.
+      - name: Testes unitarios
+        run: bash .claude/skills/ita-test/test.sh unit
