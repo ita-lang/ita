@@ -589,7 +589,7 @@ class Parser {
       do {
         typeArgs.add(_typeAnnotation());
       } while (_match(TokenType.comma));
-      _consume(TokenType.gt, 'Expected ">"');
+      _consumeTypeGt('Expected ">"');
     }
     return TraitRef(name: name, typeArgs: typeArgs);
   }
@@ -670,7 +670,7 @@ class Parser {
       }
       params.add(GenericParam(name: name, bounds: bounds));
     } while (_match(TokenType.comma));
-    _consume(TokenType.gt, 'Expected ">"');
+    _consumeTypeGt('Expected ">"');
     return params;
   }
 
@@ -1709,7 +1709,7 @@ class Parser {
         do {
           typeArgs.add(_typeAnnotation());
         } while (_match(TokenType.comma));
-        _consume(TokenType.gt, 'Expected ">"');
+        _consumeTypeGt('Expected ">"');
       }
 
       type = NamedType(name.lexeme, typeArgs: typeArgs, line: name.line, column: name.column);
@@ -1759,6 +1759,48 @@ class Parser {
   Token _consume(TokenType type, String message) {
     if (_check(type)) return _advance();
     throw _error('$message (got ${_peek().type.name} "${_peek().lexeme}")');
+  }
+
+  /// Consome o ">" que fecha uma lista de argumentos/parâmetros de tipo genérico.
+  ///
+  /// PROBLEMA: em generics aninhados como `List<List<Int>>`, os dois ">" adjacentes
+  /// são colados pelo lexer (maximal munch) num único token `>>` (gtGt). `>>>` vira
+  /// `>>` + `>` (gtGt + gt) e `>=` vira gtEq.
+  ///
+  /// SOLUÇÃO (token splitting — técnica padrão de Java/C#): ao esperar um único ">"
+  /// para fechar um nível de generic, se encontrarmos `>>` (ou `>=`) consumimos
+  /// apenas UM ">" e reescrevemos o resto no fluxo de tokens, deixando-o para o
+  /// nível externo fechar. Ex.: em `List<List<Int>>` o nível interno divide o `>>`
+  /// em `>` (consumido) + `>` (resta), e o nível externo consome o `>` restante.
+  ///
+  /// Isso é LOCAL ao parser de TIPOS: `>>` como operador de composição (`f >> g`) e
+  /// shift continua intacto, pois é tratado só em `_pipe()` (nível de expressão).
+  Token _consumeTypeGt(String message) {
+    final t = _peek();
+    switch (t.type) {
+      case TokenType.gt:
+        return _advance();
+      case TokenType.gtGt:
+        // ">>" → ">" (consumido agora) + ">" (resta para o nível externo).
+        tokens[_current] = Token(
+          type: TokenType.gt,
+          lexeme: '>',
+          line: t.line,
+          column: t.column + 1,
+        );
+        return Token(type: TokenType.gt, lexeme: '>', line: t.line, column: t.column);
+      case TokenType.gtEq:
+        // ">=" → ">" (consumido agora) + "=" (resta, ex.: `List<Int>=default`).
+        tokens[_current] = Token(
+          type: TokenType.eq,
+          lexeme: '=',
+          line: t.line,
+          column: t.column + 1,
+        );
+        return Token(type: TokenType.gt, lexeme: '>', line: t.line, column: t.column);
+      default:
+        throw _error('$message (got ${t.type.name} "${t.lexeme}")');
+    }
   }
 
   ParseError _error(String message, {String? hint, String? label}) {
