@@ -9483,7 +9483,16 @@ class CodeGenerator {
     // === Static namespace calls: File.read(), Dir.list(), Path.join(), log.info() ===
     if (callee is ast.MemberExpr && callee.object is ast.IdentifierExpr) {
       final ns = (callee.object as ast.IdentifierExpr).name;
-      if (['File', 'Dir', 'Path', 'log', 'Json', 'Terminal', 'Shell',
+      // Colisão nome-de-tipo × namespace built-in: quando o programa (ou um
+      //   módulo importado, ex.: stdlib `server`) define um TIPO com esse nome
+      //   e um `static fn` desse mesmo membro, o tipo do usuário VENCE — senão
+      //   `Response.ok(...)` cairia no built-in `_compileResponseCall`, que não
+      //   tem caso `ok` e devolve `null` (→ NoSuchMethod em `resp.status`).
+      //   Só desvia quando há colisão REAL (tipo+membro definidos); programas
+      //   sem tipo próprio seguem usando o namespace built-in normalmente.
+      final userStatic = _staticMethods[ns]?[callee.member];
+      if (userStatic == null &&
+          ['File', 'Dir', 'Path', 'log', 'Json', 'Terminal', 'Shell',
            'Hash', 'Checksum', 'Crypto', 'Base64', 'Hex', 'Hmac',
            'Aes', 'Rsa', 'Ed25519', 'Password',
            'Uuid', 'NanoId', 'Snowflake', 'Id',
@@ -10052,7 +10061,12 @@ class CodeGenerator {
     // 2ª via (fallback / regra de ouro): quando o tipo semântico é Unknown,
     //   mantém a heurística antiga baseada no scope de variáveis.
     if (typeName == null && expr.source is ast.IdentifierExpr) {
-      typeName = _varTypes[(expr.source as ast.IdentifierExpr).name];
+      final srcName = (expr.source as ast.IdentifierExpr).name;
+      // `self.{ … }` dentro de método/extension: a fase semântica não resolve
+      //   o tipo do receiver implícito, então usamos o tipo corrente (mesma
+      //   estratégia dos helpers de List/Map/String acima). Sem isto, cai no
+      //   fallback no-op e o copy-with descarta os overrides (retorna self).
+      typeName = srcName == 'self' ? _currentTypeName : _varTypes[srcName];
     }
 
     if (typeName != null && _constructors.containsKey(typeName) && _typeFields.containsKey(typeName)) {
@@ -10891,16 +10905,21 @@ class CodeGenerator {
         }
         return const k.DynamicType();
 
-      case ast.FunctionType t:
-        // `async (...) -> T` → `(...) -> Future<T>`.
-        var ret = _resolveType(t.returnType);
-        if (t.isAsync) {
-          ret = k.InterfaceType(_futureClass, k.Nullability.nonNullable, [ret]);
-        }
-        return k.FunctionType(
-          t.paramTypes.map(_resolveType).toList(),
-          ret,
-          k.Nullability.nonNullable);
+      case ast.FunctionType _:
+        // Tipos função (campos `handler: (Request) -> Response`, params de
+        //   ordem superior, etc.) são lowered para `dynamic`.
+        //
+        // Motivo: o codegen compila TODA closure como `(dynamic) => dynamic`
+        //   (sem inferência de params/retorno). Se o alvo fosse o `FunctionType`
+        //   concreto `(Request) => Response`, a Dart VM rejeitaria a atribuição
+        //   em runtime — `dynamic` NÃO é subtipo de `Response` na posição de
+        //   retorno (covariante), disparando
+        //   `type '(dynamic) => dynamic' is not a subtype of '(Request) => Response'`.
+        //   Como o Itá não faz checagem de variância de closure aqui, `dynamic`
+        //   no alvo é o lowering seguro. A invocação já usa
+        //   `FunctionInvocation` com functionType sintético `(...) => dynamic`
+        //   (ver _compileCall), independente do tipo declarado — logo não regride.
+        return const k.DynamicType();
 
       case ast.MutType t:
         return _resolveType(t.inner);
