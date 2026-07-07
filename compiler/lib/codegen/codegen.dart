@@ -54,6 +54,8 @@ import '../parser/ast.dart' as ast;
 import '../lexer/token.dart';
 import '../lexer/lexer.dart' as lex show Lexer;
 import '../parser/parser.dart' as parse show Parser;
+import '../semantic/type_table.dart';
+import '../semantic/resolved_type.dart' as sem;
 
 class CompileError {
   final String message;
@@ -148,6 +150,11 @@ class CodeGenerator {
   final String sourcePath; // path do arquivo fonte (pra resolver imports)
   final List<CompileError> errors = [];
 
+  // Resultado da análise semântica (Fase 4). Opcional: quando presente, carrega
+  // a side-table de tipos/símbolos que guiará o codegen tipado numa próxima
+  // etapa. Ainda NÃO é consumido aqui — só prepara o terreno.
+  final AnalysisResult? _analysis;
+
   // Kernel state
   late k.Component _component;
   late k.Library _library;
@@ -209,6 +216,7 @@ class CodeGenerator {
   late k.Field _utf8Field;
   late k.Class _randomClass;
   late k.Procedure _randomSecureFactory;
+  late k.Procedure _powProcedure; // dart:math top-level `pow` (exponenciação)
   late k.Procedure _processRunSync;
   late k.Procedure _jsonEncode;
   late k.Procedure _jsonDecode;
@@ -320,7 +328,8 @@ class CodeGenerator {
   // Módulos já compilados (evita compilar o mesmo módulo duas vezes)
   final Map<String, ast.Program> _compiledModules = {};
 
-  CodeGenerator(this.platformPath, {this.sourcePath = ''});
+  CodeGenerator(this.platformPath, {this.sourcePath = '', AnalysisResult? analysis})
+      : _analysis = analysis;
 
   // ============================================================
   // Entry point
@@ -541,6 +550,8 @@ class CodeGenerator {
     _randomClass = dartMath.classes.firstWhere((c) => c.name == 'Random');
     _randomSecureFactory = _randomClass.procedures.firstWhere(
       (p) => p.name.text == 'secure');
+    // dart:math — pow (top-level) para o operador `**`
+    _powProcedure = dartMath.procedures.firstWhere((p) => p.name.text == 'pow');
 
     _processRunSync = dartIo.classes.firstWhere((c) => c.name == 'Process')
       .procedures.firstWhere((p) => p.name.text == 'runSync');
@@ -2458,9 +2469,20 @@ class CodeGenerator {
           return k.StringConcatenation([left, right]);
         }
         return _dynamicOp(left, '+', right);
+      case TokenType.starStar:
+        // Exponenciacao REAL (nunca colapsa em `*`). Ver _compilePow.
+        return _compilePow(expr, left, right);
       case TokenType.slash:
-        // Divisao: se algum lado e float literal, usa / (float division)
-        // Senao, usa ~/ (truncating integer division)
+        // Divisao: `/` (float, real) vs `~/` (int, truncada).
+        // 1) Se a fase semantica INFERIU Float em qualquer lado → `/`.
+        //    (pega `let a=7.0; a/b`, que a forma sintatica nao alcanca.)
+        // 2) Fallback quando o tipo e Unknown: forma sintatica (_isFloatExpr).
+        // 3) Caso contrario (Int/Int, ou desconhecido nao-float) → `~/`.
+        final divLeftType = _analysis?.typeOf(expr.left);
+        final divRightType = _analysis?.typeOf(expr.right);
+        if (divLeftType is sem.FloatType || divRightType is sem.FloatType) {
+          return _dynamicOp(left, '/', right);
+        }
         if (_isFloatExpr(expr.left) || _isFloatExpr(expr.right)) {
           return _dynamicOp(left, '/', right);
         }
@@ -2485,6 +2507,32 @@ class CodeGenerator {
       k.DynamicAccessKind.Dynamic, left, k.Name(op), k.Arguments([right]));
   }
 
+  /// Emite EXPONENCIACAO real para `**` — antes colapsava em `*` (2**3 dava 6).
+  ///
+  /// Kernel emitido: `math.pow(left, right)` (StaticInvocation p/ o top-level
+  /// `pow` de dart:math), com um cast final conforme o tipo RESOLVIDO:
+  ///   - Int  ** Int  → `math.pow(a, b).toInt()`    → Int   (2**3   == 8, nao 8.0)
+  ///   - Float envolvido → `math.pow(a, b).toDouble()` → double (2.0**3.0 == 8.0)
+  ///   - Unknown/misto (tipo nao inferido) → `math.pow(a, b)` cru. Em runtime,
+  ///     `pow(int, int>=0)` ja devolve `int`, entao `2**3 == 8` mesmo sem tipo;
+  ///     `pow(double, ..)` devolve `double`. Expoente 0 → 1 (pow(a,0)==1).
+  k.Expression _compilePow(
+      ast.BinaryExpr expr, k.Expression left, k.Expression right) {
+    final powCall = k.StaticInvocation(_powProcedure, k.Arguments([left, right]));
+    final leftType = _analysis?.typeOf(expr.left);
+    final rightType = _analysis?.typeOf(expr.right);
+    if (leftType is sem.FloatType || rightType is sem.FloatType) {
+      return k.DynamicInvocation(k.DynamicAccessKind.Dynamic, powCall,
+          k.Name('toDouble'), k.Arguments([]));
+    }
+    if (leftType is sem.IntType && rightType is sem.IntType) {
+      return k.DynamicInvocation(k.DynamicAccessKind.Dynamic, powCall,
+          k.Name('toInt'), k.Arguments([]));
+    }
+    // Tipo desconhecido: caminho dinamico (pow ja da o inteiro certo p/ int^int).
+    return powCall;
+  }
+
   /// Checa se uma expressão Itá é garantidamente string.
   /// Usado pra decidir se + deve ser StringConcatenation.
   bool _isStringExpr(ast.Expression e) {
@@ -2501,7 +2549,8 @@ class CodeGenerator {
     TokenType.star => '*',
     TokenType.slash => '/',
     TokenType.percent => '%',
-    TokenType.starStar => '*',
+    // `**` (starStar) NAO aparece aqui: e interceptado em _compileBinary e
+    // lowered para exponenciacao real via _compilePow (nunca colapsa em `*`).
     TokenType.lt => '<',
     TokenType.gt => '>',
     TokenType.ltEq => '<=',
