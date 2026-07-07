@@ -46,9 +46,9 @@ import 'dart:convert';
 import 'dart:io';
 import '../lib/lexer/lexer.dart';
 import '../lib/parser/parser.dart';
-import '../lib/parser/ast.dart';
 import '../lib/codegen/codegen.dart';
 import '../lib/errors/reporter.dart';
+import '../lib/semantic/analyzer.dart';
 import '../lib/fmt/formatter.dart';
 import '../lib/pm/pm.dart';
 
@@ -194,10 +194,22 @@ void compile(String sourcePath, String outputPath, String platform) {
   }
   print('     ${program.declarations.length} declarations');
 
+  // Fase 2.5: Análise semântica — AST -> tipos + diagnósticos
+  final analysis = SemanticAnalyzer().run(program);
+  if (analysis.errors.isNotEmpty) {
+    print('');
+    for (final d in analysis.errors) {
+      reporter.report(d);
+    }
+    DiagnosticReporter.printSummary(analysis.errors.length, 0);
+    // GATE: erros semânticos abortam a compilação (não gera .dill).
+    if (analysis.hasErrors) exit(1);
+  }
+
   // Fase 3: CodeGen — AST -> Dart Kernel -> .dill
   print('[4/4] Generating .dill...');
-  final codegen = CodeGenerator(platform, sourcePath: sourcePath);
-  final component = codegen.compile(program);
+  final codegen = CodeGenerator(platform, sourcePath: sourcePath, analysis: analysis);
+  codegen.compile(program);
 
   if (codegen.errors.isNotEmpty) {
     print('');
@@ -236,7 +248,18 @@ void compileQuiet(String sourcePath, String outputPath, String platform, {bool r
     if (reportErrors) _reportErrors(source, sourcePath, [], parser.errors, []);
     throw Exception('Parser errors');
   }
-  final codegen = CodeGenerator(platform, sourcePath: sourcePath);
+  final analysis = SemanticAnalyzer().run(program);
+  if (analysis.hasErrors) {
+    if (reportErrors) {
+      final reporter = DiagnosticReporter(source, sourcePath);
+      for (final d in analysis.errors) {
+        reporter.report(d);
+      }
+      DiagnosticReporter.printSummary(analysis.errors.length, 0);
+    }
+    throw Exception('Semantic errors');
+  }
+  final codegen = CodeGenerator(platform, sourcePath: sourcePath, analysis: analysis);
   codegen.compile(program);
   if (codegen.errors.isNotEmpty) {
     if (reportErrors) _reportErrors(source, sourcePath, [], [], codegen.errors);
@@ -651,8 +674,22 @@ void cmdCheck(List<String> args, {required String platformDill}) {
       continue;
     }
 
+    // Análise semântica — reporta diagnósticos e soma ao total de erros.
+    final analysis = SemanticAnalyzer().run(program);
+    if (analysis.errors.isNotEmpty) {
+      for (final d in analysis.errors) {
+        reporter.report(d);
+      }
+      totalErrors += analysis.errors.length;
+    }
+    // Com erros semânticos, pular o codegen (evita crash em código mal-tipado).
+    if (analysis.hasErrors) {
+      checked++;
+      continue;
+    }
+
     // CodeGen (sem escrever arquivo)
-    final codegen = CodeGenerator(platformDill, sourcePath: filePath);
+    final codegen = CodeGenerator(platformDill, sourcePath: filePath, analysis: analysis);
     codegen.compile(program);
     if (codegen.errors.isNotEmpty) {
       for (final err in codegen.errors) {
