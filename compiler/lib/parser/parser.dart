@@ -175,7 +175,8 @@ class Parser {
     return _fnDecl(isPublic, isStream: true);
   }
 
-  FnDecl _fnDecl(bool isPublic, {bool isAsync = false, bool isStream = false}) {
+  FnDecl _fnDecl(bool isPublic,
+      {bool isAsync = false, bool isStream = false, bool isStatic = false}) {
     final token = _consume(TokenType.kwFn, 'Expected "fn"');
     final name = _consume(TokenType.identifier, 'Expected function name').lexeme;
 
@@ -213,6 +214,7 @@ class Parser {
       isPublic: isPublic,
       isAsync: isAsync,
       isStream: isStream,
+      isStatic: isStatic,
       typeParams: typeParams,
       body: body,
       line: token.line,
@@ -238,9 +240,10 @@ class Parser {
     final methods = <FnDecl>[];
 
     while (!_check(TokenType.rbrace) && !_isAtEnd) {
-      if (_check(TokenType.kwFn) || (_check(TokenType.kwPub) && _checkAt(1, TokenType.kwFn))) {
+      if (_isMethodStart()) {
         final pub = _match(TokenType.kwPub);
-        methods.add(_fnDecl(pub));
+        final isStatic = _match(TokenType.kwStatic);
+        methods.add(_fnDecl(pub, isStatic: isStatic));
       } else {
         fields.add(_fieldDecl());
         _match(TokenType.comma); // separador opcional: permite campos inline (x: Int, y: Int)
@@ -291,12 +294,13 @@ class Parser {
     while (!_check(TokenType.rbrace) && !_isAtEnd) {
       if (_check(TokenType.kwInit)) {
         inits.add(_initDecl());
-      } else if (_check(TokenType.kwFn) ||
+      } else if (_isMethodStart() ||
                  _check(TokenType.kwOverride) ||
-                 (_check(TokenType.kwPub) && (_checkAt(1, TokenType.kwFn) || _checkAt(1, TokenType.kwOverride)))) {
+                 (_check(TokenType.kwPub) && _checkAt(1, TokenType.kwOverride))) {
         final pub = _match(TokenType.kwPub);
         _match(TokenType.kwOverride); // consume override se existir
-        methods.add(_fnDecl(pub));
+        final isStatic = _match(TokenType.kwStatic);
+        methods.add(_fnDecl(pub, isStatic: isStatic));
       } else {
         fields.add(_fieldDecl());
       }
@@ -329,8 +333,10 @@ class Parser {
     final methods = <FnDecl>[];
 
     while (!_check(TokenType.rbrace) && !_isAtEnd) {
-      if (_check(TokenType.kwFn)) {
-        methods.add(_fnDecl(false));
+      if (_isMethodStart()) {
+        final pub = _match(TokenType.kwPub);
+        final isStatic = _match(TokenType.kwStatic);
+        methods.add(_fnDecl(pub, isStatic: isStatic));
       } else {
         cases.add(_enumCase());
         _match(TokenType.comma); // trailing comma optional
@@ -417,9 +423,10 @@ class Parser {
     final fields = <FieldDecl>[];
 
     while (!_check(TokenType.rbrace) && !_isAtEnd) {
-      if (_check(TokenType.kwFn) || (_check(TokenType.kwPub) && _checkAt(1, TokenType.kwFn))) {
+      if (_isMethodStart()) {
         final pub = _match(TokenType.kwPub);
-        methods.add(_fnDecl(pub));
+        final isStatic = _match(TokenType.kwStatic);
+        methods.add(_fnDecl(pub, isStatic: isStatic));
       } else {
         // Computed property ou campo
         fields.add(_fieldDecl());
@@ -1804,6 +1811,16 @@ class Parser {
   }
 
   bool _check(TokenType type) => !_isAtEnd && _peek().type == type;
+
+  /// True se os próximos tokens iniciam uma declaração de método dentro de um
+  /// corpo de tipo (struct/class/enum/extension): `fn`, `pub fn`, `static fn`
+  /// ou `pub static fn`. Ordem: `pub` antes de `static` (estilo Swift).
+  bool _isMethodStart() {
+    var i = 0;
+    if (_checkAt(i, TokenType.kwPub)) i++;
+    if (_checkAt(i, TokenType.kwStatic)) i++;
+    return _checkAt(i, TokenType.kwFn);
+  }
 
   bool _checkAt(int offset, TokenType type) {
     final index = _current + offset;
