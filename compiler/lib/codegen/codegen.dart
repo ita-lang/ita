@@ -367,6 +367,13 @@ class CodeGenerator {
   final Set<ast.Declaration> _registeredImportPrivateFns = Set.identity();
   final Set<ast.Declaration> _compiledImportPrivateFns = Set.identity();
 
+  // Dedup de `let`/`var` TOP-LEVEL (constantes de módulo — ex.: `pi`, `e`, `tau`
+  // em math.tu) importados. Registrados como campos static sob o nome BARE, do
+  // mesmo jeito incondicional dos tipos: uma constante serve tanto ao consumidor
+  // (`import { pi }`) quanto ao dispatch interno do módulo (`toRadians` usa `pi`).
+  final Set<ast.Declaration> _registeredImportBindingDecls = Set.identity();
+  final Set<ast.Declaration> _compiledImportBindingDecls = Set.identity();
+
   // Modo-lib: quando `false`, a ausência de `fn main()` NÃO é erro (uma
   // biblioteca — ex.: os módulos da stdlib — é válida e compilável sem
   // entrypoint). `true` (default) preserva o comportamento de programa: todo
@@ -1322,6 +1329,15 @@ class CodeGenerator {
               _registeredImportTypeDecls.add(d)) {
             _registerExtension(d);
           }
+        case ast.StmtDecl d:
+          // Constantes de módulo (`let pi = ...`, `var x = ...` top-level) — no
+          // fluxo normal viram campos static (Pass 1.5). No import elas NÃO eram
+          // registradas, então `import { pi, e } from "math"` dava "Undefined" e
+          // referências internas do módulo (`toRadians` → `pi`) idem. Registramos
+          // o "shell" do campo (sem initializer) incondicionalmente, como os tipos.
+          if (_registeredImportBindingDecls.add(d)) {
+            _registerImportedBindingShell(d);
+          }
         default:
           break;
       }
@@ -1374,10 +1390,84 @@ class CodeGenerator {
           // Compila os corpos dos metodos da extension importada, ligados ao
           // tipo alvo — espelha _compileExtensionMethods do fluxo normal.
           _compileExtensionMethods(d);
+        case ast.StmtDecl d when _compiledImportBindingDecls.add(d):
+          // Pendura o valor da constante importada no campo static (Pass 3.5 do
+          // fluxo normal). Sem isto o campo fica sem initializer → null em runtime.
+          _compileImportedBindingInit(d);
         default:
           break;
       }
     }
+  }
+
+  /// Cria o campo static (shell, sem initializer) de um `let`/`var` top-level de
+  /// um módulo importado. Espelha [_registerTopLevelBindings] do fluxo normal.
+  void _registerImportedBindingShell(ast.StmtDecl decl) {
+    final stmt = decl.statement;
+    final String name;
+    final bool mutable;
+    switch (stmt) {
+      case ast.LetStmt s:
+        if (s.pattern != null || s.name.isEmpty) return;
+        name = s.name;
+        mutable = false;
+      case ast.VarStmt s:
+        if (s.name.isEmpty) return;
+        name = s.name;
+        mutable = true;
+      default:
+        return;
+    }
+    // Não colide com fn/const homônima já registrada (do consumidor ou de outro
+    // import) — o primeiro vence, igual ao fluxo normal.
+    if (_topLevelFields.containsKey(name) || _functions.containsKey(name)) return;
+
+    final field = mutable
+        ? k.Field.mutable(_memberName(name),
+            type: const k.DynamicType(), isStatic: true, fileUri: _fileUri)
+        : k.Field.immutable(_memberName(name),
+            type: const k.DynamicType(),
+            isStatic: true, isFinal: true, fileUri: _fileUri);
+    field.fileOffset = 0;
+    _library.addField(field);
+    _topLevelFields[name] = field;
+  }
+
+  /// Compila o initializer de uma constante de módulo importada e o pendura no
+  /// campo static correspondente. Espelha [_compileTopLevelFieldInits].
+  void _compileImportedBindingInit(ast.StmtDecl decl) {
+    final stmt = decl.statement;
+    final String name;
+    final ast.Expression? value;
+    switch (stmt) {
+      case ast.LetStmt s:
+        if (s.pattern != null || s.name.isEmpty) return;
+        name = s.name;
+        value = s.value;
+      case ast.VarStmt s:
+        if (s.name.isEmpty) return;
+        name = s.name;
+        value = s.value;
+      default:
+        return;
+    }
+    final field = _topLevelFields[name];
+    if (field == null || value == null || field.initializer != null) return;
+
+    final prevClass = _currentClass;
+    final prevProc = _currentProcedure;
+    final prevRet = _currentReturnType;
+    _currentClass = null;
+    _currentProcedure = null;
+    _currentReturnType = null;
+    _pushScope();
+    final init = _compileExpr(value);
+    _popScope();
+    _currentClass = prevClass;
+    _currentProcedure = prevProc;
+    _currentReturnType = prevRet;
+    field.initializer = init;
+    init.parent = field;
   }
 
   bool _shouldImport(String? name, bool isPublic, List<ast.ImportMember>? filter) {
@@ -2586,7 +2676,20 @@ class CodeGenerator {
         k.Arguments([k.VariableGet(indexVar)])),
       type: const k.DynamicType(), isFinal: true);
     _declareVar(stmt.variable, elemVar);
+    // Iterar uma String rende Strings de 1 char (`s[i]`). Rastreia a var do loop
+    // como String para lowering downstream (ex.: `ch.codeUnit` em text.tu).
+    // [_varTypes] é global; salva/restaura para não vazar após o loop.
+    final prevElemType = _varTypes[stmt.variable];
+    final iterIsString = _isStringReceiver(stmt.iterable);
+    if (iterIsString) _varTypes[stmt.variable] = 'String';
     final body = _compileStatement(stmt.body);
+    if (iterIsString) {
+      if (prevElemType == null) {
+        _varTypes.remove(stmt.variable);
+      } else {
+        _varTypes[stmt.variable] = prevElemType;
+      }
+    }
     _popScope();
 
     return k.Block([
@@ -9503,6 +9606,21 @@ class CodeGenerator {
         if (lowered != null) return lowered;
       }
 
+      // === String.toInt() → int.tryParse (Int?) ===
+      // A stdlib usa `str.toInt()` (config.getInt, validate.minVal). Dart não
+      // tem `String.toInt` → sem isto vira NoSuchMethodError. Lowera para
+      // `int.tryParse(str)`, que devolve `Int?` (null quando não-parseável) —
+      // casa direto com o `??` da linguagem (null-coalesce): `s.toInt() ?? def`.
+      // SÓ dispara quando o receiver é POSITIVAMENTE String, para não colidir
+      // com `Int.toInt()`/`Float.toInt()` (que truncam número → tryParse num
+      // int estouraria). Mesma disciplina de rastreamento de tipo do List/Map.
+      if (callee.member == 'toInt' && args.isEmpty &&
+          _isStringReceiver(callee.object)) {
+        final intTryParse = _coreTypes.intClass.procedures
+            .firstWhere((p) => p.name.text == 'tryParse');
+        return k.StaticInvocation(intTryParse, k.Arguments([obj]));
+      }
+
       // Check built-in methods (Option.map, Result.unwrapOr, etc)
       // Tentar determinar o tipo do receiver pra escolher o builtin correto
       final receiverType = _inferReceiverType(callee.object);
@@ -9619,6 +9737,17 @@ class CodeGenerator {
           return k.NullLiteral();
         }
       }
+    }
+
+    // === String.codeUnit → codeUnitAt(0) ===
+    // `ch.codeUnit` (getter sintético do Itá: code unit de uma String de 1 char)
+    // não existe em Dart (só `codeUnits`/`codeUnitAt(i)`) → sem isto vira
+    // NoSuchMethodError. A stdlib text.tu usa muito (toLower/toUpper/slugify/
+    // is*). Só dispara em receiver POSITIVAMENTE String (mesmo gate do toInt),
+    // para não sequestrar um campo `codeUnit` de struct de usuário.
+    if (expr.member == 'codeUnit' && _isStringReceiver(expr.object)) {
+      final obj = _compileExpr(expr.object);
+      return _di(obj, 'codeUnitAt', [k.IntLiteral(0)]);
     }
 
     final obj = _compileExpr(expr.object);
@@ -9749,19 +9878,75 @@ class CodeGenerator {
     return null;
   }
 
-  /// Rastreia parâmetros tipados como List/Map em [_varTypes], para que
-  /// `param.set(..)`/`param.slice(..)` (ex.: `chunk(list: List<T>)`) sejam
-  /// reconhecidos. Só grava List/Map — nunca outros tipos (blast radius mínimo).
+  /// `true` quando [obj] é POSITIVAMENTE uma String em runtime — gate do lowering
+  /// de `str.toInt()` (para não colidir com `Int.toInt()`/`Float.toInt()`).
+  /// Mesmas fontes de [_listMapReceiver]: fase semântica (programa consumidor),
+  /// literais, params/vars rastreados em [_varTypes] e campos de struct/class com
+  /// tipo `String` declarado (alcança módulos importados, que a semântica não vê).
+  bool _isStringReceiver(ast.Expression obj) {
+    final t = _analysis?.typeOf(obj);
+    if (t is sem.StringType) return true;
+    if (obj is ast.StringLiteralExpr) return true;
+    if (obj is ast.StringInterpolationExpr) return true;
+    if (obj is ast.IdentifierExpr && _varTypes[obj.name] == 'String') return true;
+    // Chamada a fn com return type String (ex.: `toLower(s)` de text.tu).
+    if (obj is ast.CallExpr && obj.callee is ast.IdentifierExpr) {
+      if (_fnReturnTypes[(obj.callee as ast.IdentifierExpr).name] == 'String') {
+        return true;
+      }
+    }
+    if (obj is ast.MemberExpr && obj.object is ast.IdentifierExpr) {
+      final baseName = (obj.object as ast.IdentifierExpr).name;
+      final typeName = baseName == 'self' ? _currentTypeName : _varTypes[baseName];
+      if (typeName != null) {
+        final ft = _typeFieldTypes[typeName]?[obj.member];
+        if (ft is ast.NamedType && ft.name == 'String') return true;
+      }
+    }
+    return false;
+  }
+
+  /// Nome do tipo do valor "contido" quando [subject] produz um Option/Result
+  /// cujo binding `.some(v)`/`.ok(v)` é derivável estaticamente. Hoje cobre
+  /// `campoMap.get(k)` → V de um campo `Map<K,V>` (ex.: `self.data.get(key)` em
+  /// Config.getInt, com `data: Map<String,String>` → `String`). Devolve null
+  /// quando indeterminável (o binding segue sem tipo rastreado).
+  String? _optionValueTypeOfSubject(ast.Expression subject) {
+    if (subject is ast.CallExpr && subject.callee is ast.MemberExpr) {
+      final m = subject.callee as ast.MemberExpr;
+      if (m.member == 'get' && m.object is ast.MemberExpr &&
+          (m.object as ast.MemberExpr).object is ast.IdentifierExpr) {
+        final fieldExpr = m.object as ast.MemberExpr;
+        final baseName = (fieldExpr.object as ast.IdentifierExpr).name;
+        final typeName =
+            baseName == 'self' ? _currentTypeName : _varTypes[baseName];
+        if (typeName != null) {
+          final ft = _typeFieldTypes[typeName]?[fieldExpr.member];
+          if (ft is ast.NamedType && ft.name == 'Map' && ft.typeArgs.length == 2) {
+            final v = ft.typeArgs[1];
+            if (v is ast.NamedType) return v.name;
+          }
+        }
+      }
+    }
+    return null;
+  }
+
+  /// Rastreia parâmetros tipados como List/Map/String em [_varTypes], para que
+  /// `param.set(..)`/`param.slice(..)` (ex.: `chunk(list: List<T>)`) e
+  /// `param.toInt()` (ex.: `_ruleErrors(value: String)`) sejam reconhecidos.
+  /// Blast radius mínimo: só grava List/Map/String — nunca outros tipos.
   void _trackListMapParam(ast.Param p) {
     final t = p.type;
-    if (t is ast.NamedType && (t.name == 'List' || t.name == 'Map')) {
+    if (t is ast.NamedType &&
+        (t.name == 'List' || t.name == 'Map' || t.name == 'String')) {
       _varTypes[p.name] = t.name;
     } else {
-      // [_varTypes] é global (não escopado): limpa um List/Map STALE deixado por
-      // um param homônimo de outra função, senão este param herdaria o tipo
-      // errado e `p.set(..)` seria lowerado como coleção indevidamente.
+      // [_varTypes] é global (não escopado): limpa um List/Map/String STALE
+      // deixado por um param homônimo de outra função, senão este param herdaria
+      // o tipo errado e `p.set(..)`/`p.toInt()` seria lowerado indevidamente.
       final ex = _varTypes[p.name];
-      if (ex == 'List' || ex == 'Map') _varTypes.remove(p.name);
+      if (ex == 'List' || ex == 'Map' || ex == 'String') _varTypes.remove(p.name);
     }
   }
 
@@ -10071,6 +10256,21 @@ class CodeGenerator {
       _pushScope();
       final bindings = <k.Statement>[];
       final condition = _compilePattern(arm.pattern, k.VariableGet(tmpVar), bindings);
+
+      // Rastreia o tipo do valor ligado em `.some(v)`/`.ok(v)` quando derivável
+      // do subject (ex.: `Map<String,String>.get` → `v: String`), para que um
+      // lowering downstream no corpo do arm (ex.: `v.toInt()`) veja o tipo certo.
+      if (arm.pattern is ast.EnumPattern) {
+        final ep = arm.pattern as ast.EnumPattern;
+        if ((ep.variant == 'some' || ep.variant == 'ok') &&
+            ep.subpatterns.length == 1 &&
+            ep.subpatterns.first is ast.IdentifierPattern) {
+          final vt = _optionValueTypeOfSubject(expr.subject);
+          if (vt != null) {
+            _varTypes[(ep.subpatterns.first as ast.IdentifierPattern).name] = vt;
+          }
+        }
+      }
 
       // Guard e body são compilados DENTRO do escopo dos bindings do pattern,
       // senão a variável capturada (ex: `n if n > 10`) não é resolvida e vem
