@@ -79,7 +79,7 @@ jobs:
           DART=".dart-sdk/${{ steps.pin.outputs.ver }}/dart-sdk/bin/dart"
           export ITA_PLATFORM_DILL=".dart-sdk/${{ steps.pin.outputs.ver }}/dart-sdk/lib/_internal/vm_platform.dill"
           PKGS="compiler/.dart_tool/package_config.json"
-          for m in math text cache collections config datetime event iter log server validate; do
+          for m in async cache collections config datetime event iter log math server text validate; do
             echo "== itac check stdlib/$m.tu =="
             "$DART" --packages="$PKGS" compiler/bin/itac.dart check "$RUNNER_TEMP/stdlib/$m.tu"
           done
