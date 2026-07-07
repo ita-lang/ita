@@ -349,6 +349,13 @@ class TypeChecker {
         for (final el in e.elements) {
           _infer(el, scope);
         }
+      case ast.MapLiteralExpr e:
+        // Sem inferência de tipo de chave/valor (conservador, como as listas):
+        // visita os filhos p/ popular a side-table e devolve Unknown.
+        for (final entry in e.entries) {
+          _infer(entry.key, scope);
+          _infer(entry.value, scope);
+        }
       case ast.TupleExpr e:
         for (final el in e.elements) {
           _infer(el, scope);

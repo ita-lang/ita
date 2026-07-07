@@ -2182,6 +2182,8 @@ class CodeGenerator {
       }
     } else if (stmt.value is ast.ListLiteralExpr) {
       _varTypes[stmt.name] = 'List';
+    } else if (stmt.value is ast.MapLiteralExpr) {
+      _varTypes[stmt.name] = 'Map';
     }
     return varDecl;
   }
@@ -2469,7 +2471,8 @@ class CodeGenerator {
         return _compileCompose(e);
       case ast.WhereExpr e:
         return _compileWhere(e);
-      case ast.MapLiteralExpr _:
+      case ast.MapLiteralExpr e:
+        return _compileMap(e);
       case ast.PartialAppExpr _:
       case ast.StringInterpolationExpr _:
         return k.NullLiteral();
@@ -10150,6 +10153,18 @@ class CodeGenerator {
     return k.ListLiteral(
       expr.elements.map(_compileExpr).toList(),
       typeArgument: const k.DynamicType());
+  }
+
+  /// Map literal `{ "k": v, ... }` → Dart Kernel `MapLiteral`.
+  /// Sem fase de inferência, chave e valor são `dynamic` (igual às listas).
+  k.Expression _compileMap(ast.MapLiteralExpr expr) {
+    return k.MapLiteral(
+      expr.entries
+          .map((e) =>
+              k.MapLiteralEntry(_compileExpr(e.key), _compileExpr(e.value)))
+          .toList(),
+      keyType: const k.DynamicType(),
+      valueType: const k.DynamicType());
   }
 
   k.Expression _compilePipe(ast.PipeExpr expr) {

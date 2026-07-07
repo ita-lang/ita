@@ -1369,6 +1369,13 @@ class Parser {
       case TokenType.lbracket:
         return _listLiteral();
 
+      case TokenType.lbrace:
+        // `{` em posição de EXPRESSÃO (primária) → map literal.
+        // Em posição de STATEMENT, `_statement()` roteia `{` para `_block()`
+        // ANTES de chegar aqui, e os corpos de if/while/fn/match/closure são
+        // consumidos por `_block()` diretamente — nunca por `_primary()`.
+        return _mapLiteral();
+
       case TokenType.kwMatch:
         return _matchExpr();
 
@@ -1508,6 +1515,27 @@ class Parser {
 
     _consume(TokenType.rbracket, 'Expected "]"');
     return ListLiteralExpr(elements, token.line, token.column);
+  }
+
+  /// Map literal: `{ "k": v, "k2": v2 }` ou `{}` (vazio).
+  /// Chaves e valores são expressões. Só é alcançado em posição de expressão
+  /// (via `_primary`); em posição de statement, `{` continua sendo bloco.
+  MapLiteralExpr _mapLiteral() {
+    final token = _consume(TokenType.lbrace, 'Expected "{"');
+    final entries = <MapEntry_>[];
+
+    if (!_check(TokenType.rbrace)) {
+      do {
+        if (_check(TokenType.rbrace)) break; // tolera vírgula final
+        final key = _expression();
+        _consume(TokenType.colon, 'Expected ":" in map entry');
+        final value = _expression();
+        entries.add(MapEntry_(key: key, value: value));
+      } while (_match(TokenType.comma));
+    }
+
+    _consume(TokenType.rbrace, 'Expected "}"');
+    return MapLiteralExpr(entries, token.line, token.column);
   }
 
   MatchExpr _matchExpr() {

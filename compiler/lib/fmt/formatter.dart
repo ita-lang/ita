@@ -567,9 +567,9 @@ class Formatter {
         if (expr.elements.isEmpty) return '[]';
         return '[${expr.elements.map(_expr).join(', ')}]';
       case MapLiteralExpr():
-        if (expr.entries.isEmpty) return '[:]';
+        if (expr.entries.isEmpty) return '{}';
         final entries = expr.entries.map((e) => '${_expr(e.key)}: ${_expr(e.value)}').join(', ');
-        return '[$entries]';
+        return '{ $entries }';
       case ClosureExpr():
         return _closureExpr(expr);
       case MatchExpr():
