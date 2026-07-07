@@ -688,8 +688,10 @@ void cmdCheck(List<String> args, {required String platformDill}) {
       continue;
     }
 
-    // CodeGen (sem escrever arquivo)
-    final codegen = CodeGenerator(platformDill, sourcePath: filePath, analysis: analysis);
+    // CodeGen (sem escrever arquivo). `check` valida SEM executar, então não
+    // exige main(): uma biblioteca (ex.: os módulos da stdlib, sem entrypoint)
+    // é válida. `run` continua exigindo main via compile()/compileQuiet.
+    final codegen = CodeGenerator(platformDill, sourcePath: filePath, analysis: analysis, requireMain: false);
     codegen.compile(program);
     if (codegen.errors.isNotEmpty) {
       for (final err in codegen.errors) {
