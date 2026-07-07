@@ -66,3 +66,20 @@ jobs:
       # Testes unitarios: itac test sobre test/**/*_test.tu.
       - name: Testes unitarios
         run: bash .claude/skills/ita-test/test.sh unit
+
+      # Regressao da stdlib (repo irmao ita-lang/stdlib): garante que os
+      # modulos que JA compilam continuem compilando com o compilador deste
+      # PR. Clona a stdlib (HEAD) e roda `itac check` nos modulos verdes.
+      # Amplie a lista `for m in ...` conforme mais modulos passarem a
+      # compilar (M2/Fase 3.5). `check` sai !=0 em qualquer erro.
+      - name: Regressão da stdlib (módulos verdes)
+        run: |
+          set -euo pipefail
+          git clone --depth 1 https://github.com/ita-lang/stdlib.git "$RUNNER_TEMP/stdlib"
+          DART=".dart-sdk/${{ steps.pin.outputs.ver }}/dart-sdk/bin/dart"
+          export ITA_PLATFORM_DILL=".dart-sdk/${{ steps.pin.outputs.ver }}/dart-sdk/lib/_internal/vm_platform.dill"
+          PKGS="compiler/.dart_tool/package_config.json"
+          for m in math text; do
+            echo "== itac check stdlib/$m.tu =="
+            "$DART" --packages="$PKGS" compiler/bin/itac.dart check "$RUNNER_TEMP/stdlib/$m.tu"
+          done

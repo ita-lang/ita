@@ -207,6 +207,7 @@ class CodeGenerator {
   late k.Procedure _byteDataSublistView;
   late k.Class _endianClass;
   late k.Procedure _stringFromCharCodes;
+  late k.Procedure _stringFromCharCode;
   late k.Class _uriClass;
   late k.Procedure _uriParse;
   late k.Procedure _uriEncodeComponent;
@@ -335,7 +336,14 @@ class CodeGenerator {
   // Módulos já compilados (evita compilar o mesmo módulo duas vezes)
   final Map<String, ast.Program> _compiledModules = {};
 
-  CodeGenerator(this.platformPath, {this.sourcePath = '', AnalysisResult? analysis})
+  // Modo-lib: quando `false`, a ausência de `fn main()` NÃO é erro (uma
+  // biblioteca — ex.: os módulos da stdlib — é válida e compilável sem
+  // entrypoint). `true` (default) preserva o comportamento de programa: todo
+  // executável precisa de main(). Usado por `itac check`/`build` de lib.
+  final bool requireMain;
+
+  CodeGenerator(this.platformPath,
+      {this.sourcePath = '', AnalysisResult? analysis, this.requireMain = true})
       : _analysis = analysis;
 
   // ============================================================
@@ -393,10 +401,11 @@ class CodeGenerator {
     // Pass 3.5: Compilar os initializers dos globais top-level.
     _compileTopLevelFieldInits(program);
 
-    // Setar main
+    // Setar main. Em modo-lib (requireMain == false), uma biblioteca é válida
+    // sem entrypoint: o .dill é gerado sem main method e a ausência não é erro.
     if (_functions.containsKey('main')) {
       _component.setMainMethodAndMode(_functions['main']!.reference, true);
-    } else {
+    } else if (requireMain) {
       _error('No main() function found', 0, 0,
         hint: 'todo programa precisa de uma funcao main(): fn main() { ... }');
     }
@@ -455,6 +464,8 @@ class CodeGenerator {
     _endianClass = dartTyped.classes.firstWhere((c) => c.name == 'Endian');
     _stringFromCharCodes = dartCore.classes.firstWhere((c) => c.name == 'String')
       .procedures.firstWhere((p) => p.name.text == 'fromCharCodes');
+    _stringFromCharCode = dartCore.classes.firstWhere((c) => c.name == 'String')
+      .procedures.firstWhere((p) => p.name.text == 'fromCharCode');
     _uriParse = _uriClass.procedures.firstWhere((p) => p.name.text == 'parse');
     _uriEncodeComponent = _uriClass.procedures.firstWhere((p) => p.name.text == 'encodeComponent');
     _uriDecodeComponent = _uriClass.procedures.firstWhere((p) => p.name.text == 'decodeComponent');
@@ -3776,6 +3787,17 @@ class CodeGenerator {
             return k.DynamicInvocation(k.DynamicAccessKind.Dynamic,
               k.StaticInvocation(_fileFactory, k.Arguments([args[0]])),
               k.Name('existsSync'), k.Arguments([]));
+        }
+
+      case 'String':
+        switch (method) {
+          case 'fromCodeUnit':
+            // String.fromCodeUnit(code) → String.fromCharCode(code)
+            // Converte um único code point (Int) em uma string de 1 char.
+            if (args.isNotEmpty) {
+              return k.StaticInvocation(_stringFromCharCode, k.Arguments([args[0]]));
+            }
+            return k.StringLiteral('');
         }
 
       case 'log':
@@ -9099,7 +9121,8 @@ class CodeGenerator {
            'Date', 'Duration', 'Csv', 'Url', 'Env',
            'Toml', 'Yaml', 'Xml', 'Json5', 'Ini', 'Markdown', 'Csrf', 'Buffer',
            'Http', 'Ws', 'Net', 'Dns', 'Security', 'Jwt', 'Response',
-           'Channel', 'Broadcast', 'Mailbox', 'Timer', 'Signal', 'Bits', 'Bytes'].contains(ns)) {
+           'Channel', 'Broadcast', 'Mailbox', 'Timer', 'Signal', 'Bits', 'Bytes',
+           'String'].contains(ns)) {
         final args = expr.args.map((a) => _compileExpr(a.value)).toList();
         return _compileStaticNamespaceCall(ns, callee.member, args);
       }
