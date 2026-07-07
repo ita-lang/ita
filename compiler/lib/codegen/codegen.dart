@@ -791,13 +791,31 @@ class CodeGenerator {
     _builtinMethods[type]![name] = (args, self) => impl(args, self);
   }
 
+  /// Constrói um [k.Name] para um nome de MEMBRO (procedure/field/getter)
+  /// pertencente ao módulo do usuário (a lib [_library]).
+  ///
+  /// No Kernel, um nome que começa com `_` é PRIVADO e library-scoped: exige a
+  /// referência da biblioteca. `k.Name('_x')` sem lib crasha com
+  /// `Null check operator used on a null value` (o `libraryName!` em
+  /// package:kernel). Nomes públicos não recebem lib ref (economia de memória
+  /// via `_PublicName`). Usar esse helper TANTO na declaração do membro QUANTO
+  /// nos acessos/invocações do mesmo membro, pra que as duas `Name` sejam
+  /// iguais (private name == mesmo text + mesma library) e o VM resolva.
+  ///
+  /// NÃO usar para nomes de membros built-in de dart:core (ex.: `toString`,
+  /// `add`, `[]`): esses são públicos e nunca começam com `_`, então mesmo se
+  /// passassem por aqui o resultado seria idêntico — mas a intenção é reservar
+  /// este helper aos membros DECLARADOS no módulo corrente.
+  k.Name _memberName(String name) =>
+      name.startsWith('_') ? k.Name(name, _library) : k.Name(name);
+
   // ============================================================
   // Pass 1: Registration
   // ============================================================
 
   void _registerFunction(ast.FnDecl decl) {
     final proc = k.Procedure(
-      k.Name(decl.name),
+      _memberName(decl.name),
       k.ProcedureKind.Method,
       k.FunctionNode(null),
       isStatic: true,
@@ -839,7 +857,7 @@ class CodeGenerator {
     final fields = <k.Field>[];
     for (final f in decl.fields) {
       final field = k.Field.immutable(
-        k.Name(f.name),
+        _memberName(f.name),
         type: _resolveType(f.type),
         fileUri: _fileUri,
       );
@@ -915,8 +933,8 @@ class CodeGenerator {
     final fields = <k.Field>[];
     for (final f in decl.fields) {
       final field = f.isMutable
-          ? k.Field.mutable(k.Name(f.name), type: _resolveType(f.type), fileUri: _fileUri)
-          : k.Field.immutable(k.Name(f.name), type: _resolveType(f.type), fileUri: _fileUri);
+          ? k.Field.mutable(_memberName(f.name), type: _resolveType(f.type), fileUri: _fileUri)
+          : k.Field.immutable(_memberName(f.name), type: _resolveType(f.type), fileUri: _fileUri);
       cls.addField(field);
       fields.add(field);
       fieldNames.add(f.name);
@@ -1001,7 +1019,7 @@ class CodeGenerator {
 
       for (final p in c.params) {
         final field = k.Field.immutable(
-          k.Name(p.name),
+          _memberName(p.name),
           type: _resolveType(p.type),
           fileUri: _fileUri,
         );
@@ -1062,7 +1080,7 @@ class CodeGenerator {
           k.InstanceGet(
             k.InstanceAccessKind.Instance,
             k.ThisExpression(),
-            k.Name(fieldNames[i]),
+            _memberName(fieldNames[i]),
             resultType: const k.DynamicType(),
             interfaceTarget: cls.fields.firstWhere((f) => f.name.text == fieldNames[i]),
           ),
@@ -1341,7 +1359,7 @@ class CodeGenerator {
     _methods[decl.name] = {};
     for (final method in decl.methods) {
       final proc = k.Procedure(
-        k.Name(method.name),
+        _memberName(method.name),
         k.ProcedureKind.Method,
         k.FunctionNode(null),
         fileUri: _fileUri,
@@ -1541,7 +1559,7 @@ class CodeGenerator {
 
     final delegateCall = k.DynamicInvocation(
       k.DynamicAccessKind.Dynamic, k.VariableGet(actorVar),
-      k.Name(method.name),
+      _memberName(method.name),
       k.Arguments(params.map((p) => k.VariableGet(p)).toList()));
 
     // yield* actor.method(args)  — forward all yields
@@ -1757,7 +1775,7 @@ class CodeGenerator {
         continue;
       }
       final proc = k.Procedure(
-        k.Name(method.name),
+        _memberName(method.name),
         k.ProcedureKind.Method,
         k.FunctionNode(null),
         fileUri: _fileUri,
@@ -1774,7 +1792,7 @@ class CodeGenerator {
   k.Procedure _registerStaticMethod(
       k.Class cls, String typeName, ast.FnDecl method) {
     final proc = k.Procedure(
-      k.Name(method.name),
+      _memberName(method.name),
       k.ProcedureKind.Method,
       k.FunctionNode(null),
       isStatic: true,
@@ -1795,7 +1813,7 @@ class CodeGenerator {
 
     for (final method in impl.methods) {
       final proc = k.Procedure(
-        k.Name(method.name),
+        _memberName(method.name),
         k.ProcedureKind.Method,
         k.FunctionNode(null),
         fileUri: _fileUri,
@@ -1861,9 +1879,9 @@ class CodeGenerator {
       }
 
       final field = mutable
-          ? k.Field.mutable(k.Name(name),
+          ? k.Field.mutable(_memberName(name),
               type: const k.DynamicType(), isStatic: true, fileUri: _fileUri)
-          : k.Field.immutable(k.Name(name),
+          : k.Field.immutable(_memberName(name),
               type: const k.DynamicType(),
               isStatic: true,
               isFinal: true,
@@ -2135,7 +2153,7 @@ class CodeGenerator {
     // Se não existe (método declarado no struct/class body direto)
     if (proc == null) {
       proc = k.Procedure(
-        k.Name(method.name),
+        _memberName(method.name),
         k.ProcedureKind.Method,
         k.FunctionNode(null),
         fileUri: _fileUri,
@@ -2592,7 +2610,7 @@ class CodeGenerator {
         return k.Let(tmp, k.ConditionalExpression(
           k.EqualsNull(k.VariableGet(tmp)),
           k.NullLiteral(),
-          k.DynamicGet(k.DynamicAccessKind.Dynamic, k.VariableGet(tmp), k.Name(e.member)),
+          k.DynamicGet(k.DynamicAccessKind.Dynamic, k.VariableGet(tmp), _memberName(e.member)),
           const k.DynamicType(),
         ));
       case ast.CopyWithExpr e:
@@ -2658,7 +2676,7 @@ class CodeGenerator {
           return k.InstanceGet(
             k.InstanceAccessKind.Instance,
             k.ThisExpression(),
-            k.Name(expr.name),
+            _memberName(expr.name),
             resultType: field.type,
             interfaceTarget: field,
           );
@@ -2677,7 +2695,7 @@ class CodeGenerator {
           return k.FunctionExpression(k.FunctionNode(
             k.ReturnStatement(k.DynamicInvocation(
               k.DynamicAccessKind.Dynamic, k.ThisExpression(),
-              k.Name(expr.name),
+              _memberName(expr.name),
               k.Arguments(closureParams.map((p) => k.VariableGet(p)).toList()))),
             positionalParameters: closureParams,
             returnType: const k.DynamicType()));
@@ -9422,7 +9440,7 @@ class CodeGenerator {
       }
 
       return k.DynamicInvocation(
-        k.DynamicAccessKind.Dynamic, obj, k.Name(callee.member), k.Arguments(args));
+        k.DynamicAccessKind.Dynamic, obj, _memberName(callee.member), k.Arguments(args));
     }
 
     // === Closure/generic call ===
@@ -9511,7 +9529,7 @@ class CodeGenerator {
     }
 
     final obj = _compileExpr(expr.object);
-    return k.DynamicGet(k.DynamicAccessKind.Dynamic, obj, k.Name(expr.member));
+    return k.DynamicGet(k.DynamicAccessKind.Dynamic, obj, _memberName(expr.member));
   }
 
   k.Expression _compileEnumAccess(ast.EnumAccessExpr expr) {
@@ -9639,7 +9657,7 @@ class CodeGenerator {
           // Copiar campo original: source.field
           named.add(k.NamedExpression(field,
             k.DynamicGet(k.DynamicAccessKind.Dynamic,
-              k.VariableGet(tmp), k.Name(field))));
+              k.VariableGet(tmp), _memberName(field))));
         }
       }
 
@@ -9743,7 +9761,7 @@ class CodeGenerator {
       final member = expr.target as ast.MemberExpr;
       final obj = _compileExpr(member.object);
       return k.DynamicSet(
-        k.DynamicAccessKind.Dynamic, obj, k.Name(member.member),
+        k.DynamicAccessKind.Dynamic, obj, _memberName(member.member),
         _compileExpr(expr.value));
     }
 
@@ -9928,7 +9946,7 @@ class CodeGenerator {
           final subp = p.subpatterns[i];
           if (subp is ast.IdentifierPattern) {
             final fieldGet = k.DynamicGet(
-              k.DynamicAccessKind.Dynamic, subject, k.Name(fieldNames[i]));
+              k.DynamicAccessKind.Dynamic, subject, _memberName(fieldNames[i]));
             final binding = k.VariableDeclaration(subp.name,
               initializer: fieldGet, type: const k.DynamicType(), isFinal: true);
             bindings.add(binding);
@@ -9996,7 +10014,7 @@ class CodeGenerator {
 
         for (final field in p.fields) {
           final fieldGet = k.DynamicGet(
-            k.DynamicAccessKind.Dynamic, subject, k.Name(field.name));
+            k.DynamicAccessKind.Dynamic, subject, _memberName(field.name));
           final binding = k.VariableDeclaration(field.name,
             initializer: fieldGet, type: const k.DynamicType(), isFinal: true);
           bindings.add(binding);
@@ -10252,7 +10270,7 @@ class CodeGenerator {
         // { x, y, z } → extract fields by name
         for (final field in p.fields) {
           final extracted = k.DynamicGet(
-            k.DynamicAccessKind.Dynamic, k.VariableGet(tmp), k.Name(field.name));
+            k.DynamicAccessKind.Dynamic, k.VariableGet(tmp), _memberName(field.name));
           final varDecl = k.VariableDeclaration(field.name,
             initializer: extracted, type: const k.DynamicType(), isFinal: isFinal);
           stmts.add(varDecl);

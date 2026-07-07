@@ -1578,7 +1578,12 @@ class Parser {
   Expression _ifExpr() {
     // if como expressão (retorna valor)
     final token = _consume(TokenType.kwIf, 'Expected "if"');
+    // Desabilita trailing-closure ao parsear a condição, senão "if f(x) {"
+    // lê o "{" do bloco-then como trailing closure de f(x) (mesmo que _ifStmt).
+    final prevNoTC = _noTrailingClosure;
+    _noTrailingClosure = true;
     final condition = _expression();
+    _noTrailingClosure = prevNoTC;
     final thenBlock = _block();
 
     Statement? elseBlock;
