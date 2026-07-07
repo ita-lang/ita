@@ -67,19 +67,24 @@ jobs:
       - name: Testes unitarios
         run: bash .claude/skills/ita-test/test.sh unit
 
-      # Regressao da stdlib (repo irmao ita-lang/stdlib): garante que os
-      # modulos que JA compilam continuem compilando com o compilador deste
-      # PR. Clona a stdlib (HEAD) e roda `itac check` nos modulos verdes.
-      # Amplie a lista `for m in ...` conforme mais modulos passarem a
-      # compilar (M2/Fase 3.5). `check` sai !=0 em qualquer erro.
-      - name: Regressão da stdlib (módulos verdes)
+      # Regressao da stdlib (repo irmao ita-lang/stdlib): garante que os 12
+      # modulos continuem (1) COMPILANDO (`itac check`) e (2) RODANDO
+      # (run + golden via stdlib/test/run_runtime.sh) com o compilador deste
+      # PR. Clona a stdlib (HEAD). Qualquer erro/mismatch -> exit !=0.
+      - name: Regressão da stdlib (compila + roda)
         run: |
           set -euo pipefail
           git clone --depth 1 https://github.com/ita-lang/stdlib.git "$RUNNER_TEMP/stdlib"
-          DART=".dart-sdk/${{ steps.pin.outputs.ver }}/dart-sdk/bin/dart"
-          export ITA_PLATFORM_DILL=".dart-sdk/${{ steps.pin.outputs.ver }}/dart-sdk/lib/_internal/vm_platform.dill"
-          PKGS="compiler/.dart_tool/package_config.json"
+          VER="${{ steps.pin.outputs.ver }}"
+          export ITA_DART_BIN="$PWD/.dart-sdk/$VER/dart-sdk/bin/dart"
+          export ITA_PLATFORM_DILL="$PWD/.dart-sdk/$VER/dart-sdk/lib/_internal/vm_platform.dill"
+          export ITA_PACKAGES="$PWD/compiler/.dart_tool/package_config.json"
+          export ITA_ITAC="$PWD/compiler/bin/itac.dart"
+          export ITA_STDLIB="$RUNNER_TEMP/stdlib"
+          echo "== 1. compila: itac check nos 12 modulos =="
           for m in async cache collections config datetime event iter log math server text validate; do
-            echo "== itac check stdlib/$m.tu =="
-            "$DART" --packages="$PKGS" compiler/bin/itac.dart check "$RUNNER_TEMP/stdlib/$m.tu"
+            echo "-- check $m.tu"
+            "$ITA_DART_BIN" --packages="$ITA_PACKAGES" "$ITA_ITAC" check "$RUNNER_TEMP/stdlib/$m.tu"
           done
+          echo "== 2. roda: run + golden (run_runtime.sh) =="
+          bash "$RUNNER_TEMP/stdlib/test/run_runtime.sh"
