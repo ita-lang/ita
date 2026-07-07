@@ -42,6 +42,16 @@ ResolvedType resolveAnnotation(ast.TypeAnnotation? ann, Scope scope) {
       // `mut T` compartilha a representação de `T` nesta fatia; a mutabilidade
       // é uma propriedade do BINDING (VariableSymbol.isMutable), não do tipo.
       return resolveAnnotation(n.inner, scope);
+
+    case ast.TupleType n:
+      // Tuplas ainda não têm ResolvedType próprio nesta fatia semântica.
+      // Resolvemos os elementos (para validar nomes/popular escopo) mas
+      // tratamos o todo como Unknown — conservador, sem falsos positivos.
+      // O codegen faz o lowering real para Dart Record.
+      for (final e in n.elementTypes) {
+        resolveAnnotation(e, scope);
+      }
+      return const UnknownType();
   }
 }
 

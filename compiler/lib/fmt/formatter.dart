@@ -557,6 +557,10 @@ class Formatter {
         return '${_expr(expr.object)}.${expr.member}';
       case IndexExpr():
         return '${_expr(expr.object)}[${_expr(expr.index)}]';
+      case TupleExpr():
+        return '(${expr.elements.map(_expr).join(', ')})';
+      case TupleIndexExpr():
+        return '${_expr(expr.object)}.${expr.index}';
       case AssignExpr():
         return '${_expr(expr.target)} ${expr.op.lexeme} ${_expr(expr.value)}';
       case ListLiteralExpr():
@@ -613,8 +617,6 @@ class Formatter {
       case PartialAppExpr():
         final args = expr.args.map((a) => a == null ? '_' : _expr(a)).join(', ');
         return '${_expr(expr.callee)}($args)';
-      default:
-        return '/* unformatted */';
     }
   }
 
@@ -788,8 +790,8 @@ class Formatter {
         return '($params) -> ${_typeAnnotation(type.returnType)}';
       case MutType():
         return 'mut ${_typeAnnotation(type.inner)}';
-      default:
-        return '/* type */';
+      case TupleType():
+        return '(${type.elementTypes.map(_typeAnnotation).join(', ')})';
     }
   }
 
