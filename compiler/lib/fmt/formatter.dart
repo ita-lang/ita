@@ -141,6 +141,7 @@ class Formatter {
   void _fnDecl(FnDecl decl, {bool traitMethod = false}) {
     final buf = StringBuffer();
     if (decl.isPublic) buf.write('pub ');
+    if (decl.isStatic) buf.write('static ');
     if (decl.isAsync) buf.write('async ');
     if (decl.isStream) buf.write('stream ');
     buf.write('fn ${decl.name}');

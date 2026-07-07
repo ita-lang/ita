@@ -278,6 +278,11 @@ class CodeGenerator {
   // Métodos de instância compilados (tipo → nome → Procedure)
   final Map<String, Map<String, k.Procedure>> _methods = {};
 
+  // Métodos ESTÁTICOS (`static fn`) por tipo → nome → Procedure.
+  // Diferente de _methods: são associados ao TIPO (sem self/this) e a chamada
+  // `Type.metodo(args)` vira k.StaticInvocation ao Procedure static da classe.
+  final Map<String, Map<String, k.Procedure>> _staticMethods = {};
+
   // Trait declarations (para impl)
   final Map<String, ast.TraitDecl> _traitDecls = {};
 
@@ -335,6 +340,15 @@ class CodeGenerator {
 
   // Módulos já compilados (evita compilar o mesmo módulo duas vezes)
   final Map<String, ast.Program> _compiledModules = {};
+
+  // Dedup de registro de TIPOS/EXTENSIONS importados. Um mesmo módulo pode ser
+  // referenciado por vários `import` (ex.: examples/modules.tu importa "math"
+  // duas vezes). Como o AST do módulo é cacheado (_compiledModules), os nós de
+  // declaração são idênticos entre imports — então usamos identidade de nó para
+  // registrar/compilar cada tipo/extension UMA única vez e evitar classes e
+  // procedures duplicados (que estouram em "already bound" na canonicalização).
+  final Set<ast.Declaration> _registeredImportTypeDecls = Set.identity();
+  final Set<ast.Declaration> _compiledImportTypeDecls = Set.identity();
 
   // Modo-lib: quando `false`, a ausência de `fn main()` NÃO é erro (uma
   // biblioteca — ex.: os módulos da stdlib — é válida e compilável sem
@@ -868,6 +882,11 @@ class CodeGenerator {
     _library.addClass(cls);
     _classes[decl.name] = cls;
     _methods[decl.name] = {};
+
+    // Métodos `static fn` do corpo do struct: registrados eagerly (forward refs).
+    for (final m in decl.methods) {
+      if (m.isStatic) _registerStaticMethod(cls, decl.name, m);
+    }
   }
 
   void _registerClassDecl(ast.ClassDecl decl) {
@@ -936,6 +955,11 @@ class CodeGenerator {
     _library.addClass(cls);
     _classes[decl.name] = cls;
     _methods[decl.name] = {};
+
+    // Métodos `static fn` do corpo da class: registrados eagerly (forward refs).
+    for (final m in decl.methods) {
+      if (m.isStatic) _registerStaticMethod(cls, decl.name, m);
+    }
   }
 
   void _registerEnum(ast.EnumDecl decl) {
@@ -1015,6 +1039,11 @@ class CodeGenerator {
       _enumVariants[decl.name]![c.name] = variantCls;
       _enumVariantFields[variantCls] = variantFieldNames;
       _constructors[variantName] = variantCtor;
+    }
+
+    // Métodos `static fn` do corpo do enum: ficam na classe base (sem self).
+    for (final m in decl.methods) {
+      if (m.isStatic) _registerStaticMethod(baseCls, decl.name, m);
     }
   }
 
@@ -1196,11 +1225,15 @@ class CodeGenerator {
             ));
           }
         case ast.StructDecl d:
-          name = d.name;
-          isPublic = d.isPublic;
-          if (_shouldImport(name, isPublic, filter)) {
-            _registerStruct(d);
-          }
+          // Tipos (struct) sao registrados independentemente de `pub`/filtro.
+          // Motivos: (1) replica o fluxo normal (compile()), que registra TODOS
+          // os tipos sem gate de visibilidade; (2) os tipos servem de dependencia
+          // para as extensions e para outros tipos do mesmo modulo (ex.: a
+          // extension Cache constroi CacheEntry internamente). A visibilidade
+          // `pub` continua valendo para FUNCOES top-level (encapsulamento — ver
+          // _shouldImport no case FnDecl). Structs sempre sao registrados sob o
+          // nome bare (import de tipo nunca aplicou prefix/alias).
+          if (_registeredImportTypeDecls.add(d)) _registerStruct(d);
         case ast.ClassDecl d:
           name = d.name;
           isPublic = d.isPublic;
@@ -1225,6 +1258,16 @@ class CodeGenerator {
           if (_shouldImport(name, isPublic, filter)) {
             _registerActor(d);
           }
+        case ast.ExtensionDecl d:
+          // Extensions nao possuem `pub` (ast.ExtensionDecl nao tem isPublic):
+          // seus metodos "pegam carona" no tipo alvo. Registramos os metodos
+          // ligados ao tipo — do MESMO jeito que o fluxo normal (_registerExtension)
+          // — quando o tipo alvo esta presente (ou seja, foi importado/registrado).
+          // O guard evita erro espurio para extensions cujo alvo nao veio no import.
+          if (_classes.containsKey(d.targetName) &&
+              _registeredImportTypeDecls.add(d)) {
+            _registerExtension(d);
+          }
         default:
           break;
       }
@@ -1243,8 +1286,15 @@ class CodeGenerator {
               line: d.line, column: d.column,
             ));
           }
-        case ast.StructDecl d when d.isPublic && _shouldImport(d.name, true, filter):
+        case ast.StructDecl d when _compiledImportTypeDecls.add(d):
+          // Corpos de metodos dos structs importados (registrados sem gate acima).
           _compileStructMethods(d);
+        case ast.ExtensionDecl d
+            when _classes.containsKey(d.targetName) &&
+                _compiledImportTypeDecls.add(d):
+          // Compila os corpos dos metodos da extension importada, ligados ao
+          // tipo alvo — espelha _compileExtensionMethods do fluxo normal.
+          _compileExtensionMethods(d);
         default:
           break;
       }
@@ -1702,6 +1752,10 @@ class CodeGenerator {
     _methods[ext.targetName] ??= {};
 
     for (final method in ext.methods) {
+      if (method.isStatic) {
+        _registerStaticMethod(cls, ext.targetName, method);
+        continue;
+      }
       final proc = k.Procedure(
         k.Name(method.name),
         k.ProcedureKind.Method,
@@ -1711,6 +1765,24 @@ class CodeGenerator {
       cls.addProcedure(proc);
       _methods[ext.targetName]![method.name] = proc;
     }
+  }
+
+  /// Registra o "shell" de um método `static fn` numa classe: um k.Procedure com
+  /// `isStatic: true` (SEM parâmetro self/this implícito). O corpo é compilado
+  /// depois em [_compileStaticMethodBody]. A chamada `Type.metodo(args)` é
+  /// roteada para uma k.StaticInvocation deste Procedure em [_compileCall].
+  k.Procedure _registerStaticMethod(
+      k.Class cls, String typeName, ast.FnDecl method) {
+    final proc = k.Procedure(
+      k.Name(method.name),
+      k.ProcedureKind.Method,
+      k.FunctionNode(null),
+      isStatic: true,
+      fileUri: _fileUri,
+    );
+    cls.addProcedure(proc);
+    (_staticMethods[typeName] ??= {})[method.name] = proc;
+    return proc;
   }
 
   void _processImpl(ast.ImplDecl impl) {
@@ -1916,7 +1988,11 @@ class CodeGenerator {
     if (cls == null) return;
 
     for (final method in decl.methods) {
-      _compileMethodBody(cls, decl.name, method);
+      if (method.isStatic) {
+        _compileStaticMethodBody(decl.name, method);
+      } else {
+        _compileMethodBody(cls, decl.name, method);
+      }
     }
   }
 
@@ -1925,7 +2001,11 @@ class CodeGenerator {
     if (cls == null) return;
 
     for (final method in decl.methods) {
-      _compileMethodBody(cls, decl.name, method);
+      if (method.isStatic) {
+        _compileStaticMethodBody(decl.name, method);
+      } else {
+        _compileMethodBody(cls, decl.name, method);
+      }
     }
   }
 
@@ -1934,7 +2014,11 @@ class CodeGenerator {
     final cls = _classes[decl.name];
     if (cls == null) return;
     for (final method in decl.methods) {
-      _compileMethodBody(cls, decl.name, method);
+      if (method.isStatic) {
+        _compileStaticMethodBody(decl.name, method);
+      } else {
+        _compileMethodBody(cls, decl.name, method);
+      }
     }
   }
 
@@ -1955,8 +2039,86 @@ class CodeGenerator {
     if (cls == null) return;
 
     for (final method in ext.methods) {
-      _compileMethodBody(cls, ext.targetName, method);
+      if (method.isStatic) {
+        _compileStaticMethodBody(ext.targetName, method);
+      } else {
+        _compileMethodBody(cls, ext.targetName, method);
+      }
     }
+  }
+
+  /// Compila o corpo de um método `static fn` (já registrado em [_staticMethods]).
+  /// SEM self: `_currentClass` fica nulo, então identificadores nus NÃO viram
+  /// acesso a campo de instância e `self` fica indisponível — correto para um
+  /// método associado ao TIPO. Params entram no escopo como locais; o corpo
+  /// (ex.: `Cache(entries: [], ...)`) constrói e retorna a instância.
+  void _compileStaticMethodBody(String typeName, ast.FnDecl method) {
+    final proc = _staticMethods[typeName]?[method.name];
+    if (proc == null || method.body == null) return;
+
+    _currentProcedure = proc;
+    _currentReturnType = method.returnType;
+    _pushScope();
+
+    // Positional params
+    final params = <k.VariableDeclaration>[];
+    for (final p in method.params) {
+      final param = k.VariableDeclaration(p.name,
+          type: _resolveType(p.type), isFinal: true);
+      params.add(param);
+      _declareVar(p.name, param);
+    }
+
+    // Named params (após ;) — defaults aplicados via if-null no início do corpo
+    final namedParams = <k.VariableDeclaration>[];
+    final defaultInits = <k.Statement>[];
+    for (final p in method.namedParams) {
+      final param = k.VariableDeclaration(p.name,
+          type: const k.DynamicType(), isFinal: false);
+      namedParams.add(param);
+      _declareVar(p.name, param);
+      if (p.defaultValue != null) {
+        defaultInits.add(k.IfStatement(
+            k.EqualsNull(k.VariableGet(param)),
+            k.ExpressionStatement(
+                k.VariableSet(param, _compileExpr(p.defaultValue!))),
+            null));
+      }
+    }
+
+    k.Statement body;
+    if (method.body is ast.ExprStmt) {
+      final prevCtx = _enumContext;
+      if (method.returnType != null) {
+        _enumContext = _enumNameFromType(method.returnType!);
+      }
+      body = k.ReturnStatement(
+          _compileExpr((method.body as ast.ExprStmt).expression));
+      _enumContext = prevCtx;
+    } else {
+      body = _compileFnBody(method.body!);
+    }
+
+    if (defaultInits.isNotEmpty) {
+      final stmts = [...defaultInits];
+      if (body is k.Block) {
+        stmts.addAll((body as k.Block).statements);
+      } else {
+        stmts.add(body);
+      }
+      body = k.Block(stmts);
+    }
+
+    proc.function = k.FunctionNode(
+      body,
+      positionalParameters: params,
+      namedParameters: namedParams,
+      returnType: _resolveReturnType(method.returnType),
+    )..parent = proc;
+
+    _popScope();
+    _currentProcedure = null;
+    _currentReturnType = null;
   }
 
   void _compileMethodBody(k.Class cls, String typeName, ast.FnDecl method) {
@@ -9132,6 +9294,28 @@ class CodeGenerator {
            'String'].contains(ns)) {
         final args = expr.args.map((a) => _compileExpr(a.value)).toList();
         return _compileStaticNamespaceCall(ns, callee.member, args);
+      }
+    }
+
+    // === Static method / factory: Cache.new(2), P.make(5) ===
+    // `static fn` é associado ao TIPO (sem self). A chamada vira StaticInvocation
+    // ao Procedure static registrado em _staticMethods (struct/class/enum/extension,
+    // inclusive quando o tipo veio de um import). Precede o dispatch dinâmico de
+    // método de instância (senão `Cache.new` viraria `Cache.new` em `null`).
+    if (callee is ast.MemberExpr && callee.object is ast.IdentifierExpr) {
+      final typeName = (callee.object as ast.IdentifierExpr).name;
+      final proc = _staticMethods[typeName]?[callee.member];
+      if (proc != null) {
+        final positional = <k.Expression>[];
+        final named = <k.NamedExpression>[];
+        for (final arg in expr.args) {
+          if (arg.label != null) {
+            named.add(k.NamedExpression(arg.label!, _compileExpr(arg.value)));
+          } else {
+            positional.add(_compileExpr(arg.value));
+          }
+        }
+        return k.StaticInvocation(proc, k.Arguments(positional, named: named));
       }
     }
 

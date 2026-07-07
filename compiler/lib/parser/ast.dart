@@ -82,6 +82,7 @@ class FnDecl extends Declaration {
   final Statement? body; // BlockStmt, ExprStmt (arrow), ou null (abstract)
   final bool isAsync;
   final bool isStream; // stream fn → async* generator
+  final bool isStatic; // static fn → método/factory do TIPO, sem self (Swift-style)
 
   FnDecl({
     required this.name,
@@ -91,6 +92,7 @@ class FnDecl extends Declaration {
     this.isPublic = false,
     this.isAsync = false,
     this.isStream = false,
+    this.isStatic = false,
     this.typeParams = const [],
     this.body,
     required int line,

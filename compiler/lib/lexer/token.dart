@@ -85,6 +85,7 @@ enum TokenType {
   kwInit, // init — construtor
   kwOverride, // override — sobrescrita explicita de metodo
   kwExtension, // extension — adiciona metodos a tipos existentes (Swift-style)
+  kwStatic, // static — metodo/factory associado ao TIPO, sem self (Swift-style)
   // Visibilidade e modulos
   kwPub, // pub — torna declaracao publica
   kwImport, // import — importa modulo
@@ -288,6 +289,7 @@ const Map<String, TokenType> keywords = {
   'unsafe': TokenType.kwUnsafe,
   'operator': TokenType.kwOperator,
   'extension': TokenType.kwExtension,
+  'static': TokenType.kwStatic,
   'where': TokenType.kwWhere,
   'nil': TokenType.kwNil,
   'true': TokenType.kwTrue,
