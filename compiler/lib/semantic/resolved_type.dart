@@ -208,13 +208,26 @@ final class FunctionType extends ResolvedType {
 }
 
 // ============================================================
-// User-types — ESQUELETO nesta fatia (Fatia 2 preenche fields/variants,
-// ligando ao TypeSymbol correspondente via lookup por nome no scope).
+// User-types — COM CORPO a partir da Fatia 2.
+//
+// IDENTIDADE NOMINAL, NÃO ESTRUTURAL:
+// `==`/`hashCode` olham SÓ o `name` — de propósito. Dois `StructType('Node')`
+// são o mesmo tipo independentemente do conteúdo de `fields`. Isto:
+//   1. dá semântica NOMINAL (o padrão de struct/class/enum), e
+//   2. evita RECURSÃO INFINITA em tipos recursivos (ex.: `struct Node { next: Node? }`),
+//      onde comparar `fields` estruturalmente entraria em loop.
+// Os `fields`/`variants` são METADADOS anexados (para inferência de membro,
+// copy-with e exaustividade), não parte da relação de igualdade.
 // ============================================================
 
 final class StructType extends ResolvedType {
   final String name;
-  const StructType(this.name);
+
+  /// Campos declarados (nome → tipo). Vazio até a Fatia 2 preencher.
+  /// A ORDEM de declaração é preservada (Map literal do Dart é ordenado).
+  final Map<String, ResolvedType> fields;
+
+  const StructType(this.name, [this.fields = const {}]);
   @override
   String get displayName => name;
   @override
@@ -225,7 +238,11 @@ final class StructType extends ResolvedType {
 
 final class ClassType extends ResolvedType {
   final String name;
-  const ClassType(this.name);
+
+  /// Campos declarados (nome → tipo). Ver nota de igualdade nominal acima.
+  final Map<String, ResolvedType> fields;
+
+  const ClassType(this.name, [this.fields = const {}]);
   @override
   String get displayName => name;
   @override
@@ -236,7 +253,13 @@ final class ClassType extends ResolvedType {
 
 final class EnumType extends ResolvedType {
   final String name;
-  const EnumType(this.name);
+
+  /// Variantes (nome → tipos dos valores associados), NA ORDEM de declaração.
+  /// A ordem importa para a checagem de exaustividade listar o que falta.
+  /// Variante sem payload → lista vazia.
+  final Map<String, List<ResolvedType>> variants;
+
+  const EnumType(this.name, [this.variants = const {}]);
   @override
   String get displayName => name;
   @override

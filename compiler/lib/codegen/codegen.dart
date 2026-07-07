@@ -9271,9 +9271,19 @@ class CodeGenerator {
       if (f.label != null) overrides[f.label!] = _compileExpr(f.value);
     }
 
-    // Tentar inferir o tipo pra saber os campos
+    // Tentar inferir o tipo pra saber os campos.
+    // 1ª via: tipo resolvido pela fase semântica (funciona p/ QUALQUER fonte —
+    //   retorno de fn, self.campo, copy-with aninhado). Struct/Class têm `.name`.
     String? typeName;
-    if (expr.source is ast.IdentifierExpr) {
+    final srcType = _analysis?.typeOf(expr.source);
+    if (srcType is sem.StructType) {
+      typeName = srcType.name;
+    } else if (srcType is sem.ClassType) {
+      typeName = srcType.name;
+    }
+    // 2ª via (fallback / regra de ouro): quando o tipo semântico é Unknown,
+    //   mantém a heurística antiga baseada no scope de variáveis.
+    if (typeName == null && expr.source is ast.IdentifierExpr) {
       typeName = _varTypes[(expr.source as ast.IdentifierExpr).name];
     }
 
