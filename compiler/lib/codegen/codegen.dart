@@ -2005,6 +2005,26 @@ class CodeGenerator {
     return k.Block(stmts);
   }
 
+  /// Fatia 3 (dispatch estático): quando um `let`/`var` NÃO tem anotação,
+  /// consulta a fase semântica pelo tipo INFERIDO do inicializador e faz
+  /// lowering p/ Kernel SÓ para primitivos (Int/Float/Bool/String).
+  ///
+  /// POR QUE SÓ O LOCAL BASTA: no AOT, o TFA devirtualiza os operadores
+  /// (que continuam DynamicInvocation) assim que o receiver tem tipo concreto.
+  /// Tipar apenas o local recupera ~17× sem tocar em operadores nem emitir
+  /// AsExpression. Qualquer não-primitivo / Unknown / análise ausente cai em
+  /// `dynamic` (REGRA DE OURO: nunca arrisca Kernel inválido).
+  k.DartType _lowerPrimitiveOrDynamic(ast.Expression value) {
+    final t = _analysis?.typeOf(value);
+    return switch (t) {
+      sem.IntType() => _coreTypes.intNonNullableRawType,
+      sem.FloatType() => _coreTypes.doubleNonNullableRawType,
+      sem.BoolType() => _coreTypes.boolNonNullableRawType,
+      sem.StringType() => _coreTypes.stringNonNullableRawType,
+      _ => const k.DynamicType(),
+    };
+  }
+
   k.Statement _compileLet(ast.LetStmt stmt) {
     // Propagar contexto de tipo para inferência de .variant
     final prevCtx = _enumContext;
@@ -2018,7 +2038,11 @@ class CodeGenerator {
     final varDecl = k.VariableDeclaration(
       stmt.name,
       initializer: init,
-      type: stmt.type != null ? _resolveType(stmt.type) : const k.DynamicType(),
+      type: stmt.type != null
+          ? _resolveType(stmt.type)
+          : (stmt.value != null
+              ? _lowerPrimitiveOrDynamic(stmt.value!)
+              : const k.DynamicType()),
       isFinal: true,
     );
     _declareVar(stmt.name, varDecl);
@@ -2065,7 +2089,11 @@ class CodeGenerator {
     final varDecl = k.VariableDeclaration(
       stmt.name,
       initializer: init,
-      type: stmt.type != null ? _resolveType(stmt.type) : const k.DynamicType(),
+      type: stmt.type != null
+          ? _resolveType(stmt.type)
+          : (stmt.value != null
+              ? _lowerPrimitiveOrDynamic(stmt.value!)
+              : const k.DynamicType()),
       isFinal: false,
     );
     _declareVar(stmt.name, varDecl);
