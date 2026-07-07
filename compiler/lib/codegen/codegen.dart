@@ -252,6 +252,13 @@ class CodeGenerator {
   // Funções top-level
   final Map<String, k.Procedure> _functions = {};
 
+  // `let`/`var` TOP-LEVEL (modo script) → campo static da Library. Materializar
+  // como campo (e não jogar fora, como antes) faz `let pi = 3.14` visível a
+  // QUALQUER função — inclusive uma `fn area(r) => pi * r * r` declarada à
+  // parte. Static field = inicialização lazy: forward-refs e `let a = b` (b
+  // abaixo) funcionam sem ordenar. `let` → immutable/final; `var` → mutable.
+  final Map<String, k.Field> _topLevelFields = {};
+
   // Structs e classes → Kernel Class
   final Map<String, k.Class> _classes = {};
 
@@ -367,6 +374,12 @@ class CodeGenerator {
       }
     }
 
+    // Pass 1.5: Registrar `let`/`var` top-level como campos static (shells).
+    // Precisa acontecer ANTES de compilar corpos (Pass 3), pois estes podem
+    // referenciar os globais. Os initializers são compilados no Pass 3.5,
+    // quando TUDO (fns, tipos, outros globais) já está registrado.
+    _registerTopLevelBindings(program);
+
     // Pass 2: Processar impls (adicionar métodos aos tipos)
     for (final impl in _pendingImpls) {
       _processImpl(impl);
@@ -376,6 +389,9 @@ class CodeGenerator {
     for (final decl in program.declarations) {
       _compileDeclaration(decl);
     }
+
+    // Pass 3.5: Compilar os initializers dos globais top-level.
+    _compileTopLevelFieldInits(program);
 
     // Setar main
     if (_functions.containsKey('main')) {
@@ -1733,6 +1749,84 @@ class CodeGenerator {
     }
   }
 
+  /// Cria os "shells" (campo static sem initializer) dos `let`/`var` top-level.
+  /// Roda entre o registro de fns/tipos e a compilação dos corpos, pra que os
+  /// corpos enxerguem os globais via [_topLevelFields].
+  void _registerTopLevelBindings(ast.Program program) {
+    for (final decl in program.declarations) {
+      if (decl is! ast.StmtDecl) continue;
+      final stmt = decl.statement;
+
+      final String name;
+      final bool mutable;
+      switch (stmt) {
+        case ast.LetStmt s:
+          // Destructuring (`let (a, b) = ...`) fica para outra fatia.
+          if (s.pattern != null || s.name.isEmpty) continue;
+          name = s.name;
+          mutable = false;
+        case ast.VarStmt s:
+          if (s.name.isEmpty) continue;
+          name = s.name;
+          mutable = true;
+        default:
+          continue;
+      }
+      // Não colide com função homônima nem redeclara.
+      if (_topLevelFields.containsKey(name) || _functions.containsKey(name)) {
+        continue;
+      }
+
+      final field = mutable
+          ? k.Field.mutable(k.Name(name),
+              type: const k.DynamicType(), isStatic: true, fileUri: _fileUri)
+          : k.Field.immutable(k.Name(name),
+              type: const k.DynamicType(),
+              isStatic: true,
+              isFinal: true,
+              fileUri: _fileUri);
+      field.fileOffset = 0;
+      _library.addField(field);
+      _topLevelFields[name] = field;
+    }
+  }
+
+  /// Compila os valores dos `let`/`var` top-level e os pendura como initializer
+  /// do campo static correspondente. Roda por último (Pass 3.5), com tudo já
+  /// registrado, num contexto "de biblioteca" (sem self/procedure/escopo local).
+  void _compileTopLevelFieldInits(ast.Program program) {
+    for (final decl in program.declarations) {
+      if (decl is! ast.StmtDecl) continue;
+      final stmt = decl.statement;
+
+      final String name;
+      final ast.Expression? value;
+      switch (stmt) {
+        case ast.LetStmt s:
+          if (s.pattern != null || s.name.isEmpty) continue;
+          name = s.name;
+          value = s.value;
+        case ast.VarStmt s:
+          if (s.name.isEmpty) continue;
+          name = s.name;
+          value = s.value;
+        default:
+          continue;
+      }
+      final field = _topLevelFields[name];
+      if (field == null || value == null) continue;
+
+      _currentClass = null;
+      _currentProcedure = null;
+      _currentReturnType = null;
+      _pushScope();
+      final init = _compileExpr(value);
+      _popScope();
+      field.initializer = init;
+      init.parent = field;
+    }
+  }
+
   void _compileFnDecl(ast.FnDecl decl) {
     final proc = _functions[decl.name];
     if (proc == null) return;
@@ -2445,6 +2539,10 @@ class CodeGenerator {
       // Retorna um placeholder que não será usado diretamente
       return k.NullLiteral();
     }
+
+    // Variável global (`let`/`var` top-level) → leitura do campo static.
+    final tlField = _topLevelFields[expr.name];
+    if (tlField != null) return k.StaticGet(tlField);
 
     _error('Undefined: ${expr.name}', expr.line, expr.column,
       length: expr.name.length,
@@ -9351,6 +9449,35 @@ class CodeGenerator {
       final name = (expr.target as ast.IdentifierExpr).name;
       final varDecl = _lookupVar(name);
       if (varDecl == null) {
+        // Global top-level (`var`)? Reatribui o campo static.
+        final tlField = _topLevelFields[name];
+        if (tlField != null) {
+          if (!tlField.hasSetter) {
+            _error('Cannot assign to immutable "$name"', expr.line, expr.column,
+              length: name.length,
+              label: 'let e imutavel',
+              hint: 'declare como "var $name" para permitir reatribuicao');
+            return k.NullLiteral();
+          }
+          final k.Expression gvalue;
+          if (expr.op.type == TokenType.eq) {
+            gvalue = _compileExpr(expr.value);
+          } else {
+            final opType = switch (expr.op.type) {
+              TokenType.plusEq => TokenType.plus,
+              TokenType.minusEq => TokenType.minus,
+              TokenType.starEq => TokenType.star,
+              TokenType.slashEq => TokenType.slash,
+              _ => TokenType.plus,
+            };
+            gvalue = _dynamicOp(
+              k.StaticGet(tlField),
+              _binaryOpName(opType),
+              _compileExpr(expr.value),
+            );
+          }
+          return k.StaticSet(tlField, gvalue);
+        }
         _error('Undefined: $name', expr.line, expr.column);
         return k.NullLiteral();
       }
