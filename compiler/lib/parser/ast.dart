@@ -1145,6 +1145,12 @@ class AstPrinter {
 
       case MapLiteralExpr n:
         _println('Map {${n.entries.length} entries}');
+        _indented(() {
+          for (final e in n.entries) {
+            _visit(e.key);
+            _visit(e.value);
+          }
+        });
 
       case RangeExpr n:
         _println('Range (${n.inclusive ? "inclusive" : "exclusive"})');
