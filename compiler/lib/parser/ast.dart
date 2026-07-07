@@ -603,12 +603,16 @@ class ClosureExpr extends Expression {
   // true quando o dev escreveu () explicitamente — nao adicionar params implicitos
   // false para trailing closures sem parenteses (recebem $0, $1, $2)
   final bool hasExplicitParams;
+  // true para `async () => ...` / `async () => { ... }` — corpo pode usar await,
+  // compila para um FunctionNode com asyncMarker = Async (retorna Future).
+  final bool isAsync;
 
   ClosureExpr({
     required this.params,
     this.returnType,
     required this.body,
     this.hasExplicitParams = false,
+    this.isAsync = false,
     required int line,
     required int column,
   }) : super(line, column);
@@ -871,8 +875,11 @@ class OptionalType extends TypeAnnotation {
 class FunctionType extends TypeAnnotation {
   final List<TypeAnnotation> paramTypes;
   final TypeAnnotation returnType;
+  // true para `async (...) -> T` — semanticamente `(...) -> Future<T>`.
+  final bool isAsync;
 
-  FunctionType(this.paramTypes, this.returnType, super.line, super.column);
+  FunctionType(this.paramTypes, this.returnType, super.line, super.column,
+      {this.isAsync = false});
 }
 
 class MutType extends TypeAnnotation {
@@ -1117,7 +1124,7 @@ class AstPrinter {
         });
 
       case ClosureExpr n:
-        _println('Closure(${n.params.map(_paramStr).join(", ")})');
+        _println('${n.isAsync ? "AsyncClosure" : "Closure"}(${n.params.map(_paramStr).join(", ")})');
         _indented(() => _visit(n.body));
 
       case MatchExpr n:
