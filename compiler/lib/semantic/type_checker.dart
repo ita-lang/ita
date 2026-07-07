@@ -349,6 +349,12 @@ class TypeChecker {
         for (final el in e.elements) {
           _infer(el, scope);
         }
+      case ast.TupleExpr e:
+        for (final el in e.elements) {
+          _infer(el, scope);
+        }
+      case ast.TupleIndexExpr e:
+        _infer(e.object, scope);
       case ast.RangeExpr e:
         _infer(e.start, scope);
         _infer(e.end, scope);

@@ -1174,6 +1174,10 @@ class Parser {
           }
           _consume(TokenType.rbrace, 'Expected "}"');
           expr = CopyWithExpr(expr, fields, expr.line, expr.column);
+        } else if (_check(TokenType.intLiteral)) {
+          // Acesso posicional a tupla: t.0, t.1 (índice 0-based)
+          final idxTok = _advance();
+          expr = TupleIndexExpr(expr, idxTok.literal as int, expr.line, expr.column);
         } else {
           // Member access
           final member = _consume(TokenType.identifier, 'Expected member name').lexeme;
@@ -1405,11 +1409,23 @@ class Parser {
       return _closure();
     }
 
-    // Parenthesized expression
+    // Parenthesized expression OU tupla.
+    //   (e)        → agrupamento (devolve e)
+    //   (a, b, ...)→ TupleExpr
+    // (Closures já foram desviadas acima por _isClosureStart.)
     _advance(); // consume (
-    final expr = _expression();
+    final first = _expression();
+    if (_check(TokenType.comma)) {
+      final elements = <Expression>[first];
+      while (_match(TokenType.comma)) {
+        if (_check(TokenType.rparen)) break; // tolera vírgula final
+        elements.add(_expression());
+      }
+      _consume(TokenType.rparen, 'Expected ")"');
+      return TupleExpr(elements, start.line, start.column);
+    }
     _consume(TokenType.rparen, 'Expected ")"');
-    return expr;
+    return first;
   }
 
   bool _isClosureStart() {
@@ -1690,17 +1706,36 @@ class Parser {
     }
 
     if (_match(TokenType.lparen)) {
-      // Function type: (Int, Int) -> Bool
-      final paramTypes = <TypeAnnotation>[];
+      // Desambiguação de `(...)` em posição de tipo:
+      //   (A, B) -> C   → FunctionType (tem `->` depois do `)`)
+      //   (A, B)        → TupleType    (>= 2 elementos, sem `->`)
+      //   (A)           → agrupamento  (1 elemento, sem `->`) → devolve A
+      final lparenTok = _previous();
+      final elemTypes = <TypeAnnotation>[];
       if (!_check(TokenType.rparen)) {
         do {
-          paramTypes.add(_typeAnnotation());
+          if (_check(TokenType.rparen)) break; // tolera vírgula final
+          elemTypes.add(_typeAnnotation());
         } while (_match(TokenType.comma));
       }
       _consume(TokenType.rparen, 'Expected ")"');
-      _consume(TokenType.arrow, 'Expected "->"');
-      final returnType = _typeAnnotation();
-      type = FunctionType(paramTypes, returnType, token.line, token.column);
+
+      if (_match(TokenType.arrow)) {
+        // Function type: (Int, Int) -> Bool
+        final returnType = _typeAnnotation();
+        type = FunctionType(elemTypes, returnType, lparenTok.line, lparenTok.column);
+      } else if (elemTypes.length >= 2) {
+        // Tuple type: (Int, String)
+        type = TupleType(elemTypes, lparenTok.line, lparenTok.column);
+      } else if (elemTypes.length == 1) {
+        // Agrupamento: (T) == T
+        type = elemTypes[0];
+      } else {
+        // `()` sozinho só faz sentido como `() -> T`; força o erro do `->`.
+        _consume(TokenType.arrow, 'Expected "->" after "()"');
+        final returnType = _typeAnnotation();
+        type = FunctionType(elemTypes, returnType, lparenTok.line, lparenTok.column);
+      }
     } else {
       final name = _consume(TokenType.identifier, 'Expected type name');
       final typeArgs = <TypeAnnotation>[];

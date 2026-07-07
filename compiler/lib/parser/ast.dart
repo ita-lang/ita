@@ -569,6 +569,23 @@ class IndexExpr extends Expression {
   IndexExpr(this.object, this.index, super.line, super.column);
 }
 
+/// Construção de tupla: `(a, b, ...)` — compila para Dart RecordLiteral.
+/// Sempre tem >= 2 elementos (um único `(e)` é agrupamento).
+class TupleExpr extends Expression {
+  final List<Expression> elements;
+
+  TupleExpr(this.elements, super.line, super.column);
+}
+
+/// Acesso posicional a tupla: `t.0`, `t.1`, ... (índice 0-based no Itá).
+/// Mapeia para o getter posicional de Record `.$1`, `.$2` no Dart.
+class TupleIndexExpr extends Expression {
+  final Expression object;
+  final int index; // 0-based (Itá): .0 -> Dart .$1
+
+  TupleIndexExpr(this.object, this.index, super.line, super.column);
+}
+
 class AssignExpr extends Expression {
   final Expression target;
   final Token op; // =, +=, -=, *=, /=
@@ -861,6 +878,13 @@ class MutType extends TypeAnnotation {
   MutType(this.inner, super.line, super.column);
 }
 
+/// Tipo-tupla: `(A, B, ...)` — compila para Dart Record `(A, B, ...)`.
+/// Sempre tem >= 2 elementos (um único `(T)` é agrupamento e vira `T`).
+class TupleType extends TypeAnnotation {
+  final List<TypeAnnotation> elementTypes;
+  TupleType(this.elementTypes, super.line, super.column);
+}
+
 // ============================================================
 // AST Printer (debug)
 // ============================================================
@@ -1075,6 +1099,14 @@ class AstPrinter {
           _visit(n.index);
         });
 
+      case TupleExpr n:
+        _println('Tuple [${n.elements.length} elements]');
+        _indented(() { for (final e in n.elements) _visit(e); });
+
+      case TupleIndexExpr n:
+        _println('TupleIndex: .${n.index}');
+        _indented(() => _visit(n.object));
+
       case AssignExpr n:
         _println('Assign: ${n.op.lexeme}');
         _indented(() {
@@ -1232,6 +1264,7 @@ class AstPrinter {
         FunctionType n =>
           '(${n.paramTypes.map(_typeStr).join(", ")}) -> ${_typeStr(n.returnType)}',
         MutType n => 'mut ${_typeStr(n.inner)}',
+        TupleType n => '(${n.elementTypes.map(_typeStr).join(", ")})',
       };
 
   String _patternStr(Pattern p) => switch (p) {

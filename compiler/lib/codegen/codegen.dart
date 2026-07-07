@@ -2401,6 +2401,10 @@ class CodeGenerator {
         return _compileMember(e);
       case ast.IndexExpr e:
         return _compileIndex(e);
+      case ast.TupleExpr e:
+        return _compileTuple(e);
+      case ast.TupleIndexExpr e:
+        return _compileTupleIndex(e);
       case ast.AssignExpr e:
         return _compileAssign(e);
       case ast.ClosureExpr e:
@@ -9467,6 +9471,29 @@ class CodeGenerator {
       k.DynamicAccessKind.Dynamic, obj, k.Name('[]'), k.Arguments([index]));
   }
 
+  /// Construção de tupla `(a, b, ...)` → Dart RecordLiteral.
+  /// Sem fase de inferência, os campos são tipados como `dynamic`; o Record
+  /// resultante carrega os tipos de runtime dos valores (ex.: `(int, String)`).
+  k.Expression _compileTuple(ast.TupleExpr expr) {
+    final positional = expr.elements.map(_compileExpr).toList();
+    final fieldTypes = List<k.DartType>.filled(
+      positional.length, const k.DynamicType());
+    final recordType = k.RecordType(
+      fieldTypes, const <k.NamedType>[], k.Nullability.nonNullable);
+    return k.RecordLiteral(
+      positional, const <k.NamedExpression>[], recordType);
+  }
+
+  /// Acesso posicional `t.0`, `t.1` → getter de Record `.$1`, `.$2`.
+  /// Itá é 0-based; Dart é 1-based, daí `index + 1`. Usamos acesso dinâmico
+  /// (o receiver é tipado como `dynamic` no codegen), evitando precisar da
+  /// aridade estática da tupla — o VM resolve `.$N` nativamente no Record.
+  k.Expression _compileTupleIndex(ast.TupleIndexExpr expr) {
+    final obj = _compileExpr(expr.object);
+    return k.DynamicGet(
+      k.DynamicAccessKind.Dynamic, obj, k.Name('\$${expr.index + 1}'));
+  }
+
   k.Expression _compileAssign(ast.AssignExpr expr) {
     if (expr.target is ast.IdentifierExpr) {
       final name = (expr.target as ast.IdentifierExpr).name;
@@ -10224,6 +10251,12 @@ class CodeGenerator {
 
       case ast.MutType t:
         return _resolveType(t.inner);
+
+      case ast.TupleType t:
+        // Tupla Itá → Dart Record posicional. Ex.: (Int, String) → (int, String).
+        final positional = t.elementTypes.map(_resolveType).toList();
+        return k.RecordType(
+          positional, const <k.NamedType>[], k.Nullability.nonNullable);
     }
   }
 
