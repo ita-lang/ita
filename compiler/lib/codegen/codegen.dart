@@ -269,6 +269,12 @@ class CodeGenerator {
   // Campos de cada tipo (nome do tipo → lista de nomes de campos)
   final Map<String, List<String>> _typeFields = {};
 
+  // Tipos DECLARADOS dos campos (nome do tipo → nome do campo → anotação).
+  // Usado para reconhecer `self.data`/`obj.items` como Map/List no dispatch de
+  // métodos built-in de coleção — funciona MESMO em módulos importados (a fase
+  // semântica não popula a side-table de módulos, mas a AST dos campos, sim).
+  final Map<String, Map<String, ast.TypeAnnotation>> _typeFieldTypes = {};
+
   // Enum: nome do enum → { nome do variant → Kernel Class }
   final Map<String, Map<String, k.Class>> _enumVariants = {};
 
@@ -294,6 +300,10 @@ class CodeGenerator {
 
   // Classe atual sendo compilada (para self/this)
   k.Class? _currentClass;
+
+  // Nome do TIPO (struct/class) cujo corpo/extension está sendo compilado —
+  // resolve `self.<campo>` ao tipo declarado do campo via [_typeFieldTypes].
+  String? _currentTypeName;
 
   // Tipo de retorno das funções (pra inferência)
   final Map<String, String> _fnReturnTypes = {};
@@ -873,6 +883,9 @@ class CodeGenerator {
       fieldNames.add(f.name);
     }
     _typeFields[decl.name] = fieldNames;
+    _typeFieldTypes[decl.name] = {
+      for (final f in decl.fields) f.name: f.type,
+    };
 
     // Constructor com named parameters
     final ctorParams = <k.VariableDeclaration>[];
@@ -947,6 +960,9 @@ class CodeGenerator {
       fieldNames.add(f.name);
     }
     _typeFields[decl.name] = fieldNames;
+    _typeFieldTypes[decl.name] = {
+      for (final f in decl.fields) f.name: f.type,
+    };
 
     // Constructor
     final ctorParams = <k.VariableDeclaration>[];
@@ -1988,6 +2004,7 @@ class CodeGenerator {
         type: _resolveType(p.type), isFinal: true);
       params.add(param);
       _declareVar(p.name, param);
+      _trackListMapParam(p);
     }
 
     // Named params (após ;) — defaults são aplicados via ?? no corpo
@@ -2211,6 +2228,7 @@ class CodeGenerator {
     if (method.body == null) return;
 
     _currentClass = cls;
+    _currentTypeName = typeName;
     _pushScope();
 
     // Parâmetros do método
@@ -2223,6 +2241,7 @@ class CodeGenerator {
       );
       params.add(param);
       _declareVar(p.name, param);
+      _trackListMapParam(p);
     }
 
     k.Statement body;
@@ -2240,6 +2259,7 @@ class CodeGenerator {
 
     _popScope();
     _currentClass = null;
+    _currentTypeName = null;
   }
 
   // ============================================================
@@ -2410,6 +2430,12 @@ class CodeGenerator {
     } else if (stmt.value is ast.MapLiteralExpr) {
       _varTypes[stmt.name] = 'Map';
     }
+    // Propaga List/Map por outras fontes (campo Map de struct, cadeia imutável
+    // como `{..}.set(..)`), pra que usos seguintes do binding sejam reconhecidos.
+    if (!_varTypes.containsKey(stmt.name) && stmt.value != null) {
+      final ct = _listMapReceiver(stmt.value!);
+      if (ct != null) _varTypes[stmt.name] = ct;
+    }
     return varDecl;
   }
 
@@ -2429,6 +2455,14 @@ class CodeGenerator {
       isFinal: false,
     );
     _declareVar(stmt.name, varDecl);
+    // Rastreia List/Map (inclui `var merged = self.data`, `var h = ...`) pra
+    // que reatribuições e chamadas de método subsequentes sejam reconhecidas.
+    if (stmt.type is ast.NamedType) {
+      _varTypes[stmt.name] = (stmt.type as ast.NamedType).name;
+    } else if (stmt.value != null) {
+      final ct = _listMapReceiver(stmt.value!);
+      if (ct != null) _varTypes[stmt.name] = ct;
+    }
     return varDecl;
   }
 
@@ -9455,6 +9489,20 @@ class CodeGenerator {
         }
       }
 
+      // === Métodos built-in de instância de List/Map (imutáveis) ===
+      // list.set/slice, map.set/get/keys — que a stdlib usa e que, sem isso,
+      // viravam DynamicInvocation → NoSuchMethodError (Dart não tem `set`/
+      // `slice`/`get` nesses tipos). SÓ intercepta quando o receiver é
+      // POSITIVAMENTE List/Map (fase semântica p/ campos/params tipados +
+      // heurística de literais/vars). Structs de usuário com métodos homônimos
+      // (Config.get, Cache.set, OrderedMap.keys, …) resolvem para null aqui e
+      // seguem intactos pelo dispatch de método de usuário (regra de ouro).
+      final collRecv = _listMapReceiver(callee.object);
+      if (collRecv != null) {
+        final lowered = _lowerCollectionMethod(collRecv, callee.member, args, obj);
+        if (lowered != null) return lowered;
+      }
+
       // Check built-in methods (Option.map, Result.unwrapOr, etc)
       // Tentar determinar o tipo do receiver pra escolher o builtin correto
       final receiverType = _inferReceiverType(callee.object);
@@ -9650,6 +9698,138 @@ class CodeGenerator {
     // List literal direto: [1,2,3].map(...)
     if (expr is ast.ListLiteralExpr) {
       return 'List';
+    }
+    return null;
+  }
+
+  /// Retorna `'List'` | `'Map'` | `null`, indicando quando [obj] é
+  /// POSITIVAMENTE uma List/Map em runtime. Combina três fontes, sem nunca
+  /// devolver nome de struct/class (que devem cair fora → método de usuário):
+  ///
+  ///  1. Fase semântica — tipo resolvido de campo/param/var TIPADA
+  ///     (`self.data: Map<..>` → [sem.MapType]; `items: List<..>` → [sem.ListType]).
+  ///  2. Literais diretos (`[..]`, `{..}`) e vars rastreadas em [_varTypes].
+  ///  3. Cadeias imutáveis conhecidas — o tipo do resultado herda da base:
+  ///     `list.set/slice → List`, `map.set → Map`, `map.keys → List`.
+  String? _listMapReceiver(ast.Expression obj) {
+    // 1. Fase semântica (cobre campos de struct, params e vars tipadas).
+    final t = _analysis?.typeOf(obj);
+    if (t is sem.ListType) return 'List';
+    if (t is sem.MapType) return 'Map';
+    // 2. Literais e vars rastreadas.
+    if (obj is ast.ListLiteralExpr) return 'List';
+    if (obj is ast.MapLiteralExpr) return 'Map';
+    if (obj is ast.IdentifierExpr) {
+      final vt = _varTypes[obj.name];
+      if (vt == 'List' || vt == 'Map') return vt;
+    }
+    // 2b. Campo de struct/class: `self.data`, `cfg.items`. Resolve o tipo
+    //     DECLARADO do campo — alcança módulos importados (a fase semântica
+    //     não), cobrindo o grosso da stdlib (Config.data, Stack.items, …).
+    if (obj is ast.MemberExpr && obj.object is ast.IdentifierExpr) {
+      final baseName = (obj.object as ast.IdentifierExpr).name;
+      final typeName = baseName == 'self' ? _currentTypeName : _varTypes[baseName];
+      if (typeName != null) {
+        final ft = _typeFieldTypes[typeName]?[obj.member];
+        if (ft is ast.NamedType) {
+          if (ft.name == 'List') return 'List';
+          if (ft.name == 'Map') return 'Map';
+        }
+      }
+    }
+    // 3. Cadeia imutável: o resultado de um método de coleção conhecido é, ele
+    //    próprio, List/Map — permite `{..}.set(..).get(..)` e afins.
+    if (obj is ast.CallExpr && obj.callee is ast.MemberExpr) {
+      final m = obj.callee as ast.MemberExpr;
+      final base = _listMapReceiver(m.object);
+      if (base == 'List' && (m.member == 'set' || m.member == 'slice')) return 'List';
+      if (base == 'Map' && m.member == 'set') return 'Map';
+      if (base == 'Map' && m.member == 'keys') return 'List';
+    }
+    return null;
+  }
+
+  /// Rastreia parâmetros tipados como List/Map em [_varTypes], para que
+  /// `param.set(..)`/`param.slice(..)` (ex.: `chunk(list: List<T>)`) sejam
+  /// reconhecidos. Só grava List/Map — nunca outros tipos (blast radius mínimo).
+  void _trackListMapParam(ast.Param p) {
+    final t = p.type;
+    if (t is ast.NamedType && (t.name == 'List' || t.name == 'Map')) {
+      _varTypes[p.name] = t.name;
+    } else {
+      // [_varTypes] é global (não escopado): limpa um List/Map STALE deixado por
+      // um param homônimo de outra função, senão este param herdaria o tipo
+      // errado e `p.set(..)` seria lowerado como coleção indevidamente.
+      final ex = _varTypes[p.name];
+      if (ex == 'List' || ex == 'Map') _varTypes.remove(p.name);
+    }
+  }
+
+  /// Lowering dos métodos built-in de instância de List/Map. [recv] já é
+  /// `'List'`/`'Map'` (garantido por [_listMapReceiver]). Devolve `null` quando
+  /// `(recv, member)` não é um dos casos suportados → o chamador segue o
+  /// dispatch normal. IMUTÁVEL: todo método retorna uma coleção NOVA.
+  ///
+  /// Node-safety: [obj] e cada `args[i]` são consumidos no máx. UMA vez como
+  /// inicializador de temp; os usos seguintes vão por `VariableGet` fresco.
+  k.Expression? _lowerCollectionMethod(
+      String recv, String member, List<k.Expression> args, k.Expression obj) {
+    if (recv == 'List') {
+      switch (member) {
+        // list.set(i, v) → cópia com o índice i trocado (original intacto).
+        //   var _ls = obj.toList(); _ls[i] = v; => _ls
+        case 'set' when args.length == 2:
+          final tmp = _dv('_ls', _di(obj, 'toList'), isFinal: true);
+          return k.BlockExpression(
+            k.Block([
+              tmp,
+              k.ExpressionStatement(_di(_vg(tmp), '[]=', [args[0], args[1]])),
+            ]),
+            _vg(tmp));
+        // list.slice(a[, b]) → sublista [a, b) (ou de a até o fim). Casa 1:1
+        // com Dart List.sublist(start, [end]).
+        case 'slice' when args.length == 1 || args.length == 2:
+          return _di(obj, 'sublist', args);
+      }
+      return null;
+    }
+    if (recv == 'Map') {
+      switch (member) {
+        // map.set(k, v) → NOVO map com k=v (add/update), original intacto.
+        //   var _ms = <dynamic,dynamic>{}; _ms.addAll(obj); _ms[k] = v; => _ms
+        case 'set' when args.length == 2:
+          final tmp = _dv('_ms',
+            k.MapLiteral([], keyType: const k.DynamicType(),
+              valueType: const k.DynamicType()),
+            isFinal: true);
+          return k.BlockExpression(
+            k.Block([
+              tmp,
+              k.ExpressionStatement(_di(_vg(tmp), 'addAll', [obj])),
+              k.ExpressionStatement(_di(_vg(tmp), '[]=', [args[0], args[1]])),
+            ]),
+            _vg(tmp));
+        // map.get(k) → Option<V>: .some(v) se a chave existe, senão .none.
+        // Usa containsKey (não `== null`) p/ distinguir valor nulo de ausência.
+        case 'get' when args.length == 1:
+          final mg = _dv('_mg', obj, isFinal: true);
+          final mk = _dv('_mk', args[0], isFinal: true);
+          final some = k.ConstructorInvocation(_constructors['Option_some']!,
+            k.Arguments([], named: [
+              k.NamedExpression('value', _di(_vg(mg), '[]', [_vg(mk)])),
+            ]));
+          final none = k.ConstructorInvocation(_constructors['Option_none']!,
+            k.Arguments.empty());
+          return k.BlockExpression(
+            k.Block([mg, mk]),
+            k.ConditionalExpression(
+              _di(_vg(mg), 'containsKey', [_vg(mk)]),
+              some, none, const k.DynamicType()));
+        // map.keys() → List das chaves (Dart .keys é Iterable → .toList()).
+        case 'keys' when args.isEmpty:
+          return _di(_dg(obj, 'keys'), 'toList');
+      }
+      return null;
     }
     return null;
   }
