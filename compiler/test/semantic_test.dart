@@ -39,8 +39,51 @@ Token _tok(TokenType t, String lexeme) =>
 IntLiteralExpr _int(int v) => IntLiteralExpr(v, 1, 1);
 FloatLiteralExpr _float(double v) => FloatLiteralExpr(v, 1, 1);
 
+NamedType _named(String n) => NamedType(n, line: 1, column: 1);
+
+/// struct Point { x: Float, y: Float }
+StructDecl _pointStruct() => StructDecl(
+      name: 'Point',
+      fields: [
+        FieldDecl(name: 'x', type: _named('Float')),
+        FieldDecl(name: 'y', type: _named('Float')),
+      ],
+      line: 1,
+      column: 1,
+    );
+
+/// enum Shape { circle(radius: Float), rect(width: Float, height: Float), point }
+EnumDecl _shapeEnum() => EnumDecl(
+      name: 'Shape',
+      cases: [
+        EnumCase(name: 'circle', params: [Param(name: 'radius', type: _named('Float'))]),
+        EnumCase(name: 'rect', params: [
+          Param(name: 'width', type: _named('Float')),
+          Param(name: 'height', type: _named('Float')),
+        ]),
+        EnumCase(name: 'point'),
+      ],
+      line: 1,
+      column: 1,
+    );
+
+/// Constrói `fn f(s: Shape) { match s { <arms> } }` sobre o enum Shape e roda o
+/// analyzer, devolvendo o resultado — usado pelos testes de exaustividade.
+AnalysisResult _runMatch(List<MatchArm> arms) {
+  final match = MatchExpr(IdentifierExpr('s', 1, 1), arms, 1, 1);
+  final fn = FnDecl(
+    name: 'f',
+    params: [Param(name: 's', type: _named('Shape'))],
+    body: BlockStmt([ExprStmt(match, 1, 1)], 1, 1),
+    line: 1,
+    column: 1,
+  );
+  final prog = Program([_shapeEnum(), fn], 1, 1);
+  return SemanticAnalyzer().run(prog);
+}
+
 void main() {
-  print('=== Itá Semantic Test (Fase 4, Fatia 1) ===\n');
+  print('=== Itá Semantic Test (Fase 4, Fatias 1 e 2) ===\n');
 
   // ---- Inferência de expressões (via TypeChecker direto) ----
   {
@@ -153,6 +196,133 @@ void main() {
         'Int NÃO aceita String');
     check(const OptionalType(IntType()).isAssignableFrom(const NilType()),
         'Int? aceita nil');
+  }
+
+  print('\n=== Fatia 2: tipos de usuário (struct/enum) ===\n');
+
+  // ---- construção + acesso a membro + copy-with (struct Point) ----
+  {
+    // let p  = Point(x: 1.0, y: 2.0)
+    // let px = p.x
+    // let p2 = p.{ x: 9.0 }
+    final ctor = CallExpr(
+      IdentifierExpr('Point', 1, 1),
+      [
+        Argument(label: 'x', value: _float(1.0)),
+        Argument(label: 'y', value: _float(2.0)),
+      ],
+      1,
+      1,
+    );
+    final letP = LetStmt(name: 'p', value: ctor, line: 1, column: 1);
+
+    final member = MemberExpr(IdentifierExpr('p', 1, 1), 'x', 1, 1);
+    final letPx = LetStmt(name: 'px', value: member, line: 1, column: 1);
+
+    final cw = CopyWithExpr(IdentifierExpr('p', 1, 1),
+        [Argument(label: 'x', value: _float(9.0))], 1, 1);
+    final letP2 = LetStmt(name: 'p2', value: cw, line: 1, column: 1);
+
+    final prog = Program([
+      _pointStruct(),
+      StmtDecl(letP, line: 1, column: 1),
+      StmtDecl(letPx, line: 1, column: 1),
+      StmtDecl(letP2, line: 1, column: 1),
+    ], 1, 1);
+    final res = SemanticAnalyzer().run(prog);
+
+    final ctorType = res.typeOf(ctor);
+    check(ctorType is StructType && ctorType.name == 'Point',
+        'Point(x: 1, y: 2) -> StructType(Point)');
+    check(res.typeOf(member) is FloatType, 'p.x -> Float (tipo do campo)');
+    final cwType = res.typeOf(cw);
+    check(cwType is StructType && cwType.name == 'Point',
+        'p.{ x: 9 } (copy-with) -> StructType(Point)');
+    check(res.typeOf(cw) == res.typeOf(ctor),
+        'copy-with preserva o tipo do source');
+    check(!res.hasErrors, 'construção/membro/copy-with válidos -> sem erros');
+  }
+
+  // ---- copy-with com label inexistente -> 1 erro ----
+  {
+    final cwBad = CopyWithExpr(IdentifierExpr('p', 1, 1),
+        [Argument(label: 'z', value: _float(9.0))], 1, 1);
+    final letP = LetStmt(
+        name: 'p',
+        value: CallExpr(IdentifierExpr('Point', 1, 1),
+            [Argument(label: 'x', value: _float(1.0)), Argument(label: 'y', value: _float(2.0))], 1, 1),
+        line: 1,
+        column: 1);
+    final letBad = LetStmt(name: 'bad', value: cwBad, line: 1, column: 1);
+    final prog = Program([
+      _pointStruct(),
+      StmtDecl(letP, line: 1, column: 1),
+      StmtDecl(letBad, line: 1, column: 1),
+    ], 1, 1);
+    final res = SemanticAnalyzer().run(prog);
+    check(res.errors.length == 1,
+        'copy-with p.{ z: 9 } com campo inexistente -> 1 erro');
+  }
+
+  // ---- match exaustivo sobre enum -> sem erro ----
+  {
+    final res = _runMatch([
+      MatchArm(
+          pattern: EnumPattern(null, 'circle', [IdentifierPattern('r', 1, 1)], 1, 1),
+          body: _int(1)),
+      MatchArm(
+          pattern: EnumPattern(
+              null, 'rect', [IdentifierPattern('w', 1, 1), IdentifierPattern('h', 1, 1)], 1, 1),
+          body: _int(2)),
+      MatchArm(pattern: EnumPattern(null, 'point', const [], 1, 1), body: _int(3)),
+    ]);
+    check(!res.hasErrors, 'match exaustivo (circle/rect/point) -> sem erro');
+  }
+
+  // ---- match faltando variante (sem wildcard) -> 1 erro ----
+  {
+    final res = _runMatch([
+      MatchArm(
+          pattern: EnumPattern(null, 'circle', [IdentifierPattern('r', 1, 1)], 1, 1),
+          body: _int(1)),
+      MatchArm(
+          pattern: EnumPattern(
+              null, 'rect', [IdentifierPattern('w', 1, 1), IdentifierPattern('h', 1, 1)], 1, 1),
+          body: _int(2)),
+      // falta .point, sem wildcard
+    ]);
+    check(res.errors.length == 1, 'match faltando .point (sem _) -> 1 erro');
+    check(res.hasErrors, 'match não-exaustivo -> hasErrors true');
+  }
+
+  // ---- match com wildcard -> exaustivo -> sem erro ----
+  {
+    final res = _runMatch([
+      MatchArm(
+          pattern: EnumPattern(null, 'circle', [IdentifierPattern('r', 1, 1)], 1, 1),
+          body: _int(1)),
+      MatchArm(pattern: WildcardPattern(1, 1), body: _int(0)),
+    ]);
+    check(!res.hasErrors, 'match .circle + _ (wildcard) -> sem erro');
+  }
+
+  // ---- guard NÃO conta como cobertura total -> 1 erro ----
+  {
+    final res = _runMatch([
+      MatchArm(
+          pattern: EnumPattern(null, 'circle', [IdentifierPattern('r', 1, 1)], 1, 1),
+          body: _int(1)),
+      MatchArm(
+          pattern: EnumPattern(
+              null, 'rect', [IdentifierPattern('w', 1, 1), IdentifierPattern('h', 1, 1)], 1, 1),
+          body: _int(2)),
+      // .point coberto SÓ por um wildcard com guard -> não conta
+      MatchArm(
+          pattern: WildcardPattern(1, 1),
+          guard: BoolLiteralExpr(true, 1, 1),
+          body: _int(0)),
+    ]);
+    check(res.hasErrors, 'wildcard COM guard não é catch-all -> erro (falta .point)');
   }
 
   print('');

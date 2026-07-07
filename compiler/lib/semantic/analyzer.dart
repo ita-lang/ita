@@ -4,13 +4,19 @@
 //
 // CONTEXTO EDUCACIONAL:
 // ---------------------
-// A análise semântica roda em DUAS PASSADAS sobre o `Program`:
+// A análise semântica roda em TRÊS PASSADAS sobre o `Program`:
 //
-//   1. COLLECT — registra os símbolos TOP-LEVEL (funções e tipos) no escopo
+//   1. COLLECT — registra os NOMES top-level (funções e tipos) no escopo
 //      global. Fazer isto antes permite referência mútua/forward: `fn a()`
 //      pode chamar `fn b()` declarada depois, e tipos podem se referenciar.
+//      Os tipos entram aqui ainda "vazios" (sem fields/variants).
 //
-//   2. CHECK — percorre os CORPOS das funções (e statements top-level em modo
+//   2. RESOLVE BODIES — agora que TODOS os nomes de tipo existem, preenche os
+//      `fields` (struct/class) e `variants` (enum) de cada TypeSymbol,
+//      resolvendo as anotações dos membros. Separar desta forma é o que torna
+//      seguras as forward-refs entre tipos (`struct A { b: B }` com `B` abaixo).
+//
+//   3. CHECK — percorre os CORPOS das funções (e statements top-level em modo
 //      script), abrindo escopos-filho e delegando ao TypeChecker.
 //
 // Retorna um `AnalysisResult` com a side-table de tipos, os símbolos e os
@@ -22,6 +28,7 @@
 // ============================================================================
 
 import '../parser/ast.dart' as ast;
+import 'resolved_type.dart';
 import 'scope.dart';
 import 'symbol.dart';
 import 'type_checker.dart';
@@ -37,6 +44,7 @@ class SemanticAnalyzer {
     final global = Scope();
 
     _collect(program, global, result);
+    _resolveTypeBodies(program, global, result);
     _check(program, global, result);
 
     return result;
@@ -89,7 +97,79 @@ class SemanticAnalyzer {
     result.setSymbol(node, sym);
   }
 
-  // ---- Passada 2: checagem dos corpos ----
+  // ---- Passada 2: preenche fields (struct/class) e variants (enum) ----
+  //
+  // Só agora TODOS os nomes de tipo estão no escopo, então `resolveAnnotation`
+  // dos membros enxerga forward-refs. Substituímos o TypeSymbol "vazio" por um
+  // completo (imutável) tanto no escopo quanto na side-table de símbolos.
+
+  void _resolveTypeBodies(
+      ast.Program program, Scope global, AnalysisResult result) {
+    for (final decl in program.declarations) {
+      switch (decl) {
+        case ast.StructDecl s:
+          _fillAggregate(s, s.name, TypeKind.struct, s.fields, s.line, s.column,
+              global, result);
+        case ast.ClassDecl s:
+          _fillAggregate(s, s.name, TypeKind.class_, s.fields, s.line, s.column,
+              global, result);
+        case ast.EnumDecl s:
+          _fillEnum(s, global, result);
+        default:
+          break;
+      }
+    }
+  }
+
+  void _fillAggregate(
+    ast.Declaration node,
+    String name,
+    TypeKind kind,
+    List<ast.FieldDecl> declFields,
+    int line,
+    int column,
+    Scope global,
+    AnalysisResult result,
+  ) {
+    final fields = <String, ResolvedType>{};
+    for (final f in declFields) {
+      // FieldDecl.type é não-nulo; resolveAnnotation resolve contra o global
+      // (que já tem todos os nomes de tipo registrados).
+      fields[f.name] = resolveAnnotation(f.type, global);
+    }
+    final sym = TypeSymbol(
+        name: name, kind: kind, fields: fields, line: line, column: column);
+    _replaceType(node, sym, global, result);
+  }
+
+  void _fillEnum(
+      ast.EnumDecl decl, Scope global, AnalysisResult result) {
+    final variants = <String, List<ResolvedType>>{};
+    for (final c in decl.cases) {
+      // Param.type é nullable → resolveAnnotation(null) devolve UnknownType.
+      variants[c.name] = [
+        for (final p in c.params) resolveAnnotation(p.type, global),
+      ];
+    }
+    final sym = TypeSymbol(
+        name: decl.name,
+        kind: TypeKind.enum_,
+        variants: variants,
+        line: decl.line,
+        column: decl.column);
+    _replaceType(decl, sym, global, result);
+  }
+
+  /// Troca o TypeSymbol "vazio" (passada 1) pelo completo, no escopo e na
+  /// side-table. A identidade nominal (== por nome) mantém as forward-refs já
+  /// resolvidas válidas.
+  void _replaceType(
+      ast.Declaration node, TypeSymbol sym, Scope global, AnalysisResult result) {
+    global.symbols[sym.name] = sym;
+    result.setSymbol(node, sym);
+  }
+
+  // ---- Passada 3: checagem dos corpos ----
 
   void _check(ast.Program program, Scope global, AnalysisResult result) {
     final checker = TypeChecker(result);

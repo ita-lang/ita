@@ -81,32 +81,47 @@ final class FunctionSymbol extends Symbol {
 
 /// Tipo definido pelo usuário (struct/class/enum/...).
 ///
-/// ESQUELETO nesta fatia: [fieldNames]/[variantNames] ficam vazios; a Fatia 2
-/// os preenche a partir da declaração. `type` já aponta para o
-/// [ResolvedType] correspondente (StructType/ClassType/EnumType).
+/// A partir da Fatia 2, [fields] (struct/class) e [variants] (enum) carregam os
+/// tipos RESOLVIDOS dos membros — preenchidos na 2ª passada do analyzer, depois
+/// que todos os NOMES de tipo já existem (permite forward-refs entre tipos).
+/// `type` aponta para o [ResolvedType] correspondente (StructType/ClassType/
+/// EnumType), que EMBUTE os mesmos [fields]/[variants].
+///
+/// A ORDEM de declaração é preservada em ambos os mapas (Map literal do Dart é
+/// ordenado) — a exaustividade de match depende disso para listar variantes.
 final class TypeSymbol extends Symbol {
   final TypeKind kind;
-  final List<String> fieldNames; // Fatia 2
-  final List<String> variantNames; // Fatia 2 (enums)
+
+  /// Struct/class: campo → tipo. Vazio para enums.
+  final Map<String, ResolvedType> fields;
+
+  /// Enum: variante → tipos dos valores associados. Vazio para struct/class.
+  final Map<String, List<ResolvedType>> variants;
 
   TypeSymbol({
     required String name,
     required this.kind,
-    this.fieldNames = const [],
-    this.variantNames = const [],
+    this.fields = const {},
+    this.variants = const {},
     required int line,
     required int column,
   }) : super(
           name: name,
-          type: _typeFor(kind, name),
+          type: _typeFor(kind, name, fields, variants),
           line: line,
           column: column,
         );
 
-  static ResolvedType _typeFor(TypeKind kind, String name) => switch (kind) {
-        TypeKind.struct => StructType(name),
-        TypeKind.class_ => ClassType(name),
-        TypeKind.enum_ => EnumType(name),
+  static ResolvedType _typeFor(
+    TypeKind kind,
+    String name,
+    Map<String, ResolvedType> fields,
+    Map<String, List<ResolvedType>> variants,
+  ) =>
+      switch (kind) {
+        TypeKind.struct => StructType(name, fields),
+        TypeKind.class_ => ClassType(name, fields),
+        TypeKind.enum_ => EnumType(name, variants),
         // trait/alias: sem representação dedicada ainda → rede de segurança.
         TypeKind.trait || TypeKind.alias => const UnknownType(),
       };
