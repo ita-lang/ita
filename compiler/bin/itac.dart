@@ -225,6 +225,12 @@ void compile(String sourcePath, String outputPath, String platform) {
       ));
     }
     DiagnosticReporter.printSummary(codegen.errors.length, 0);
+    // GATE: erros de codegen (ex.: símbolo Undefined) abortam a compilação —
+    // não gera .dill nem executa. Antes o .dill era emitido mesmo com erros,
+    // gerando NoSuchMethodError/'call on null' em runtime. Espelha o gate
+    // semântico (analysis.hasErrors) acima. Afeta só run/build/legacy: `check`
+    // (cmdCheck) e o test-runner (compileQuiet) têm caminho próprio.
+    exit(1);
   }
 
   codegen.writeToFile(outputPath);

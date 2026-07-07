@@ -350,6 +350,13 @@ class CodeGenerator {
   final Set<ast.Declaration> _registeredImportTypeDecls = Set.identity();
   final Set<ast.Declaration> _compiledImportTypeDecls = Set.identity();
 
+  // Dedup de FUNÇÕES top-level NÃO expostas (privadas / fora do filtro) de um
+  // módulo importado. Elas são registradas/compiladas sob o nome BARE só para
+  // que o dispatch interno do módulo resolva (uma `pub` chamando um helper `_x`).
+  // Mesma justificativa de identidade de nó dos tipos acima (módulo importado 2×).
+  final Set<ast.Declaration> _registeredImportPrivateFns = Set.identity();
+  final Set<ast.Declaration> _compiledImportPrivateFns = Set.identity();
+
   // Modo-lib: quando `false`, a ausência de `fn main()` NÃO é erro (uma
   // biblioteca — ex.: os módulos da stdlib — é válida e compilável sem
   // entrypoint). `true` (default) preserva o comportamento de programa: todo
@@ -1241,6 +1248,26 @@ class CodeGenerator {
               isStream: d.isStream, typeParams: d.typeParams, body: d.body,
               line: d.line, column: d.column,
             ));
+          } else if (!_functions.containsKey(d.name) &&
+              _registeredImportPrivateFns.add(d)) {
+            // Funções top-level NÃO expostas ao consumidor (privadas, sem `pub`,
+            // OU públicas fora do filtro) são registradas sob o nome BARE para
+            // que as chamadas de DENTRO do módulo resolvam (ex.: uma `pub`
+            // chamando o helper `_padInt`). Espelha o registro incondicional de
+            // struct/extension acima: o gate de `pub` continua valendo para o
+            // que é EXPOSTO ao consumidor (prefix/alias só se aplicam ao ramo
+            // acima), mas o dispatch interno precisa de TODAS as top-level fns.
+            // O guard `!_functions.containsKey` evita registrar 2× o mesmo nome
+            // quando o módulo é importado várias vezes com filtros diferentes
+            // (ex.: modules.tu importa "math" p/ {add,...} e depois p/ {Vector}:
+            // no 2º import `add` cai aqui mas já está registrado → pularia sem
+            // o guard geraria "already bound" na canonicalização do Kernel).
+            _registerFunction(ast.FnDecl(
+              name: d.name, params: d.params, namedParams: d.namedParams,
+              returnType: d.returnType, isPublic: false, isAsync: d.isAsync,
+              isStream: d.isStream, typeParams: d.typeParams, body: d.body,
+              line: d.line, column: d.column,
+            ));
           }
         case ast.StructDecl d:
           // Tipos (struct) sao registrados independentemente de `pub`/filtro.
@@ -1253,29 +1280,22 @@ class CodeGenerator {
           // nome bare (import de tipo nunca aplicou prefix/alias).
           if (_registeredImportTypeDecls.add(d)) _registerStruct(d);
         case ast.ClassDecl d:
-          name = d.name;
-          isPublic = d.isPublic;
-          if (_shouldImport(name, isPublic, filter)) {
-            _registerClassDecl(d);
-          }
+          // Tipos (class) — mesmo tratamento incondicional do struct: uma classe
+          // interna pode ser dependência da API pública do módulo. Dedup por nó.
+          if (_registeredImportTypeDecls.add(d)) _registerClassDecl(d);
         case ast.EnumDecl d:
-          name = d.name;
-          isPublic = d.isPublic;
-          if (_shouldImport(name, isPublic, filter)) {
-            _registerEnum(d);
-          }
+          // Enums (ADT) são TIPOS e são registrados incondicionalmente — igual a
+          // struct/class. Um enum privado (ex.: LogLevel, SchemaRule) é dependência
+          // interna de métodos/funções públicas que fazem pattern-match nele; sem
+          // registrá-lo, os bindings das variantes (ex.: `.minLen(n)`) ficam
+          // "Undefined: n". Espelha o fluxo normal (compile() registra todo enum
+          // sem gate de `pub`). Dedup por identidade (módulo importado 2×).
+          if (_registeredImportTypeDecls.add(d)) _registerEnum(d);
         case ast.TraitDecl d:
-          name = d.name;
-          isPublic = d.isPublic;
-          if (_shouldImport(name, isPublic, filter)) {
-            _traitDecls[name] = d;
-          }
+          // Traits são tipos — registrados incondicionalmente (map idempotente).
+          _traitDecls[d.name] = d;
         case ast.ActorDecl d:
-          name = d.name;
-          isPublic = d.isPublic;
-          if (_shouldImport(name, isPublic, filter)) {
-            _registerActor(d);
-          }
+          if (_registeredImportTypeDecls.add(d)) _registerActor(d);
         case ast.ExtensionDecl d:
           // Extensions nao possuem `pub` (ast.ExtensionDecl nao tem isPublic):
           // seus metodos "pegam carona" no tipo alvo. Registramos os metodos
@@ -1304,9 +1324,34 @@ class CodeGenerator {
               line: d.line, column: d.column,
             ));
           }
+        case ast.FnDecl d
+            when _registeredImportPrivateFns.contains(d) &&
+                _compiledImportPrivateFns.add(d):
+          // Corpos das funções top-level NÃO expostas (privadas / fora do
+          // filtro), registradas sob o nome BARE no Pass 1. Só compila os nós
+          // que foram DE FATO registrados pelo ramo privado (contains) — assim
+          // uma fn pública compilada pelo case anterior não é recompilada aqui
+          // num segundo import. Sem compilar o corpo elas ficam como procedure
+          // vazia (FunctionNode(null)) → o consumidor gera .dill mas explode em
+          // runtime ('call on null').
+          if (_functions.containsKey(d.name)) {
+            _compileFnDecl(ast.FnDecl(
+              name: d.name, params: d.params, namedParams: d.namedParams,
+              returnType: d.returnType, isAsync: d.isAsync, isStream: d.isStream,
+              typeParams: d.typeParams, body: d.body,
+              line: d.line, column: d.column,
+            ));
+          }
         case ast.StructDecl d when _compiledImportTypeDecls.add(d):
           // Corpos de metodos dos structs importados (registrados sem gate acima).
           _compileStructMethods(d);
+        case ast.ClassDecl d when _compiledImportTypeDecls.add(d):
+          _compileClassMethods(d);
+        case ast.EnumDecl d when _compiledImportTypeDecls.add(d):
+          // Corpos de métodos de enums importados (enums podem ter métodos).
+          _compileEnumMethods(d);
+        case ast.ActorDecl d when _compiledImportTypeDecls.add(d):
+          _compileActorMethods(d);
         case ast.ExtensionDecl d
             when _classes.containsKey(d.targetName) &&
                 _compiledImportTypeDecls.add(d):
