@@ -345,6 +345,23 @@ class CodeGenerator {
   // Info de parâmetros de funções (função → lista de tipos dos params)
   final Map<String, List<ast.TypeAnnotation?>> _fnParamTypes = {};
 
+  // Assinatura de MÉTODOS de instância (tipo → método → tipos dos params).
+  // Alimenta a inferência de contexto do param de closure em chamadas de método
+  // (`app.get(path, (req) => ...)`): sabendo que `get` recebe `(Request)->Response`,
+  // o param `req` da closure é rastreado como `Request` (em vez de dynamic).
+  final Map<String, Map<String, List<ast.TypeAnnotation?>>> _methodParamTypes = {};
+
+  // Return type dos `static fn` (tipo → método → nome do tipo de retorno). Serve
+  // para rastrear o tipo de `let x = Type.factory()` (ex.: `App.new() -> App`),
+  // habilitando a resolução do receiver em `x.metodo(...)`.
+  final Map<String, Map<String, String>> _staticMethodReturnTypes = {};
+
+  // Tipos esperados dos parâmetros de uma ClosureExpr, empurrados por
+  // [_compileCall] logo antes de compilar um arg-closure cujo param declarado é
+  // um FunctionType concreto. Consumido (e limpo) imediatamente por
+  // [_compileClosure]. Null = sem contexto → params seguem dynamic (regra de ouro).
+  List<ast.TypeAnnotation>? _pendingClosureParamTypes;
+
   // Return type da função atual (para inferir .variant em return)
   ast.TypeAnnotation? _currentReturnType;
 
@@ -857,6 +874,23 @@ class CodeGenerator {
     }
   }
 
+  /// Registra a assinatura (tipos declarados dos params) e o return type dos
+  /// métodos de [typeName], alimentando a inferência de contexto do param de
+  /// closure ([_compileCall] → [_pendingClosureParamTypes]). Chamado na fase de
+  /// registro (Pass 1/2), tanto no fluxo normal quanto para módulos importados,
+  /// de modo que a assinatura esteja disponível antes de compilar qualquer corpo.
+  /// Idempotente (mesmo tipo pode ser visto por vários imports).
+  void _registerMethodSignatures(String typeName, List<ast.FnDecl> methods) {
+    final sigs = _methodParamTypes.putIfAbsent(typeName, () => {});
+    for (final m in methods) {
+      sigs[m.name] = m.params.map((p) => p.type).toList();
+      if (m.isStatic && m.returnType is ast.NamedType) {
+        (_staticMethodReturnTypes[typeName] ??= {})[m.name] =
+            (m.returnType as ast.NamedType).name;
+      }
+    }
+  }
+
   void _registerStruct(ast.StructDecl decl) {
     // Criar TypeParameters
     final kernelTypeParams = decl.typeParams.map((gp) =>
@@ -927,6 +961,7 @@ class CodeGenerator {
     _library.addClass(cls);
     _classes[decl.name] = cls;
     _methods[decl.name] = {};
+    _registerMethodSignatures(decl.name, decl.methods);
 
     // Métodos `static fn` do corpo do struct: registrados eagerly (forward refs).
     for (final m in decl.methods) {
@@ -1003,6 +1038,7 @@ class CodeGenerator {
     _library.addClass(cls);
     _classes[decl.name] = cls;
     _methods[decl.name] = {};
+    _registerMethodSignatures(decl.name, decl.methods);
 
     // Métodos `static fn` do corpo da class: registrados eagerly (forward refs).
     for (final m in decl.methods) {
@@ -1088,6 +1124,8 @@ class CodeGenerator {
       _enumVariantFields[variantCls] = variantFieldNames;
       _constructors[variantName] = variantCtor;
     }
+
+    _registerMethodSignatures(decl.name, decl.methods);
 
     // Métodos `static fn` do corpo do enum: ficam na classe base (sem self).
     for (final m in decl.methods) {
@@ -1508,6 +1546,7 @@ class CodeGenerator {
     _constructors[decl.name] = ctor;
 
     _methods[decl.name] = {};
+    _registerMethodSignatures(decl.name, decl.methods);
     for (final method in decl.methods) {
       final proc = k.Procedure(
         _memberName(method.name),
@@ -1919,6 +1958,7 @@ class CodeGenerator {
     }
 
     _methods[ext.targetName] ??= {};
+    _registerMethodSignatures(ext.targetName, ext.methods);
 
     for (final method in ext.methods) {
       if (method.isStatic) {
@@ -1961,6 +2001,7 @@ class CodeGenerator {
     if (targetName == null || !_classes.containsKey(targetName)) return;
 
     final cls = _classes[targetName]!;
+    _registerMethodSignatures(targetName, impl.methods);
 
     for (final method in impl.methods) {
       final proc = k.Procedure(
@@ -2507,6 +2548,10 @@ class CodeGenerator {
           // let p = Point(x: 1.0, y: 2.0) → tipo é Point
           _varTypes[stmt.name] = callee.name;
         }
+      } else {
+        // let app = App.new() → tipo é o return type do static fn.
+        final rt = _staticFactoryReturnType(stmt.value as ast.CallExpr);
+        if (rt != null) _varTypes[stmt.name] = rt;
       }
     } else if (stmt.value is ast.CopyWithExpr) {
       // let p2 = p1.{ x: 10 } → mesmo tipo que p1
@@ -2549,11 +2594,29 @@ class CodeGenerator {
     // que reatribuições e chamadas de método subsequentes sejam reconhecidas.
     if (stmt.type is ast.NamedType) {
       _varTypes[stmt.name] = (stmt.type as ast.NamedType).name;
+    } else if (stmt.value is ast.CallExpr &&
+        (stmt.value as ast.CallExpr).callee is ast.MemberExpr) {
+      // var app = App.new() → tipo é o return type do static fn (habilita
+      // `app.get(path, closure)` a resolver o param handler).
+      final rt = _staticFactoryReturnType(stmt.value as ast.CallExpr);
+      if (rt != null) _varTypes[stmt.name] = rt;
     } else if (stmt.value != null) {
       final ct = _listMapReceiver(stmt.value!);
       if (ct != null) _varTypes[stmt.name] = ct;
     }
     return varDecl;
+  }
+
+  /// Nome do tipo de retorno de uma chamada de factory estática `Type.method(...)`
+  /// (ex.: `App.new()` → `'App'`), ou null quando [call] não é uma factory
+  /// estática registrada. Alimenta o rastreamento de tipo do receiver.
+  String? _staticFactoryReturnType(ast.CallExpr call) {
+    final callee = call.callee;
+    if (callee is ast.MemberExpr && callee.object is ast.IdentifierExpr) {
+      final typeName = (callee.object as ast.IdentifierExpr).name;
+      return _staticMethodReturnTypes[typeName]?[callee.member];
+    }
+    return null;
   }
 
   k.ReturnStatement _compileReturn(ast.ReturnStmt stmt) {
@@ -9417,6 +9480,24 @@ class CodeGenerator {
       k.Name('trim'), k.Arguments([]));
   }
 
+  /// Compila o VALOR de um argumento, propagando o tipo esperado do parâmetro
+  /// para o rastreamento de tipo da closure QUANDO (arg é ClosureExpr) ∧
+  /// (paramType é um FunctionType concreto). Nesse caso empurra os tipos dos
+  /// params-alvo em [_pendingClosureParamTypes], que [_compileClosure] consome
+  /// para rastrear cada param da closure (ex.: `req: Request`). Fora disso,
+  /// compila normalmente — params seguem dynamic (regra de ouro).
+  k.Expression _compileArgWithParamType(
+      ast.Expression argValue, ast.TypeAnnotation? paramType) {
+    if (argValue is ast.ClosureExpr && paramType is ast.FunctionType) {
+      final prev = _pendingClosureParamTypes;
+      _pendingClosureParamTypes = paramType.paramTypes;
+      final compiled = _compileExpr(argValue);
+      _pendingClosureParamTypes = prev;
+      return compiled;
+    }
+    return _compileExpr(argValue);
+  }
+
   k.Expression _compileCall(ast.CallExpr expr) {
     final callee = expr.callee;
 
@@ -9434,10 +9515,17 @@ class CodeGenerator {
       final positional = <k.Expression>[];
 
       for (final arg in expr.args) {
+        // Campo `handler: (Request) -> Response` recebendo closure literal →
+        // propaga o tipo do param (`Request`) para o corpo da closure.
+        ast.TypeAnnotation? fieldType;
         if (arg.label != null) {
-          named.add(k.NamedExpression(arg.label!, _compileExpr(arg.value)));
+          fieldType = _typeFieldTypes[callee.name]?[arg.label!];
+        }
+        if (arg.label != null) {
+          named.add(k.NamedExpression(
+            arg.label!, _compileArgWithParamType(arg.value, fieldType)));
         } else {
-          positional.add(_compileExpr(arg.value));
+          positional.add(_compileArgWithParamType(arg.value, fieldType));
         }
       }
 
@@ -9467,10 +9555,12 @@ class CodeGenerator {
           _enumContext = _enumNameFromType(paramTypes[i]!);
         }
         final arg = expr.args[i];
+        final paramType = i < paramTypes.length ? paramTypes[i] : null;
         if (arg.label != null) {
-          namedArgs.add(k.NamedExpression(arg.label!, _compileExpr(arg.value)));
+          namedArgs.add(k.NamedExpression(
+            arg.label!, _compileArgWithParamType(arg.value, paramType)));
         } else {
-          positionalArgs.add(_compileExpr(arg.value));
+          positionalArgs.add(_compileArgWithParamType(arg.value, paramType));
         }
         _enumContext = prevCtx;
       }
@@ -9573,7 +9663,26 @@ class CodeGenerator {
     // === Method call: obj.method(args) ===
     if (callee is ast.MemberExpr) {
       final obj = _compileExpr(callee.object);
-      final args = expr.args.map((a) => _compileExpr(a.value)).toList();
+
+      // Assinatura do método (quando o tipo do receiver é conhecido) → propaga o
+      // tipo de um param `FunctionType` para o corpo de um arg-closure literal
+      // (ex.: `app.get(path, (req) => ...)` com `get(_, (Request)->Response)`).
+      final recvTypeName =
+          (callee.object is ast.IdentifierExpr &&
+                  (callee.object as ast.IdentifierExpr).name == 'self')
+              ? _currentTypeName
+              : _inferReceiverType(callee.object);
+      final recvMethods =
+          recvTypeName != null ? _methodParamTypes[recvTypeName] : null;
+      final methodParams = recvMethods?[callee.member];
+      final args = <k.Expression>[
+        for (var i = 0; i < expr.args.length; i++)
+          _compileArgWithParamType(
+            expr.args[i].value,
+            (methodParams != null && i < methodParams.length)
+                ? methodParams[i]
+                : null),
+      ];
 
       // === Actor method calls ===
       final varType = _inferReceiverType(callee.object);
@@ -9941,21 +10050,36 @@ class CodeGenerator {
     return null;
   }
 
-  /// Rastreia parâmetros tipados como List/Map/String em [_varTypes], para que
-  /// `param.set(..)`/`param.slice(..)` (ex.: `chunk(list: List<T>)`) e
-  /// `param.toInt()` (ex.: `_ruleErrors(value: String)`) sejam reconhecidos.
-  /// Blast radius mínimo: só grava List/Map/String — nunca outros tipos.
+  /// Rastreia parâmetros tipados em [_varTypes], para que operações que dependem
+  /// do tipo do receiver funcionem sobre o PARÂMETRO:
+  ///  - List/Map/String → `param.set(..)`/`param.slice(..)`/`param.toInt()`;
+  ///  - struct/class do usuário (inclui importados, ex.: `req: Request`) →
+  ///    copy-with (`req.{ campo: v }`) e resolução do tipo de campo
+  ///    (`req.params` → Map). Sem isto o copy-with sobre um param cai no
+  ///    fallback no-op e DESCARTA os overrides (bug do `_runRoute` do server:
+  ///    `req.{ params: params }` devolvia o req original, params vazio).
   void _trackListMapParam(ast.Param p) {
     final t = p.type;
-    if (t is ast.NamedType &&
-        (t.name == 'List' || t.name == 'Map' || t.name == 'String')) {
-      _varTypes[p.name] = t.name;
+    String? track;
+    if (t is ast.NamedType) {
+      if (t.name == 'List' || t.name == 'Map' || t.name == 'String') {
+        track = t.name;
+      } else if (_typeFields.containsKey(t.name)) {
+        track = t.name; // struct/class registrado (inclui imports)
+      }
+    }
+    if (track != null) {
+      _varTypes[p.name] = track;
     } else {
-      // [_varTypes] é global (não escopado): limpa um List/Map/String STALE
-      // deixado por um param homônimo de outra função, senão este param herdaria
-      // o tipo errado e `p.set(..)`/`p.toInt()` seria lowerado indevidamente.
+      // [_varTypes] é global (não escopado): limpa entrada STALE de um param
+      // homônimo de outra função (List/Map/String ou nome de struct/class),
+      // senão este param herdaria o tipo errado.
       final ex = _varTypes[p.name];
-      if (ex == 'List' || ex == 'Map' || ex == 'String') _varTypes.remove(p.name);
+      if (ex != null &&
+          (ex == 'List' || ex == 'Map' || ex == 'String' ||
+           _typeFields.containsKey(ex))) {
+        _varTypes.remove(p.name);
+      }
     }
   }
 
@@ -10194,8 +10318,34 @@ class CodeGenerator {
   }
 
   k.Expression _compileClosure(ast.ClosureExpr expr) {
+    // Contexto: tipos esperados dos params, empurrados por [_compileCall] quando
+    // esta closure é o arg de um param `FunctionType` concreto (`(Req)->String`).
+    // Consumido AQUI (e limpo) para que closures ANINHADAS no corpo não herdem
+    // o contexto por engano — cada arg-closure recebe o seu.
+    final expectedParamTypes = _pendingClosureParamTypes;
+    _pendingClosureParamTypes = null;
+
     _pushScope();
     final params = <k.VariableDeclaration>[];
+
+    // [_varTypes] é global/sticky. Salvamos o valor anterior dos nomes de param
+    // que rastreamos, p/ restaurar após o corpo (senão `req: Request` vazaria
+    // para código após a closure).
+    final savedVarTypes = <String, String?>{};
+    void trackParam(String name, ast.TypeAnnotation? explicit, int index) {
+      // Tipo do param: preferir o explícito (`(x: T) =>`); senão o do contexto
+      // (tipo esperado do param no alvo). Regra de ouro: só rastreia quando é
+      // um NamedType CONCRETO (struct do usuário, List/Map/String) — nunca de
+      // FunctionType/dynamic/genérico, mantendo o comportamento dynamic atual.
+      final ctx = (expectedParamTypes != null && index < expectedParamTypes.length)
+          ? expectedParamTypes[index]
+          : null;
+      final t = explicit ?? ctx;
+      if (t is ast.NamedType) {
+        savedVarTypes[name] = _varTypes[name];
+        _varTypes[name] = t.name;
+      }
+    }
 
     if (expr.params.isEmpty && !expr.hasExplicitParams) {
       // Trailing closure sem parenteses — params implicitos ($0, $1, $2)
@@ -10205,16 +10355,19 @@ class CodeGenerator {
           type: const k.DynamicType(), isFinal: true);
         params.add(param);
         _declareVar('\$$i', param);
+        trackParam('\$$i', null, i);
       }
     } else if (expr.params.isEmpty && expr.hasExplicitParams) {
       // Closure com parenteses explicitamente vazios: () => { body }
       // Zero params — nao adicionar $0/$1/$2
     } else {
-      for (final p in expr.params) {
+      for (var i = 0; i < expr.params.length; i++) {
+        final p = expr.params[i];
         final param = k.VariableDeclaration(p.name,
           type: _resolveType(p.type), isFinal: true);
         params.add(param);
         _declareVar(p.name, param);
+        trackParam(p.name, p.type, i);
       }
     }
 
@@ -10239,6 +10392,15 @@ class CodeGenerator {
       body = _compileStatement(expr.body);
     }
     _popScope();
+
+    // Restaura os tipos globais anteriores dos nomes de param rastreados.
+    for (final e in savedVarTypes.entries) {
+      if (e.value == null) {
+        _varTypes.remove(e.key);
+      } else {
+        _varTypes[e.key] = e.value as String;
+      }
+    }
 
     // Closure async: espelha o que `async fn` faz — asyncMarker.Async +
     // emittedValueType. O corpo pode conter `await`; o retorno vira Future.
@@ -10849,6 +11011,34 @@ class CodeGenerator {
     final right = _compileExpr(expr.right);
     final tmp = k.VariableDeclaration('_nc',
       initializer: left, type: const k.DynamicType(), isFinal: true);
+
+    // `Option ?? default` DESEMBRULHA o Option (Swift-style). A stdlib depende
+    // disso: `map.get(k) ?? def`, `headers.get("Origin") ?? "*"` (cors),
+    // `data.get(f.name) ?? ""` (validate). Como `.get` devolve `Option<V>` e o
+    // tipo estático é dynamic no dialeto atual, o dispatch é por runtime-type:
+    //   _nc is Option.some ? _nc.value
+    //                      : ((_nc is Option.none || _nc == null) ? right : _nc)
+    // Fora de Option, colapsa no null-check clássico. `right` (lazy) aparece UMA
+    // única vez — nenhum nó Kernel é compartilhado entre ramos.
+    final someCls = _enumVariants['Option']?['some'];
+    final noneCls = _enumVariants['Option']?['none'];
+    if (someCls != null && noneCls != null) {
+      final useRight = k.LogicalExpression(
+        k.IsExpression(k.VariableGet(tmp),
+          k.InterfaceType(noneCls, k.Nullability.nonNullable)),
+        k.LogicalExpressionOperator.OR,
+        k.EqualsNull(k.VariableGet(tmp)));
+      final elseBranch = k.ConditionalExpression(
+        useRight, right, k.VariableGet(tmp), const k.DynamicType());
+      return k.Let(tmp, k.ConditionalExpression(
+        k.IsExpression(k.VariableGet(tmp),
+          k.InterfaceType(someCls, k.Nullability.nonNullable)),
+        k.DynamicGet(
+          k.DynamicAccessKind.Dynamic, k.VariableGet(tmp), k.Name('value')),
+        elseBranch,
+        const k.DynamicType()));
+    }
+
     return k.Let(tmp, k.ConditionalExpression(
       k.EqualsNull(k.VariableGet(tmp)), right, k.VariableGet(tmp),
       const k.DynamicType()));
