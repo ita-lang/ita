@@ -54,11 +54,16 @@ void main(List<String> args) async {
   // Encontrar todos os .tu (excluir módulos auxiliares que não tem main)
   final auxiliaryModules = {'math.tu', 'greetings.tu'};
 
-  // Exemplos de longa duração (servidores/listeners que rodam pra sempre
-  // esperando conexão/sinal). Não terminam por design — verificamos só que
-  // compilam, sem tentar executar até o fim (senão dão timeout sempre).
+  // Exemplos que só COMPILAM na suíte (não executam até o fim):
+  //  - servidores/listeners que rodam pra sempre esperando conexão/sinal
+  //    (não terminam por design);
+  //  - clientes de rede que batem em endpoints EXTERNOS (httpbin.org) —
+  //    não-determinísticos no CI: dão timeout quando a rede/endpoint está
+  //    lenta ou indisponível. fetch_secure (127.0.0.1, connection refused
+  //    rápido) e parallel (Fetcher é mock) NÃO entram aqui — são estáveis.
   final compileOnly = {
     'server', 'server_inline', 'tcp', 'websocket_server', 'timer_signal',
+    'fetch_async', 'http', // rede externa (httpbin.org) — flaky no CI
   };
   final testFiles = examplesDir
       .listSync()
