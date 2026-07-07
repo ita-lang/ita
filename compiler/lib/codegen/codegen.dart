@@ -9816,10 +9816,16 @@ class CodeGenerator {
     }
     _popScope();
 
+    // Closure async: espelha o que `async fn` faz — asyncMarker.Async +
+    // emittedValueType. O corpo pode conter `await`; o retorno vira Future.
+    // Mantemos returnType/emittedValueType em dynamic (regra de ouro: sem type
+    // inference completa, o valor futuro é dynamic — igual às funções async).
     return k.FunctionExpression(k.FunctionNode(
       body,
       positionalParameters: params,
       returnType: const k.DynamicType(),
+      asyncMarker: expr.isAsync ? k.AsyncMarker.Async : k.AsyncMarker.Sync,
+      emittedValueType: expr.isAsync ? const k.DynamicType() : null,
     ));
   }
 
@@ -10461,9 +10467,14 @@ class CodeGenerator {
         return const k.DynamicType();
 
       case ast.FunctionType t:
+        // `async (...) -> T` → `(...) -> Future<T>`.
+        var ret = _resolveType(t.returnType);
+        if (t.isAsync) {
+          ret = k.InterfaceType(_futureClass, k.Nullability.nonNullable, [ret]);
+        }
         return k.FunctionType(
           t.paramTypes.map(_resolveType).toList(),
-          _resolveType(t.returnType),
+          ret,
           k.Nullability.nonNullable);
 
       case ast.MutType t:

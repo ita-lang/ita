@@ -1280,6 +1280,14 @@ class Parser {
   Expression _primary() {
     final token = _peek();
 
+    // async closure em posição de expressão: async () => expr / async () => { ... }
+    // `async` só precede `(` aqui (closure). `async fn` (declaração) é tratado
+    // em _declaration antes de chegar em _primary, e nunca é seguido por `(`.
+    if (_check(TokenType.kwAsync) && _checkAt(1, TokenType.lparen)) {
+      _advance(); // consume async
+      return _closure(isAsync: true);
+    }
+
     // panic("message")
     if (_match(TokenType.kwPanic)) {
       _consume(TokenType.lparen, 'Expected "("');
@@ -1475,7 +1483,7 @@ class Parser {
     }
   }
 
-  ClosureExpr _closure() {
+  ClosureExpr _closure({bool isAsync = false}) {
     final token = _peek();
     _consume(TokenType.lparen, 'Expected "("');
     final (params, _) = _paramList();
@@ -1505,6 +1513,7 @@ class Parser {
       returnType: returnType,
       body: body,
       hasExplicitParams: true,
+      isAsync: isAsync,
       line: token.line,
       column: token.column,
     );
@@ -1743,6 +1752,18 @@ class Parser {
     if (_match(TokenType.kwMut)) {
       type = MutType(_typeAnnotation(), _previous().line, _previous().column);
       return type;
+    }
+
+    // async (A, B) -> T  → tipo-função assíncrono (semanticamente `(...) -> Future<T>`).
+    // Ex.: `fn timeout(ms: Int, task: async () -> T)`.
+    if (_check(TokenType.kwAsync)) {
+      final asyncTok = _advance(); // consume async
+      final inner = _typeAnnotation();
+      if (inner is FunctionType) {
+        return FunctionType(inner.paramTypes, inner.returnType,
+            asyncTok.line, asyncTok.column, isAsync: true);
+      }
+      throw _error('"async" deve preceder um tipo-função "(...) -> T"');
     }
 
     if (_match(TokenType.lparen)) {

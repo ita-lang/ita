@@ -647,13 +647,14 @@ class Formatter {
   }
 
   String _closureExpr(ClosureExpr expr) {
+    final async = expr.isAsync ? 'async ' : '';
     final params = _params(expr.params);
     final ret = expr.returnType != null ? ' -> ${_typeAnnotation(expr.returnType!)}' : '';
     if (expr.body is ExprStmt) {
-      return '($params)$ret => ${_expr((expr.body as ExprStmt).expression)}';
+      return '$async($params)$ret => ${_expr((expr.body as ExprStmt).expression)}';
     }
     // Multi-line closures are complex in inline context — fallback
-    return '($params)$ret { ... }';
+    return '$async($params)$ret { ... }';
   }
 
   String _matchExpr(MatchExpr expr) {
@@ -787,8 +788,9 @@ class Formatter {
       case OptionalType():
         return '${_typeAnnotation(type.inner)}?';
       case FunctionType():
+        final async = type.isAsync ? 'async ' : '';
         final params = type.paramTypes.map(_typeAnnotation).join(', ');
-        return '($params) -> ${_typeAnnotation(type.returnType)}';
+        return '$async($params) -> ${_typeAnnotation(type.returnType)}';
       case MutType():
         return 'mut ${_typeAnnotation(type.inner)}';
       case TupleType():
