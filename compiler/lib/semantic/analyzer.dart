@@ -45,9 +45,77 @@ class SemanticAnalyzer {
 
     _collect(program, global, result);
     _resolveTypeBodies(program, global, result);
+    _collectTopLevelBindings(program, global, result);
     _check(program, global, result);
 
     return result;
+  }
+
+  // ---- Passada 2.5: coleta de `let`/`var` TOP-LEVEL (modo script) ----
+  //
+  // Registra no escopo GLOBAL as variáveis declaradas no top-level, ANTES de
+  // checar os corpos das funções. Sem isto, uma `fn area(r) => pi * r * r` não
+  // enxergaria o `let pi` top-level (forward-ref: a fn pode até ser declarada
+  // ANTES do `let`). O tipo é INFERIDO do valor (ou vem da anotação-constraint,
+  // se houver). REGRA DE OURO: se o valor referencia algo ainda não resolvido,
+  // a inferência devolve UnknownType — sem erro.
+  //
+  // A INFERÊNCIA aqui roda contra um `AnalysisResult` DESCARTÁVEL (scratch): só
+  // queremos o TIPO do valor para registrar o símbolo. Os diagnósticos "de
+  // verdade" (mismatch de anotação, copy-with com campo inexistente, match
+  // não-exaustivo, etc.) continuam sendo emitidos UMA ÚNICA VEZ na passada 3
+  // (`_check`), que revisita cada `StmtDecl`. Assim evitamos erros duplicados.
+
+  void _collectTopLevelBindings(
+      ast.Program program, Scope global, AnalysisResult result) {
+    for (final decl in program.declarations) {
+      if (decl is! ast.StmtDecl) continue;
+      final stmt = decl.statement;
+
+      final String name;
+      final ast.TypeAnnotation? ann;
+      final ast.Expression? value;
+      final bool isMutable;
+      switch (stmt) {
+        case ast.LetStmt s:
+          // `let (a, b) = ...` (destructuring) fica para outra fatia.
+          if (s.pattern != null) continue;
+          name = s.name;
+          ann = s.type;
+          value = s.value;
+          isMutable = false;
+        case ast.VarStmt s:
+          name = s.name;
+          ann = s.type;
+          value = s.value;
+          isMutable = true;
+        default:
+          continue;
+      }
+      if (name.isEmpty) continue;
+      // Redeclaração no top-level: o primeiro vence (o `_check` reporta, se for
+      // o caso). Não sobrescrevemos aqui.
+      if (global.lookupLocal(name) != null) continue;
+
+      final ResolvedType bindingType;
+      if (ann != null) {
+        // Anotação é a fonte da verdade (constraint).
+        bindingType = resolveAnnotation(ann, global);
+      } else if (value != null) {
+        // Infere do valor num resultado descartável (não polui diagnósticos).
+        bindingType = TypeChecker(AnalysisResult()).inferExpr(value, global);
+      } else {
+        bindingType = const UnknownType();
+      }
+
+      global.define(VariableSymbol(
+        name: name,
+        type: bindingType,
+        isMutable: isMutable,
+        line: stmt.line,
+        column: stmt.column,
+      ));
+    }
   }
 
   // ---- Passada 1: coleta de símbolos top-level ----

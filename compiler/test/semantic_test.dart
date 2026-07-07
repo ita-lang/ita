@@ -198,6 +198,35 @@ void main() {
         'Int? aceita nil');
   }
 
+  // ---- let/var TOP-LEVEL registrados no escopo global + forward-ref ----
+  // A fn `use` referencia `pi` no corpo, mas `let pi` é declarado DEPOIS dela
+  // (forward-ref). O collect de bindings top-level (passada 2.5) precisa ter
+  // registrado `pi` no global ANTES de checar o corpo da fn.
+  {
+    // fn use() { let b = pi }
+    // let pi = 3.14            (declarado DEPOIS da fn)
+    final letB =
+        LetStmt(name: 'b', value: IdentifierExpr('pi', 1, 1), line: 1, column: 1);
+    final fn = FnDecl(
+      name: 'use',
+      params: const [],
+      body: BlockStmt([letB], 1, 1),
+      line: 1,
+      column: 1,
+    );
+    final letPi = LetStmt(name: 'pi', value: _float(3.14), line: 1, column: 1);
+    final prog = Program([fn, StmtDecl(letPi, line: 1, column: 1)], 1, 1);
+    final res = SemanticAnalyzer().run(prog);
+
+    final symPi = res.symbolOf(letPi);
+    check(symPi is VariableSymbol && symPi.type is FloatType,
+        'let pi TOP-LEVEL registrado no escopo global (pi : Float)');
+    final symB = res.symbolOf(letB);
+    check(symB is VariableSymbol && symB.type is FloatType,
+        'let pi top-level visível numa fn declarada ANTES dele (b : Float via pi)');
+    check(!res.hasErrors, 'forward-ref de let top-level -> sem erros');
+  }
+
   print('\n=== Fatia 2: tipos de usuário (struct/enum) ===\n');
 
   // ---- construção + acesso a membro + copy-with (struct Point) ----
