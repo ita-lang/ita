@@ -63,9 +63,22 @@ cd "$REPO_ROOT" || { echo "FATAL: nao achei a raiz do repo Ita"; exit 1; }
 ITA_DART_BIN="${ITA_DART_BIN:-$REPO_ROOT/.dart-sdk/3.12.2/dart-sdk/bin/dart}"
 ITA_PLATFORM_DILL="${ITA_PLATFORM_DILL:-$REPO_ROOT/.dart-sdk/3.12.2/dart-sdk/lib/_internal/vm_platform.dill}"
 ITA_PACKAGES="${ITA_PACKAGES:-$REPO_ROOT/compiler/.dart_tool/package_config.json}"
-export ITA_DART_BIN ITA_PLATFORM_DILL ITA_PACKAGES
+# compiler/lib: p/ o codegen linkar toml.runtime.dill sob o binário AOT
+# (Platform.script aponta pro binário). Inócuo pro JIT. Ver bin/itac.
+ITA_COMPILER_LIB="${ITA_COMPILER_LIB:-$REPO_ROOT/compiler/lib}"
+export ITA_DART_BIN ITA_PLATFORM_DILL ITA_PACKAGES ITA_COMPILER_LIB
 
 ITAC="$REPO_ROOT/compiler/bin/itac.dart"
+# Compilar .tu -> .dill: prefere o binário AOT (ITA_ITAC_BIN) quando executável,
+# senão cai no `dart itac.dart` (JIT). MESMO .dill; só + rápido. As demais
+# invocações de `dart` abaixo (compile js, --dfe p/ rodar na VM) usam SEMPRE o
+# dart real — o itac só cobre a etapa .tu -> .dill.
+if [ -n "${ITA_ITAC_BIN:-}" ] && [ -x "$ITA_ITAC_BIN" ]; then
+  ITAC_CMD=("$ITA_ITAC_BIN")
+else
+  [ -n "${ITA_ITAC_BIN:-}" ] && echo "AVISO: ITA_ITAC_BIN='$ITA_ITAC_BIN' não é executável — usando JIT." >&2
+  ITAC_CMD=("$ITA_DART_BIN" --packages="$ITA_PACKAGES" "$ITAC")
+fi
 EX_DIR="${ITA_JS_PARITY_EXAMPLES:-$REPO_ROOT/examples}"
 MANIFEST="$SCRIPT_DIR/expected.txt"
 TIMEOUT="${ITA_JS_PARITY_TIMEOUT:-20}"
@@ -156,7 +169,7 @@ classify() {
   grep -qw main "$tu" || { echo EXCLUDE_NOMAIN; return; }
 
   local dill="$WORK/$name.dill"
-  if ! "$ITA_DART_BIN" --packages="$ITA_PACKAGES" "$ITAC" "$tu" "$dill" "$ITA_PLATFORM_DILL" \
+  if ! "${ITAC_CMD[@]}" "$tu" "$dill" "$ITA_PLATFORM_DILL" \
         > "$WORK/$name.itac.log" 2>&1; then
     echo EXCLUDE_ITAC; return
   fi

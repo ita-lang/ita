@@ -41,6 +41,15 @@ void main(List<String> args) async {
   final platformDill = args[1];
   final packages = args[2];
 
+  // Compilador .tu -> .dill: prefere o binário AOT (ITA_ITAC_BIN) quando
+  // presente — roda a MESMA lógica do itac.dart sem VM startup nem JIT
+  // (~250× em arquivos pequenos). Senão, cai no `dart itac.dart` (JIT).
+  // Só a etapa de COMPILAÇÃO usa o itac; a EXECUÇÃO do .dill segue via dartBin
+  // (--dfe). O ITA_ITAC_BIN é buildado por tools/build-itac.sh.
+  final itacBin = Platform.environment['ITA_ITAC_BIN'] ?? '';
+  final useAot = itacBin.isNotEmpty && File(itacBin).existsSync();
+  print(useAot ? 'itac: AOT ($itacBin)' : 'itac: JIT (dart itac.dart)');
+
   final examplesDir = Directory('examples');
   if (!examplesDir.existsSync()) {
     print('Error: examples/ directory not found');
@@ -86,15 +95,17 @@ void main(List<String> args) async {
 
     stdout.write('  $name ... ');
 
-    // Compilar
+    // Compilar (AOT quando disponível; senão JIT — mesmo .dill)
     final compileStart = DateTime.now();
-    final compileResult = Process.runSync(dartBin, [
-      '--packages=$packages',
-      'compiler/bin/itac.dart',
-      file.path,
-      dillPath,
-      platformDill,
-    ]);
+    final compileResult = useAot
+        ? Process.runSync(itacBin, [file.path, dillPath, platformDill])
+        : Process.runSync(dartBin, [
+            '--packages=$packages',
+            'compiler/bin/itac.dart',
+            file.path,
+            dillPath,
+            platformDill,
+          ]);
     final compileTime = DateTime.now().difference(compileStart);
 
     if (compileResult.exitCode != 0) {

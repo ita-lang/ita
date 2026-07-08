@@ -19,6 +19,10 @@
 #   ITA_DART_BIN       dart do SDK pinado
 #   ITA_PLATFORM_DILL  vm_platform.dill do mesmo SDK
 #   ITA_PACKAGES       package_config.json do compilador
+#   ITA_ITAC_BIN       (opcional) binário `itac` AOT (ver tools/build-itac.sh).
+#                      Se setado e executável, cada `itac check` roda o binário
+#                      nativo (~250× vs JIT) no lugar de `dart itac.dart`. Caso
+#                      contrário, cai no JIT — comportamento idêntico, só + lento.
 # ===========================================================================
 set -uo pipefail
 
@@ -47,9 +51,23 @@ CONF_DIR="compiler/test/conformance"
 VALID_DIR="$CONF_DIR/valid"
 INVALID_DIR="$CONF_DIR/invalid"
 
+# --- itac: prefere o binário AOT (ITA_ITAC_BIN) quando disponível -----------
+# 76 invocações de `itac check` — via JIT são ~1 s cada (~76 s no total); via
+# AOT caem pra ~0,03 s cada. Se ITA_ITAC_BIN aponta pra um binário executável,
+# usamos ele; senão caímos no `dart itac.dart` (JIT). Mesmo resultado.
+ITAC="$REPO_ROOT/compiler/bin/itac.dart"
+if [ -n "${ITA_ITAC_BIN:-}" ] && [ -x "$ITA_ITAC_BIN" ]; then
+  ITAC_CMD=("$ITA_ITAC_BIN")
+  echo "itac: AOT ($ITA_ITAC_BIN)"
+else
+  [ -n "${ITA_ITAC_BIN:-}" ] && echo "AVISO: ITA_ITAC_BIN='$ITA_ITAC_BIN' não é executável — usando JIT." >&2
+  ITAC_CMD=("$ITA_DART_BIN" --packages="$ITA_PACKAGES" "$ITAC")
+  echo "itac: JIT (dart itac.dart)"
+fi
+
 check() {
   # roda `itac check <arquivo>` silenciando a saída; devolve o exit code
-  "$ITA_DART_BIN" --packages="$ITA_PACKAGES" compiler/bin/itac.dart check "$1" >/dev/null 2>&1
+  "${ITAC_CMD[@]}" check "$1" >/dev/null 2>&1
 }
 
 green='\033[32m'; red='\033[31m'; reset='\033[0m'

@@ -22,10 +22,29 @@ ITA_DART_BIN="${ITA_DART_BIN:-${ITA_HOME}/.dart-sdk/3.12.2/dart-sdk/bin/dart}"
 ITA_PLATFORM_DILL="${ITA_PLATFORM_DILL:-${ITA_HOME}/.dart-sdk/3.12.2/dart-sdk/lib/_internal/vm_platform.dill}"
 ITA_PACKAGES="${ITA_PACKAGES:-${ITA_HOME}/compiler/.dart_tool/package_config.json}"
 
-# Compiler entry point
+# compiler/lib — usado pelo codegen p/ localizar toml.runtime.dill. Sob o
+# binário AOT, Platform.script aponta pro binário (não pro itac.dart), então a
+# busca automática por-diretório de _compilerLibDir() não alcança compiler/lib
+# e o codegen cairia no parser TOML legado (gera .dill diferente). Setar aqui
+# fecha essa diferença: AOT e JIT emitem o MESMO .dill. Inócuo pro JIT.
+ITA_COMPILER_LIB="${ITA_COMPILER_LIB:-${ITA_HOME}/compiler/lib}"
+
+# Compiler entry point (JIT)
 COMPILER="${ITA_HOME}/compiler/bin/itac.dart"
 
-# Export for the compiler to use
-export ITA_DART_BIN ITA_PLATFORM_DILL ITA_PACKAGES
+# Binário AOT (~10 MB, platform-specific, NÃO versionado). Buildar com
+# `bash tools/build-itac.sh` -> build/itac. Roda a MESMA lógica do itac.dart
+# sem VM startup nem JIT: ~250× mais rápido que o JIT em arquivos pequenos.
+ITA_ITAC_BIN="${ITA_ITAC_BIN:-${ITA_HOME}/build/itac}"
+
+# Export for the compiler to use (o AOT lê estas envs em runtime p/ run/test)
+export ITA_DART_BIN ITA_PLATFORM_DILL ITA_PACKAGES ITA_COMPILER_LIB
+
+# Fast path: se o binário AOT existe e é executável, roda ele. Senão, cai no
+# JIT (dart itac.dart) — mesmo resultado, só mais lento. Assim quem buildou o
+# AOT ganha 250×; quem não buildou continua funcionando sem setup extra.
+if [ -x "$ITA_ITAC_BIN" ]; then
+  exec "$ITA_ITAC_BIN" "$@"
+fi
 
 exec "$ITA_DART_BIN" --packages="$ITA_PACKAGES" "$COMPILER" "$@"
