@@ -2415,7 +2415,7 @@ class CodeGenerator {
         } else if (isLast && s is ast.IfStmt) {
           stmts.add(_compileIfWithImplicitReturn(s));
         } else {
-          stmts.add(_compileStatement(s));
+          _emitStatement(stmts, s);
         }
       }
       _popScope();
@@ -2444,7 +2444,7 @@ class CodeGenerator {
         _pushScope();
         final stmts = <k.Statement>[];
         for (var i = 0; i < stmt.statements.length - 1; i++) {
-          stmts.add(_compileStatement(stmt.statements[i]));
+          _emitStatement(stmts, stmt.statements[i]);
         }
         stmts.add(k.ReturnStatement(_compileExpr(last.expression)));
         _popScope();
@@ -2457,6 +2457,31 @@ class CodeGenerator {
   // ============================================================
   // Statements
   // ============================================================
+
+  /// Compila [stmt] e adiciona o(s) k.Statement resultante(s) a [out].
+  ///
+  /// Quase todo statement vira um único k.Statement. As exceções são os que
+  /// HOISTAM bindings para o escopo pai — `guard let` e o destructuring
+  /// `let { x, y } = ...`: o(s) nome(s) ligado(s) precisam continuar visíveis
+  /// para os statements IRMÃOS seguintes. Embrulhá-los num k.Block próprio
+  /// fecharia o escopo (cada Block faz push/popScope no VariableIndexer da
+  /// serialização) e faria um uso posterior referenciar uma VariableDeclaration
+  /// fora de escopo — kernel malformado que a Dart VM tolera mas o dart2js
+  /// rejeita. Por isso esses statements são splicados direto na lista do pai.
+  ///
+  /// Todo builder de LISTA de statements (bloco, corpo de função, corpo de
+  /// closure, block-value, implicit-return) deve usar este helper em vez de
+  /// `_compileStatement` direto, senão o hoist volta a quebrar.
+  void _emitStatement(List<k.Statement> out, ast.Statement stmt) {
+    switch (stmt) {
+      case ast.GuardLetStmt s:
+        _emitGuardLet(s, out);
+      case ast.DestructureStmt s:
+        _emitDestructure(s, out);
+      default:
+        out.add(_compileStatement(stmt));
+    }
+  }
 
   k.Statement _compileStatement(ast.Statement stmt) {
     switch (stmt) {
@@ -2526,7 +2551,10 @@ class CodeGenerator {
 
   k.Block _compileBlock(ast.BlockStmt stmt) {
     _pushScope();
-    final stmts = stmt.statements.map(_compileStatement).toList();
+    final stmts = <k.Statement>[];
+    for (final s in stmt.statements) {
+      _emitStatement(stmts, s);
+    }
     _popScope();
     return k.Block(stmts);
   }
@@ -2749,9 +2777,29 @@ class CodeGenerator {
   }
 
   k.Statement _compileGuardLet(ast.GuardLetStmt stmt) {
-    // guard let name = expr [&& condition] else { body }
-    // → var _tmp = expr; if (_tmp == null [|| !condition]) { body } let name = _tmp;
+    // Fallback: `guard let` num contexto de statement ÚNICO (ex.: corpo direto
+    // de um branch/loop sem bloco). Aqui não há irmãos posteriores, então
+    // embrulhar num k.Block é seguro. No caminho comum (dentro de uma lista de
+    // statements) o guard passa por [_emitStatement] → [_emitGuardLet] e é
+    // splicado, mantendo o binding visível para os statements seguintes.
+    final stmts = <k.Statement>[];
+    _emitGuardLet(stmt, stmts);
+    return k.Block(stmts);
+  }
 
+  /// Emite o desugaring de `guard let name = expr [&& cond] else { body }` como
+  /// IRMÃOS diretos em [out] — nunca embrulhado num k.Block próprio.
+  ///
+  /// O binding `name` precisa continuar visível DEPOIS do guard (é a razão de
+  /// existir do guard let). Se fosse declarado dentro de um k.Block aninhado, o
+  /// bloco fecharia seu escopo e qualquer uso posterior (`${name}`, `name.x`…)
+  /// geraria um VariableGet para uma VariableDeclaration fora de escopo — kernel
+  /// malformado que a Dart VM tolera mas o dart2js rejeita (o pkg/kernel
+  /// BinaryBuilder valida o índice: "Unexpected variable index: N. Current
+  /// variable count: M", pois cada k.Block faz push/popScope no VariableIndexer).
+  void _emitGuardLet(ast.GuardLetStmt stmt, List<k.Statement> out) {
+    // guard let name = expr [&& condition] else { body }
+    // → var _tmp = expr; var name = _tmp; if (_tmp == null [|| !condition]) { body }
     final tmpVar = k.VariableDeclaration(
       '${stmt.name}_tmp',
       initializer: _compileExpr(stmt.value),
@@ -2779,11 +2827,9 @@ class CodeGenerator {
 
     final elseBody = _compileStatement(stmt.elseBody);
 
-    return k.Block([
-      tmpVar,
-      bindVar,
-      k.IfStatement(failCondition, elseBody, null),
-    ]);
+    out.add(tmpVar);
+    out.add(bindVar);
+    out.add(k.IfStatement(failCondition, elseBody, null));
   }
 
   k.Statement _compileWhile(ast.WhileStmt stmt) {
@@ -10595,7 +10641,10 @@ class CodeGenerator {
       if (block.statements.isNotEmpty && block.statements.last is ast.ExprStmt) {
         final stmts = block.statements.sublist(0, block.statements.length - 1);
         final lastExpr = (block.statements.last as ast.ExprStmt).expression;
-        final compiledStmts = stmts.map((s) => _compileStatement(s)).toList();
+        final compiledStmts = <k.Statement>[];
+        for (final s in stmts) {
+          _emitStatement(compiledStmts, s);
+        }
         compiledStmts.add(k.ReturnStatement(_compileExpr(lastExpr)));
         body = k.Block(compiledStmts);
       } else {
@@ -10934,7 +10983,7 @@ class CodeGenerator {
         _pushScope();
         final stmts = <k.Statement>[];
         for (var i = 0; i < stmt.statements.length - 1; i++) {
-          stmts.add(_compileStatement(stmt.statements[i]));
+          _emitStatement(stmts, stmt.statements[i]);
         }
         final value = _compileExpr(last.expression);
         _popScope();
@@ -11045,7 +11094,11 @@ class CodeGenerator {
       returnType: const k.DynamicType(),
     ));
 
-    return k.Let(fVar, k.Let(gVar, closure));
+    // _f e _g são CAPTURADOS pela closure → precisam ser VariableDeclarations de
+    // bloco, não `Let`s. Um Let-captured por FunctionExpression quebra a closure
+    // conversion do dart2js ("Cannot find value local(main#_g)"), embora a VM
+    // aceite. Mesmo motivo/fix de [_buildCurriedClosure].
+    return k.BlockExpression(k.Block([fVar, gVar]), closure);
   }
 
   /// expr where { let x = ... }  → Let(x = ..., expr)
@@ -11078,12 +11131,26 @@ class CodeGenerator {
   /// let { x, y } = point  →  tmp = point; x = tmp.x; y = tmp.y
   /// let [a, b, c] = list  →  tmp = list; a = tmp[0]; b = tmp[1]; c = tmp[2]
   k.Statement _compileDestructure(ast.DestructureStmt stmt) {
+    // Fallback statement-único (ver _compileGuardLet). No caminho comum passa
+    // por [_emitStatement] → [_emitDestructure] e é splicado no bloco pai.
+    final stmts = <k.Statement>[];
+    _emitDestructure(stmt, stmts);
+    return k.Block(stmts);
+  }
+
+  /// Emite `let { x, y } = ...` / `let [a, b] = ...` como IRMÃOS diretos em
+  /// [out]. Assim como o guard let, os nomes destructurados HOISTAM para o
+  /// escopo pai e precisam continuar visíveis para os statements seguintes —
+  /// embrulhá-los num k.Block aninhado tornaria o kernel malformado (VariableGet
+  /// fora de escopo; ver [_emitGuardLet]).
+  void _emitDestructure(ast.DestructureStmt stmt, List<k.Statement> out) {
     final isFinal = !stmt.isMutable;
     final value = _compileExpr(stmt.value);
     final tmp = k.VariableDeclaration('_destr',
       initializer: value, type: const k.DynamicType(), isFinal: true);
 
-    final stmts = <k.Statement>[tmp];
+    final stmts = out;
+    stmts.add(tmp);
 
     switch (stmt.pattern) {
       case ast.ObjectDestructurePattern p:
@@ -11127,8 +11194,6 @@ class CodeGenerator {
       default:
         _error('Unsupported destructure pattern', stmt.line, stmt.column);
     }
-
-    return k.Block(stmts);
   }
 
   /// Currying: quando uma função é chamada com menos args que espera,
@@ -11164,11 +11229,15 @@ class CodeGenerator {
       returnType: const k.DynamicType(),
     ));
 
-    k.Expression result = closure;
-    for (var i = lets.length - 1; i >= 0; i--) {
-      result = k.Let(lets[i], result);
-    }
-    return result;
+    // Os args capturados precisam ser VariableDeclarations de escopo de BLOCO,
+    // não `Let`s. O dart2js NÃO resolve uma variável ligada por `Let` que é
+    // CAPTURADA por um FunctionExpression aninhado: a closure conversion falha
+    // em readLocal ("Cannot find value local(main#_curry0)"). Um k.BlockExpression
+    // declara os temporários como statements normais — forma que a closure
+    // conversion sabe capturar (e é o que o CFE do Dart emitiria). A Dart VM
+    // aceita as duas formas, por isso o bug só aparecia no alvo JS.
+    if (lets.isEmpty) return closure;
+    return k.BlockExpression(k.Block(List<k.Statement>.from(lets)), closure);
   }
 
   k.Expression _compileList(ast.ListLiteralExpr expr) {
@@ -11291,12 +11360,26 @@ class CodeGenerator {
         // User-defined type com type args
         final cls = _classes[t.name];
         if (cls != null) {
-          // Se classe tem type params mas chamador não passou args, fill com dynamic
-          final classParamCount = _classTypeParams[t.name]?.length ?? 0;
-          final typeArgs = resolvedArgs.isNotEmpty ? resolvedArgs
-              : (classParamCount > 0
-                  ? List<k.DartType>.filled(classParamCount, const k.DynamicType())
-                  : <k.DartType>[]);
+          // A aridade de um k.InterfaceType TEM que casar com o nº de type params
+          // da classe — senão o kernel é malformado. A Dart VM tolera, mas o
+          // dart2js crasha em CommonMasks._createFromStaticType
+          // ("RangeError: Valid value range is empty: 0") ao indexar a lista de
+          // type params vazia. Caso clássico: os built-in Option/Result são
+          // classes com ZERO type params, então `Option<Int>` deve virar o
+          // InterfaceType RAW `Option` (0 args), não `Option<int>`.
+          //
+          // Fonte da verdade = cls.typeParameters.length (o nó Kernel real). Se
+          // o annotation trouxe exatamente esse nº de args, usa-os; senão
+          // (aridade 0, args faltando ou sobrando) preenche com dynamic.
+          final arity = cls.typeParameters.length;
+          final List<k.DartType> typeArgs;
+          if (arity == 0) {
+            typeArgs = const <k.DartType>[];
+          } else if (resolvedArgs.length == arity) {
+            typeArgs = resolvedArgs;
+          } else {
+            typeArgs = List<k.DartType>.filled(arity, const k.DynamicType());
+          }
           return k.InterfaceType(cls, k.Nullability.nonNullable, typeArgs);
         }
         return const k.DynamicType();
