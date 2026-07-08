@@ -74,6 +74,8 @@ enum TokenType {
   kwMatch, // match — pattern matching exaustivo
   kwFor, // for
   kwWhile, // while
+  kwBreak, // break — sai do loop mais interno
+  kwContinue, // continue — pula para a proxima iteracao
   kwIn, // in — usado em for..in
   // Tipos e estruturas de dados
   kwStruct, // struct — tipo valor (copiado, imutavel por default)
@@ -227,18 +229,26 @@ class Token {
   final int column;
   final Object? literal;
 
+  /// True para tokens FABRICADOS pelo parser durante recuperação de erro
+  /// (single-token insertion — ver Parser._synthetic). Não vêm do lexer, então
+  /// não têm posição real no fonte: reusam a posição do token anterior. Nunca
+  /// devem alimentar fileOffset de codegen (o .dill não é emitido com erros).
+  final bool isSynthetic;
+
   const Token({
     required this.type,
     required this.lexeme,
     required this.line,
     required this.column,
     this.literal,
+    this.isSynthetic = false,
   });
 
   @override
   String toString() {
     final lit = literal != null ? ' ($literal)' : '';
-    return '${type.name}[$line:$column] "$lexeme"$lit';
+    final syn = isSynthetic ? ' (synthetic)' : '';
+    return '${type.name}[$line:$column] "$lexeme"$lit$syn';
   }
 }
 
@@ -266,6 +276,8 @@ const Map<String, TokenType> keywords = {
   'match': TokenType.kwMatch,
   'for': TokenType.kwFor,
   'while': TokenType.kwWhile,
+  'break': TokenType.kwBreak,
+  'continue': TokenType.kwContinue,
   'in': TokenType.kwIn,
   'struct': TokenType.kwStruct,
   'class': TokenType.kwClass,

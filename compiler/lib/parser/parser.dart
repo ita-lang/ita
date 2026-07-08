@@ -63,7 +63,235 @@ class Parser {
   int _current = 0;
   bool _noTrailingClosure = false; // desabilita trailing closure temporariamente
 
+  // ============================================================
+  // Recuperação de erro (nível N2 — "ANTLR-lite")
+  // ============================================================
+  //
+  // Três mecanismos cooperam para transformar 1 erro sintático em 1 mensagem
+  // (não numa avalanche) e continuar parseando o resto do arquivo:
+  //
+  // 1. PILHA DE SYNC-SETS (_syncStack): cada construção aninhada (bloco, lista
+  //    de args/params, ...) empurra o conjunto de tokens que a "fecham" ou a
+  //    continuam. `_recoverySet()` une todos os frames + o conjunto-base de
+  //    início de declaração. É o equivalente ao `getErrorRecoverySet` do ANTLR
+  //    subindo a pilha de chamadas: ao sincronizar, paramos no PRIMEIRO token
+  //    que qualquer contexto ativo saiba consumir — sem atravessar fronteiras.
+  //
+  // 2. PANIC MODE (_panicMode): ligado ao registrar o 1º erro; enquanto ligado,
+  //    erros subsequentes são SUPRIMIDOS (a cascata de erros-fantasma derivados
+  //    do primeiro). Desligado quando um token esperado é de fato consumido
+  //    (`_consume`/`_match` com sucesso) — aí sabemos que re-sincronizamos.
+  //    Espelha o `errorRecoveryMode` do ANTLR (reportError early-return em
+  //    recovery; reportMatch limpa).
+  //
+  // 3. SINGLE-TOKEN INSERTION/DELETION (em `_consume`): antes de desistir e
+  //    lançar, tenta corrigir localmente 1 token (lixo a remover, ou pontuação
+  //    faltante a fabricar). Ver `_consume`.
+
+  /// Ligado ao registrar um erro; suprime os erros-cascata seguintes.
+  bool _panicMode = false;
+
+  /// Pilha de recovery-sets contextuais (frames empilhados ao aninhar).
+  final List<Set<TokenType>> _syncStack = [];
+
+  /// Início de declaração top-level — o "chão" do recovery set. Um erro em
+  /// nível de declaração re-sincroniza para a PRÓXIMA declaração (pula o corpo
+  /// quebrado inteiro, evitando cascata do tipo "} inesperado").
+  static const Set<TokenType> _declStart = {
+    TokenType.kwPub,
+    TokenType.kwFn,
+    TokenType.kwAsync,
+    TokenType.kwStream,
+    TokenType.kwActor,
+    TokenType.kwStruct,
+    TokenType.kwClass,
+    TokenType.kwEnum,
+    TokenType.kwTrait,
+    TokenType.kwImpl,
+    TokenType.kwExtension,
+    TokenType.kwImport,
+    TokenType.kwOperator,
+  };
+
+  /// Início de statement — usado no frame de um bloco.
+  static const Set<TokenType> _stmtStart = {
+    TokenType.kwLet,
+    TokenType.kwVar,
+    TokenType.kwReturn,
+    TokenType.kwIf,
+    TokenType.kwGuard,
+    TokenType.kwWhile,
+    TokenType.kwFor,
+    TokenType.kwBreak,
+    TokenType.kwContinue,
+    TokenType.kwEmit,
+  };
+
+  /// Fechadores de fronteira — a recuperação NUNCA os atravessa quando um
+  /// contexto ativo os espera; para antes deles, deixando o `_consume` do
+  /// contexto externo consumi-los.
+  static const Set<TokenType> _boundaryClosers = {
+    TokenType.rbrace,
+    TokenType.rparen,
+    TokenType.rbracket,
+  };
+
+  /// Tokens de PONTUAÇÃO estrutural que `_consume` pode FABRICAR (single-token
+  /// insertion). Restrito a pontuação: inserir identifier/literal sintético
+  /// seria inútil (nome vazio) e arriscaria loop; para esses, `_consume` lança.
+  static const Set<TokenType> _insertable = {
+    TokenType.rparen,
+    TokenType.rbrace,
+    TokenType.rbracket,
+    TokenType.colon,
+    TokenType.arrow,
+    TokenType.fatArrow,
+    TokenType.eq,
+  };
+
   Parser(this.tokens);
+
+  // --- Helpers de recuperação ---
+
+  void _pushSync(Set<TokenType> frame) => _syncStack.add(frame);
+  void _popSync() {
+    if (_syncStack.isNotEmpty) _syncStack.removeLast();
+  }
+
+  /// União dos frames ativos + o conjunto-base de declaração. É o "FOLLOW no
+  /// ponto atual" aproximado (o que qualquer contexto ativo saberia consumir).
+  Set<TokenType> _recoverySet() {
+    final set = <TokenType>{..._declStart};
+    for (final frame in _syncStack) {
+      set.addAll(frame);
+    }
+    return set;
+  }
+
+  /// Registra um erro respeitando o panic mode (supressão de cascata).
+  void _recordError(ParseError e) {
+    if (_panicMode) return; // suprime a cascata derivada do 1º erro
+    errors.add(e);
+    _panicMode = true;
+  }
+
+  bool _isBoundaryCloser(TokenType t) => _boundaryClosers.contains(t);
+
+  /// True se o token atual pode INICIAR uma expressão. Usado para detectar
+  /// "vírgula faltante" em listas de args/elementos: em código válido sempre há
+  /// `,` ou fechador após um elemento, então isto só dispara no caminho de erro.
+  bool _canStartExpression() {
+    switch (_peek().type) {
+      case TokenType.intLiteral:
+      case TokenType.floatLiteral:
+      case TokenType.stringLiteral:
+      case TokenType.multilineString:
+      case TokenType.identifier:
+      case TokenType.kwTrue:
+      case TokenType.kwFalse:
+      case TokenType.kwNil:
+      case TokenType.kwSelf:
+      case TokenType.lparen:
+      case TokenType.lbracket:
+      case TokenType.lbrace:
+      case TokenType.kwMatch:
+      case TokenType.kwIf:
+      case TokenType.kwAwait:
+      case TokenType.kwSpawn:
+      case TokenType.kwPanic:
+      case TokenType.kwAsync:
+      case TokenType.dot:
+      case TokenType.bang:
+      case TokenType.minus:
+      case TokenType.tilde:
+        return true;
+      default:
+        return false;
+    }
+  }
+
+  /// Descrição legível do token esperado (para as mensagens de recuperação).
+  String _expectDesc(TokenType t) {
+    switch (t) {
+      case TokenType.rparen:
+        return "')'";
+      case TokenType.rbrace:
+        return "'}'";
+      case TokenType.rbracket:
+        return "']'";
+      case TokenType.lparen:
+        return "'('";
+      case TokenType.lbrace:
+        return "'{'";
+      case TokenType.lbracket:
+        return "'['";
+      case TokenType.colon:
+        return "':'";
+      case TokenType.comma:
+        return "','";
+      case TokenType.arrow:
+        return "'->'";
+      case TokenType.fatArrow:
+        return "'=>'";
+      case TokenType.eq:
+        return "'='";
+      case TokenType.identifier:
+        return 'um identificador';
+      default:
+        return "'${t.name}'";
+    }
+  }
+
+  /// Símbolo textual de um token de pontuação (para o lexeme sintético).
+  String _symbolFor(TokenType t) {
+    switch (t) {
+      case TokenType.rparen:
+        return ')';
+      case TokenType.rbrace:
+        return '}';
+      case TokenType.rbracket:
+        return ']';
+      case TokenType.colon:
+        return ':';
+      case TokenType.comma:
+        return ',';
+      case TokenType.arrow:
+        return '->';
+      case TokenType.fatArrow:
+        return '=>';
+      case TokenType.eq:
+        return '=';
+      default:
+        return '';
+    }
+  }
+
+  /// Fabrica um token sintético de [type] na posição do token ANTERIOR
+  /// (nunca inventa fileOffset). Literais recebem um valor default seguro para
+  /// não estourar os casts `token.literal as X` dos chamadores.
+  Token _synthetic(TokenType type) {
+    final prev = _current > 0 ? tokens[_current - 1] : _peek();
+    Object? lit;
+    switch (type) {
+      case TokenType.intLiteral:
+        lit = 0;
+      case TokenType.floatLiteral:
+        lit = 0.0;
+      case TokenType.stringLiteral:
+      case TokenType.multilineString:
+        lit = '';
+      default:
+        lit = null;
+    }
+    return Token(
+      type: type,
+      lexeme: _symbolFor(type),
+      line: prev.line,
+      column: prev.column,
+      literal: lit,
+      isSynthetic: true,
+    );
+  }
 
   // ============================================================
   // Entry point
@@ -72,12 +300,23 @@ class Parser {
   Program parse() {
     final declarations = <Declaration>[];
     while (!_isAtEnd) {
+      final depth = _syncStack.length;
       try {
         declarations.add(_declaration());
+        _panicMode = false; // uma declaração completa re-sincroniza de vez
       } catch (e) {
         if (e is ParseError) {
-          errors.add(e);
+          _recordError(e);
+          // Restaura a pilha de sync-sets ao nível pré-declaração (frames de
+          // args/params/blocos abandonados pela exceção não devem vazar).
+          while (_syncStack.length > depth) {
+            _syncStack.removeLast();
+          }
+          final before = _current;
           _synchronize();
+          // Guard anti-loop: garante progresso se a sync parou sem avançar
+          // (token estranho que nenhuma regra consome no topo).
+          if (_current == before && !_isAtEnd) _advance();
         } else {
           rethrow;
         }
@@ -176,7 +415,10 @@ class Parser {
   }
 
   FnDecl _fnDecl(bool isPublic,
-      {bool isAsync = false, bool isStream = false, bool isStatic = false}) {
+      {bool isAsync = false,
+      bool isStream = false,
+      bool isStatic = false,
+      bool allowNoBody = false}) {
     final token = _consume(TokenType.kwFn, 'Expected "fn"');
     final name = _consume(TokenType.identifier, 'Expected function name').lexeme;
 
@@ -204,7 +446,15 @@ class Parser {
     } else if (_check(TokenType.lbrace)) {
       body = _block();
     }
-    // else: sem corpo (declaração abstrata em trait)
+    // else: sem corpo. Só é válido como assinatura abstrata em `trait`
+    // (allowNoBody). Em qualquer outro contexto (top-level, struct, class,
+    // impl, extension, actor) exige corpo — senão o codegen sintetizaria um
+    // corpo em silêncio e a função "compilaria mas rodaria errado".
+    if (body == null && !allowNoBody) {
+      throw _error("fn '$name' precisa de um corpo",
+        hint: 'defina o corpo com "{ ... }" ou "=> expr"; '
+            'assinaturas sem corpo só são válidas dentro de um "trait"');
+    }
 
     return FnDecl(
       name: name,
@@ -365,7 +615,8 @@ class Parser {
 
     final methods = <FnDecl>[];
     while (!_check(TokenType.rbrace) && !_isAtEnd) {
-      methods.add(_fnDecl(false));
+      // Em trait, uma assinatura sem corpo é uma declaração abstrata válida.
+      methods.add(_fnDecl(false, allowNoBody: true));
     }
 
     _consume(TokenType.rbrace, 'Expected "}"');
@@ -608,22 +859,39 @@ class Parser {
 
     if (_check(TokenType.rparen)) return (params, namedParams);
 
-    while (true) {
-      if (_match(TokenType.semicolon)) {
-        inNamed = true;
-        if (_check(TokenType.rparen)) break;
-      }
+    // Frame: dentro da lista de params, ")"/","/";" são pontos de re-sync e
+    // fazem parte do FOLLOW usado por single-token insertion.
+    _pushSync({TokenType.rparen, TokenType.comma, TokenType.semicolon});
+    try {
+      while (true) {
+        if (_match(TokenType.semicolon)) {
+          inNamed = true;
+          if (_check(TokenType.rparen)) break;
+        }
 
-      final param = _param();
-      if (inNamed) {
-        namedParams.add(param);
-      } else {
-        params.add(param);
-      }
+        final param = _param();
+        if (inNamed) {
+          namedParams.add(param);
+        } else {
+          params.add(param);
+        }
 
-      if (_match(TokenType.comma)) continue;
-      if (_check(TokenType.semicolon)) continue; // ; sem comma antes
-      break;
+        if (_match(TokenType.comma)) continue;
+        if (_check(TokenType.semicolon)) continue; // ; sem comma antes
+        if (_check(TokenType.rparen) || _isAtEnd) break;
+        // Sem separador e sem fechador: se o que vem em seguida inicia outro
+        // parâmetro (identifier), assume VÍRGULA FALTANTE e segue — 1 erro
+        // limpo em vez de estourar no `_consume(")")` (bug de cascata).
+        // Em código válido isto nunca dispara: sempre há "," / ";" / ")".
+        if (_check(TokenType.identifier)) {
+          _recordError(_error("faltando ',' entre parâmetros",
+              hint: 'separe os parâmetros com vírgula'));
+          continue;
+        }
+        break;
+      }
+    } finally {
+      _popSync();
     }
 
     return (params, namedParams);
@@ -693,6 +961,8 @@ class Parser {
     if (_check(TokenType.kwGuard)) return _guardStmt();
     if (_check(TokenType.kwWhile)) return _whileStmt();
     if (_check(TokenType.kwFor)) return _forStmt();
+    if (_check(TokenType.kwBreak)) return _breakStmt();
+    if (_check(TokenType.kwContinue)) return _continueStmt();
     if (_check(TokenType.kwEmit)) return _emitStmt();
     if (_check(TokenType.lbrace)) return _block();
 
@@ -703,20 +973,42 @@ class Parser {
     final token = _consume(TokenType.lbrace, 'Expected "{"');
     final stmts = <Statement>[];
 
-    while (!_check(TokenType.rbrace) && !_isAtEnd) {
-      try {
-        stmts.add(_statement());
-        // Semicolons sao opcionais como separadores de statements
-        // Permite: { a = 1; b = 2; c = 3 } numa unica linha
-        while (_match(TokenType.semicolon)) {}
-      } catch (e) {
-        if (e is ParseError) {
-          errors.add(e);
-          _synchronize();
-        } else {
-          rethrow;
+    // Frame de recuperação do bloco: um erro num statement re-sincroniza para o
+    // próximo statement OU para o "}" de fechamento — sem atravessá-lo (era o
+    // bug #1: a sync antiga cruzava o "}" e disparava um 2º erro espúrio).
+    _pushSync({..._stmtStart, ..._declStart, TokenType.rbrace});
+    try {
+      while (!_check(TokenType.rbrace) && !_isAtEnd) {
+        final depth = _syncStack.length;
+        try {
+          stmts.add(_statement());
+          _panicMode = false; // statement completo → fim da cascata
+          // Semicolons sao opcionais como separadores de statements
+          // Permite: { a = 1; b = 2; c = 3 } numa unica linha
+          while (_match(TokenType.semicolon)) {}
+        } catch (e) {
+          if (e is ParseError) {
+            _recordError(e);
+            while (_syncStack.length > depth) {
+              _syncStack.removeLast();
+            }
+            final before = _current;
+            _synchronize();
+            // Guard anti-loop: avança se travou num token que não é o "}" do
+            // bloco (esse encerra o laço naturalmente) — ex.: ")" solto dentro
+            // do bloco vindo de um contexto externo.
+            if (_current == before &&
+                !_isAtEnd &&
+                !_check(TokenType.rbrace)) {
+              _advance();
+            }
+          } else {
+            rethrow;
+          }
         }
       }
+    } finally {
+      _popSync();
     }
 
     _consume(TokenType.rbrace, 'Expected "}"');
@@ -943,6 +1235,16 @@ class Parser {
     final token = _consume(TokenType.kwEmit, 'Expected "emit"');
     final value = _expression();
     return EmitStmt(value, token.line, token.column);
+  }
+
+  BreakStmt _breakStmt() {
+    final token = _consume(TokenType.kwBreak, 'Expected "break"');
+    return BreakStmt(token.line, token.column);
+  }
+
+  ContinueStmt _continueStmt() {
+    final token = _consume(TokenType.kwContinue, 'Expected "continue"');
+    return ContinueStmt(token.line, token.column);
   }
 
   Statement _forStmt() {
@@ -1239,17 +1541,35 @@ class Parser {
     final args = <Argument>[];
 
     if (!_check(TokenType.rparen)) {
-      do {
-        // Check for labeled argument: name: value
-        if (_check(TokenType.identifier) && _checkAt(1, TokenType.colon)) {
-          final label = _advance().lexeme;
-          _advance(); // consume :
-          final value = _expression();
-          args.add(Argument(label: label, value: value));
-        } else {
-          args.add(Argument(value: _expression()));
+      // Frame: ")"/"," re-sincronizam e entram no FOLLOW de single-token insertion.
+      _pushSync({TokenType.rparen, TokenType.comma});
+      try {
+        while (true) {
+          // Check for labeled argument: name: value
+          if (_check(TokenType.identifier) && _checkAt(1, TokenType.colon)) {
+            final label = _advance().lexeme;
+            _advance(); // consume :
+            final value = _expression();
+            args.add(Argument(label: label, value: value));
+          } else {
+            args.add(Argument(value: _expression()));
+          }
+
+          if (_match(TokenType.comma)) continue;
+          if (_check(TokenType.rparen) || _isAtEnd) break;
+          // Sem "," e sem ")": se o próximo inicia uma expressão, assume
+          // VÍRGULA FALTANTE e segue (1 erro limpo, sem cascata no `_consume`).
+          // Em código válido nunca dispara: sempre há "," ou ")".
+          if (_canStartExpression()) {
+            _recordError(_error("faltando ',' entre argumentos",
+                hint: 'separe os argumentos com vírgula'));
+            continue;
+          }
+          break;
         }
-      } while (_match(TokenType.comma));
+      } finally {
+        _popSync();
+      }
     }
 
     _consume(TokenType.rparen, 'Expected ")"');
@@ -1524,9 +1844,23 @@ class Parser {
     final elements = <Expression>[];
 
     if (!_check(TokenType.rbracket)) {
-      do {
-        elements.add(_expression());
-      } while (_match(TokenType.comma));
+      _pushSync({TokenType.rbracket, TokenType.comma});
+      try {
+        while (true) {
+          elements.add(_expression());
+          if (_match(TokenType.comma)) continue;
+          if (_check(TokenType.rbracket) || _isAtEnd) break;
+          // Vírgula faltante entre elementos → 1 erro limpo, sem cascata.
+          if (_canStartExpression()) {
+            _recordError(_error("faltando ',' entre elementos da lista",
+                hint: 'separe os elementos com vírgula'));
+            continue;
+          }
+          break;
+        }
+      } finally {
+        _popSync();
+      }
     }
 
     _consume(TokenType.rbracket, 'Expected "]"');
@@ -1863,7 +2197,42 @@ class Parser {
   }
 
   Token _consume(TokenType type, String message) {
-    if (_check(type)) return _advance();
+    if (_check(type)) {
+      _panicMode = false; // reportMatch: consumo bem-sucedido encerra a cascata
+      return _advance();
+    }
+
+    // ---------------------------------------------------------------
+    // N2 (ANTLR-lite): tenta corrigir 1 token antes de lançar.
+    // Só chega aqui no CAMINHO DE ERRO (código válido nunca falha um consume),
+    // então nada disto afeta programas corretos.
+    // ---------------------------------------------------------------
+
+    // (a) SINGLE-TOKEN DELETION: o próximo token JÁ é o esperado → o token
+    //     atual é lixo (entrada estranha). Descarta-o e segue com o T seguinte.
+    if (!_isAtEnd && _checkAt(1, type)) {
+      final bad = _peek();
+      _recordError(_error(
+        "entrada estranha '${bad.lexeme}' — esperava ${_expectDesc(type)}",
+        hint: 'remova este token'));
+      _advance(); // descarta o lixo
+      _panicMode = false;
+      return _advance(); // consome o T (garantidamente presente)
+    }
+
+    // (b) SINGLE-TOKEN INSERTION: T (pontuação estrutural) está faltando, e o
+    //     token atual é algo que um contexto ativo já espera (∈ FOLLOW ≈
+    //     _recoverySet) — ou fim de arquivo. Fabrica um T sintético e segue SEM
+    //     consumir. Restrito a pontuação (ver _insertable) p/ não inventar
+    //     nomes vazios nem arriscar loop.
+    if (_insertable.contains(type) &&
+        (_isAtEnd || _recoverySet().contains(_peek().type))) {
+      _recordError(_error("faltando ${_expectDesc(type)}",
+          hint: 'insira ${_expectDesc(type)} aqui'));
+      return _synthetic(type); // token fabricado (isSynthetic), não consome
+    }
+
+    // (c) Sem correção local possível: lança para o `_synchronize` da regra.
     throw _error('$message (got ${_peek().type.name} "${_peek().lexeme}")');
   }
 
@@ -1918,28 +2287,38 @@ class Parser {
     );
   }
 
+  /// Panic-mode recovery contextual. Descarta tokens até um ponto de re-sync do
+  /// recovery-set ativo (`_recoverySet` = base de declaração ∪ frames da pilha:
+  /// statements do bloco, "}"/")"/"]" de fronteira, keywords de início de
+  /// construção). Deriva os sync-sets do FIRST/FOLLOW de GRAMMAR.md §3.
+  ///
+  /// Diferenças-chave vs. a versão antiga (que era "cega a fronteiras"):
+  ///  - PARA em "}" "]" ")" quando um contexto ativo os espera — sem
+  ///    atravessá-los (era o bug #1: cruzava o "}" e gerava erro-fantasma).
+  ///  - inclui as keywords que faltavam (actor/extension/operator/stream/
+  ///    async/emit) via _declStart/_stmtStart (bug #2).
+  ///  - contextual: um erro em nível de declaração pula o corpo quebrado inteiro
+  ///    (recovery-set = só _declStart), evitando reprocessar tokens soltos.
   void _synchronize() {
+    if (_isAtEnd) return;
+    final recovery = _recoverySet();
+
+    // Se já estamos sobre um fechador de fronteira que um contexto externo vai
+    // consumir, para AQUI sem atravessá-lo (o `_consume` de fora o pega).
+    if (_isBoundaryCloser(_peek().type) && recovery.contains(_peek().type)) {
+      return;
+    }
+
+    // Garante progresso: consome ao menos o token ofensor.
     _advance();
+
     while (!_isAtEnd) {
-      switch (_peek().type) {
-        case TokenType.kwFn:
-        case TokenType.kwStruct:
-        case TokenType.kwClass:
-        case TokenType.kwEnum:
-        case TokenType.kwTrait:
-        case TokenType.kwImpl:
-        case TokenType.kwLet:
-        case TokenType.kwVar:
-        case TokenType.kwReturn:
-        case TokenType.kwIf:
-        case TokenType.kwFor:
-        case TokenType.kwWhile:
-        case TokenType.kwGuard:
-        case TokenType.kwImport:
-          return;
-        default:
-          _advance();
-      }
+      final t = _peek().type;
+      // Para ANTES de um fechador de fronteira esperado (não o atravessa).
+      if (_isBoundaryCloser(t) && recovery.contains(t)) return;
+      // Para ANTES de uma keyword de início de construção (a regra a consome).
+      if (recovery.contains(t)) return;
+      _advance();
     }
   }
 }

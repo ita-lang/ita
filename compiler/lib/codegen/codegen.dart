@@ -250,6 +250,12 @@ class CodeGenerator {
   // Scope de variáveis locais
   final List<Map<String, k.VariableDeclaration>> _scopes = [];
 
+  // Pilha de loops ativos, para resolver `break`/`continue` SEM rótulo.
+  // O topo é o loop mais interno; empurrado ao entrar em while/for-in/for-await
+  // e desempilhado ao sair. Um `break`/`continue` com a pilha vazia → erro de
+  // compilação ("fora de loop"). Ver [_LoopScope] e [_compileBreak].
+  final List<_LoopScope> _loopStack = [];
+
   // Funções top-level
   final Map<String, k.Procedure> _functions = {};
 
@@ -2419,6 +2425,10 @@ class CodeGenerator {
   }
 
   k.Statement _compileIfWithImplicitReturn(ast.IfStmt stmt) {
+    final cond = stmt.condition;
+    if (cond is ast.IfLetExpr && cond.name.isNotEmpty) {
+      return _compileIfLetStmt(cond, implicitReturn: true);
+    }
     final condition = _compileExpr(stmt.condition);
     final then = _wrapWithImplicitReturn(stmt.thenBranch);
     final otherwise = stmt.elseBranch != null
@@ -2476,7 +2486,42 @@ class CodeGenerator {
         return k.YieldStatement(_compileExpr(s.value));
       case ast.ForAwaitStmt s:
         return _compileForAwait(s);
+      case ast.BreakStmt s:
+        return _compileBreak(s);
+      case ast.ContinueStmt s:
+        return _compileContinue(s);
     }
+  }
+
+  /// `break` sem rótulo → salto para fora do loop mais interno.
+  /// O `k.Statement` concreto depende do tipo de loop (ver [_LoopScope]):
+  /// `BreakStatement(labelExterno)` para while/for-in; `sub.cancel(); return;`
+  /// para for-await (que é lowered para `stream.listen(...)`).
+  k.Statement _compileBreak(ast.BreakStmt s) {
+    if (_loopStack.isEmpty) {
+      _error('`break` fora de um loop', s.line, s.column,
+          length: 5,
+          hint: '`break` só é válido dentro de while, for-in ou for-await');
+      return k.EmptyStatement();
+    }
+    final scope = _loopStack.last;
+    scope.usedBreak = true;
+    return scope.emitBreak();
+  }
+
+  /// `continue` sem rótulo → pula para a próxima iteração do loop mais interno.
+  /// É um `BreakStatement` para um `LabeledStatement` que envolve APENAS o corpo
+  /// (não o incremento), de modo que o passo de incremento ainda execute.
+  k.Statement _compileContinue(ast.ContinueStmt s) {
+    if (_loopStack.isEmpty) {
+      _error('`continue` fora de um loop', s.line, s.column,
+          length: 8,
+          hint: '`continue` só é válido dentro de while, for-in ou for-await');
+      return k.EmptyStatement();
+    }
+    final scope = _loopStack.last;
+    scope.usedContinue = true;
+    return scope.emitContinue();
   }
 
   k.Block _compileBlock(ast.BlockStmt stmt) {
@@ -2633,13 +2678,68 @@ class CodeGenerator {
     return k.ExpressionStatement(_compileExpr(stmt.expression));
   }
 
-  k.IfStatement _compileIf(ast.IfStmt stmt) {
+  k.Statement _compileIf(ast.IfStmt stmt) {
+    // `if let name = expr { ... } else { ... }` chega aqui como IfStmt cuja
+    // condition é um IfLetExpr com name != ''. Precisa de codegen próprio: o
+    // caminho comum usaria o VALOR do IfLetExpr como condição booleana (roda os
+    // dois branches e ignora o resultado) e não liga o binding no corpo.
+    final cond = stmt.condition;
+    if (cond is ast.IfLetExpr && cond.name.isNotEmpty) {
+      return _compileIfLetStmt(cond, implicitReturn: false);
+    }
     final condition = _compileExpr(stmt.condition);
     final then = _compileStatement(stmt.thenBranch);
     final otherwise = stmt.elseBranch != null
         ? _compileStatement(stmt.elseBranch!)
         : null;
     return k.IfStatement(condition, then, otherwise);
+  }
+
+  /// Codegen do `if let name = expr { then } else { else }` como STATEMENT.
+  /// Gera, correto e com avaliação única de `expr`:
+  ///
+  ///   { var _iflet = expr;
+  ///     if (_iflet != null) { var name = _iflet; <then> } else { <else> } }
+  ///
+  /// `name` é declarado no escopo SÓ durante a compilação do then-branch, então
+  /// nem o else nem o código seguinte o enxergam. Espelha _compileGuardLet.
+  k.Statement _compileIfLetStmt(ast.IfLetExpr e, {required bool implicitReturn}) {
+    final tmp = k.VariableDeclaration(
+      '_iflet',
+      initializer: _compileExpr(e.value),
+      type: const k.DynamicType(),
+      isFinal: true,
+    );
+    // binding ligado ao valor unwrapped (não-nil) de tmp
+    final bindVar = k.VariableDeclaration(
+      e.name,
+      initializer: k.VariableGet(tmp),
+      type: const k.DynamicType(),
+      isFinal: true,
+    );
+
+    _pushScope();
+    _declareVar(e.name, bindVar);
+    final thenBody = implicitReturn
+        ? _wrapWithImplicitReturn(e.thenBranch)
+        : _compileStatement(e.thenBranch);
+    _popScope();
+    final thenBlock = k.Block([bindVar, thenBody]);
+
+    final elseBody = e.elseBranch != null
+        ? (implicitReturn
+            ? _wrapWithImplicitReturn(e.elseBranch!)
+            : _compileStatement(e.elseBranch!))
+        : null;
+
+    return k.Block([
+      tmp,
+      k.IfStatement(
+        k.Not(k.EqualsNull(k.VariableGet(tmp))),
+        thenBlock,
+        elseBody,
+      ),
+    ]);
   }
 
   k.Statement _compileGuard(ast.GuardStmt stmt) {
@@ -2686,8 +2786,39 @@ class CodeGenerator {
     ]);
   }
 
-  k.WhileStatement _compileWhile(ast.WhileStmt stmt) {
-    return k.WhileStatement(_compileExpr(stmt.condition), _compileStatement(stmt.body));
+  k.Statement _compileWhile(ast.WhileStmt stmt) {
+    final cond = _compileExpr(stmt.condition);
+
+    // Alvos de salto para break/continue. Criados com corpo nulo ANTES de
+    // compilar o corpo, para que os BreakStatement internos possam apontá-los.
+    final breakLabel = k.LabeledStatement(null);
+    final continueLabel = k.LabeledStatement(null);
+    final scope = _LoopScope(
+      () => k.BreakStatement(breakLabel),
+      () => k.BreakStatement(continueLabel),
+    );
+    _loopStack.add(scope);
+    final body = _compileStatement(stmt.body);
+    _loopStack.removeLast();
+
+    // `continue` → break para o label que envolve o corpo (pula para o fim do
+    // corpo → o while re-testa a condição). Só embrulha se houve `continue`.
+    k.Statement loopBody = body;
+    if (scope.usedContinue) {
+      continueLabel.body = body;
+      body.parent = continueLabel;
+      loopBody = continueLabel;
+    }
+    // `break` → break para o label que envolve o while inteiro. Só embrulha se
+    // houve `break` (loops sem break/continue emitem exatamente o kernel antigo
+    // → zero regressão).
+    k.Statement loop = k.WhileStatement(cond, loopBody);
+    if (scope.usedBreak) {
+      breakLabel.body = loop;
+      loop.parent = breakLabel;
+      loop = breakLabel;
+    }
+    return loop;
   }
 
   /// for await x in stream { body }
@@ -2703,19 +2834,54 @@ class CodeGenerator {
       type: const k.DynamicType(), isFinal: true);
     _declareVar(stmt.variable, elemParam);
 
+    // Variável da subscription — só entra na árvore se houver `break`.
+    // Declarada ANTES de compilar o corpo para o factory de break referenciá-la.
+    // Inicializa com null e é atribuída pelo `.listen(...)` abaixo; o listener só
+    // roda depois disso, então nunca lê null (dispensa `late`).
+    final subVar = k.VariableDeclaration('_fas',
+      initializer: k.NullLiteral(), type: const k.DynamicType(), isFinal: false);
+
+    final continueLabel = k.LabeledStatement(null);
+    final scope = _LoopScope(
+      // break → cancela a subscription e sai do callback (para de consumir).
+      () => k.Block([
+        k.ExpressionStatement(k.DynamicInvocation(k.DynamicAccessKind.Dynamic,
+          k.VariableGet(subVar), k.Name('cancel'), k.Arguments([]))),
+        k.ReturnStatement(),
+      ]),
+      // continue → pula para o fim do corpo do listener (= aguarda o próximo item).
+      () => k.BreakStatement(continueLabel),
+    );
+    _loopStack.add(scope);
     final body = _compileStatement(stmt.body);
+    _loopStack.removeLast();
     _popScope();
+
+    k.Statement listenerBody = body;
+    if (scope.usedContinue) {
+      continueLabel.body = body;
+      body.parent = continueLabel;
+      listenerBody = continueLabel;
+    }
 
     // Closure: (item) { body }
     final listener = k.FunctionExpression(k.FunctionNode(
-      body,
+      listenerBody,
       positionalParameters: [elemParam],
       returnType: const k.VoidType()));
 
-    // stream.listen(listener)
-    return k.ExpressionStatement(
-      k.DynamicInvocation(k.DynamicAccessKind.Dynamic,
-        stream, k.Name('listen'), k.Arguments([listener])));
+    final listenCall = k.DynamicInvocation(k.DynamicAccessKind.Dynamic,
+      stream, k.Name('listen'), k.Arguments([listener]));
+
+    if (scope.usedBreak) {
+      // var _fas = null; _fas = stream.listen((item){ ... _fas.cancel(); return ... });
+      return k.Block([
+        subVar,
+        k.ExpressionStatement(k.VariableSet(subVar, listenCall)),
+      ]);
+    }
+    // Sem break: idêntico ao lowering original (fire-and-forget listen).
+    return k.ExpressionStatement(listenCall);
   }
 
   k.Statement _compileForIn(ast.ForInStmt stmt) {
@@ -2745,7 +2911,17 @@ class CodeGenerator {
     final prevElemType = _varTypes[stmt.variable];
     final iterIsString = _isStringReceiver(stmt.iterable);
     if (iterIsString) _varTypes[stmt.variable] = 'String';
+
+    final breakLabel = k.LabeledStatement(null);
+    final continueLabel = k.LabeledStatement(null);
+    final scope = _LoopScope(
+      () => k.BreakStatement(breakLabel),
+      () => k.BreakStatement(continueLabel),
+    );
+    _loopStack.add(scope);
     final body = _compileStatement(stmt.body);
+    _loopStack.removeLast();
+
     if (iterIsString) {
       if (prevElemType == null) {
         _varTypes.remove(stmt.variable);
@@ -2755,21 +2931,30 @@ class CodeGenerator {
     }
     _popScope();
 
-    return k.Block([
-      listVar, indexVar,
-      k.WhileStatement(
-        k.DynamicInvocation(k.DynamicAccessKind.Dynamic,
-          k.VariableGet(indexVar), k.Name('<'),
-          k.Arguments([k.DynamicGet(k.DynamicAccessKind.Dynamic,
-            k.VariableGet(listVar), k.Name('length'))])),
-        k.Block([
-          elemVar, body,
-          k.ExpressionStatement(k.VariableSet(indexVar,
-            k.DynamicInvocation(k.DynamicAccessKind.Dynamic,
-              k.VariableGet(indexVar), k.Name('+'),
-              k.Arguments([k.IntLiteral(1)])))),
-        ])),
-    ]);
+    // `continue` envolve APENAS o corpo → cai no incremento `_fi++` e re-testa.
+    k.Statement bodyStmt = body;
+    if (scope.usedContinue) {
+      continueLabel.body = body;
+      body.parent = continueLabel;
+      bodyStmt = continueLabel;
+    }
+    final increment = k.ExpressionStatement(k.VariableSet(indexVar,
+      k.DynamicInvocation(k.DynamicAccessKind.Dynamic,
+        k.VariableGet(indexVar), k.Name('+'),
+        k.Arguments([k.IntLiteral(1)]))));
+    k.Statement loop = k.WhileStatement(
+      k.DynamicInvocation(k.DynamicAccessKind.Dynamic,
+        k.VariableGet(indexVar), k.Name('<'),
+        k.Arguments([k.DynamicGet(k.DynamicAccessKind.Dynamic,
+          k.VariableGet(listVar), k.Name('length'))])),
+      k.Block([elemVar, bodyStmt, increment]));
+    if (scope.usedBreak) {
+      breakLabel.body = loop;
+      loop.parent = breakLabel;
+      loop = breakLabel;
+    }
+
+    return k.Block([listVar, indexVar, loop]);
   }
 
   /// for i in start..end → var i = start; while (i < end) { body; i++; }
@@ -2782,22 +2967,39 @@ class CodeGenerator {
       initializer: start, type: const k.DynamicType(), isFinal: false);
     _declareVar(variable, iVar);
 
+    final breakLabel = k.LabeledStatement(null);
+    final continueLabel = k.LabeledStatement(null);
+    final scope = _LoopScope(
+      () => k.BreakStatement(breakLabel),
+      () => k.BreakStatement(continueLabel),
+    );
+    _loopStack.add(scope);
     final compiledBody = _compileStatement(body);
+    _loopStack.removeLast();
     _popScope();
 
     final cmpOp = range.inclusive ? '<=' : '<';
-    return k.Block([
-      iVar,
-      k.WhileStatement(
-        k.DynamicInvocation(k.DynamicAccessKind.Dynamic,
-          k.VariableGet(iVar), k.Name(cmpOp), k.Arguments([end])),
-        k.Block([
-          compiledBody,
-          k.ExpressionStatement(k.VariableSet(iVar,
-            k.DynamicInvocation(k.DynamicAccessKind.Dynamic,
-              k.VariableGet(iVar), k.Name('+'), k.Arguments([k.IntLiteral(1)])))),
-        ])),
-    ]);
+    // `continue` envolve APENAS o corpo → cai no incremento `i++` e re-testa
+    // (não pula o incremento, senão seria loop infinito).
+    k.Statement bodyStmt = compiledBody;
+    if (scope.usedContinue) {
+      continueLabel.body = compiledBody;
+      compiledBody.parent = continueLabel;
+      bodyStmt = continueLabel;
+    }
+    final increment = k.ExpressionStatement(k.VariableSet(iVar,
+      k.DynamicInvocation(k.DynamicAccessKind.Dynamic,
+        k.VariableGet(iVar), k.Name('+'), k.Arguments([k.IntLiteral(1)]))));
+    k.Statement loop = k.WhileStatement(
+      k.DynamicInvocation(k.DynamicAccessKind.Dynamic,
+        k.VariableGet(iVar), k.Name(cmpOp), k.Arguments([end])),
+      k.Block([bodyStmt, increment]));
+    if (scope.usedBreak) {
+      breakLabel.body = loop;
+      loop.parent = breakLabel;
+      loop = breakLabel;
+    }
+    return k.Block([iVar, loop]);
   }
 
   // ============================================================
@@ -2871,10 +3073,21 @@ class CodeGenerator {
         // if let name = expr { then } else { else }
         final tmp = k.VariableDeclaration('_iflet',
           initializer: _compileExpr(e.value), type: const k.DynamicType(), isFinal: true);
+        // Liga `name` ao valor unwrapped (não-nil) de tmp, visível SÓ no
+        // then-branch (mesmo padrão de _compileGuardLet). Sem isso o corpo
+        // referencia `name` que nunca foi declarado → "não encontrado no escopo".
+        final bindVar = k.VariableDeclaration(e.name,
+          initializer: k.VariableGet(tmp), type: const k.DynamicType(), isFinal: true);
+        _pushScope();
+        _declareVar(e.name, bindVar);
         final thenVal = _compileBlockValue(e.thenBranch);
+        _popScope();
+        // else/depois NÃO enxergam `name`: scope já foi removido.
         final elseVal = e.elseBranch != null ? _compileBlockValue(e.elseBranch!) : k.NullLiteral();
         return k.Let(tmp, k.ConditionalExpression(
-          k.Not(k.EqualsNull(k.VariableGet(tmp))), thenVal, elseVal, const k.DynamicType()));
+          k.Not(k.EqualsNull(k.VariableGet(tmp))),
+          k.Let(bindVar, thenVal),
+          elseVal, const k.DynamicType()));
       case ast.BlockExpr e:
         if (e.value != null) return _compileExpr(e.value!);
         return k.NullLiteral();
@@ -11149,6 +11362,27 @@ class CodeGenerator {
   void _error(String msg, int line, int col, {int length = 1, String? hint, String? label}) {
     errors.add(CompileError(msg, line, col, length: length, hint: hint, label: label));
   }
+}
+
+/// Contexto de um loop em compilação, empilhado em [CodeGenerator._loopStack]
+/// para resolver `break`/`continue` SEM rótulo.
+///
+/// No Dart Kernel não existe break/continue soltos: ambos viram
+/// `BreakStatement(target)` para um `LabeledStatement`. Para não pagar o custo
+/// dos labels quando o loop não usa break/continue (a esmagadora maioria dos
+/// loops existentes), os labels só são materializados quando [usedBreak] /
+/// [usedContinue] ficam `true` — garantindo kernel idêntico ao anterior nesses
+/// casos (zero regressão).
+///
+/// [emitBreak]/[emitContinue] são fábricas do salto correto para CADA tipo de
+/// loop: while/for-in usam `BreakStatement(label)`; for-await (lowered para
+/// `stream.listen(...)`) usa `sub.cancel(); return;` no break.
+class _LoopScope {
+  final k.Statement Function() emitBreak;
+  final k.Statement Function() emitContinue;
+  bool usedBreak = false;
+  bool usedContinue = false;
+  _LoopScope(this.emitBreak, this.emitContinue);
 }
 
 /// Marker interno para enum constructor call pendente.

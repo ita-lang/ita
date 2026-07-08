@@ -1,0 +1,26 @@
+for-range break:
+0
+1
+2
+3
+4
+for-range continue (ímpares):
+1
+3
+5
+7
+9
+while break:
+0
+1
+2
+for-in continue (pula 30):
+10
+20
+40
+50
+nested break (interno só):
+a=0 b=0
+a=1 b=0
+a=2 b=0
+done

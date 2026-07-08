@@ -67,6 +67,20 @@ jobs:
       - name: Testes unitarios
         run: bash .claude/skills/ita-test/test.sh unit
 
+      # Conformancia sintatica: corpus de programas .tu minimos (um por
+      # construcao da GRAMMAR.md) rodados via `itac check`. Blinda a gramatica
+      # contra regressoes: todo valid/ deve passar e todo invalid/ deve
+      # reprovar. Sai !=0 em qualquer discrepancia (regressao do parser OU
+      # buraco novo: o parser passou a aceitar algo que deveria rejeitar).
+      - name: Conformância sintática (corpus GRAMMAR.md)
+        run: |
+          set -euo pipefail
+          VER="${{ steps.pin.outputs.ver }}"
+          export ITA_DART_BIN="$PWD/.dart-sdk/$VER/dart-sdk/bin/dart"
+          export ITA_PLATFORM_DILL="$PWD/.dart-sdk/$VER/dart-sdk/lib/_internal/vm_platform.dill"
+          export ITA_PACKAGES="$PWD/compiler/.dart_tool/package_config.json"
+          bash compiler/test/conformance/run_conformance.sh
+
       # Regressao da stdlib (repo irmao ita-lang/stdlib): garante que os 12
       # modulos continuem (1) COMPILANDO (`itac check`) e (2) RODANDO
       # (run + golden via stdlib/test/run_runtime.sh) com o compilador deste
