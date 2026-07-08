@@ -421,6 +421,10 @@ class Formatter {
         _writeln('${_indentStr()}}');
       case EmitStmt():
         _writeln('${_indentStr()}emit ${_expr(stmt.value)}');
+      case BreakStmt():
+        _writeln('${_indentStr()}break');
+      case ContinueStmt():
+        _writeln('${_indentStr()}continue');
     }
   }
 

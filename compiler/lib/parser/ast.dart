@@ -468,6 +468,18 @@ class ForInStmt extends Statement {
   }) : super(line, column);
 }
 
+/// break — sai imediatamente do loop mais interno (while / for-in / for-await).
+/// Sem rótulo: afeta apenas o loop diretamente envolvente.
+class BreakStmt extends Statement {
+  BreakStmt(super.line, super.column);
+}
+
+/// continue — pula para a próxima iteração do loop mais interno.
+/// Sem rótulo: afeta apenas o loop diretamente envolvente.
+class ContinueStmt extends Statement {
+  ContinueStmt(super.line, super.column);
+}
+
 /// emit value — emite um valor numa stream fn
 class EmitStmt extends Statement {
   final Expression value;
@@ -1039,6 +1051,12 @@ class AstPrinter {
           _visit(n.condition);
           _visit(n.body);
         });
+
+      case BreakStmt _:
+        _println('Break');
+
+      case ContinueStmt _:
+        _println('Continue');
 
       case DestructureStmt n:
         _println('Destructure (${n.isMutable ? "var" : "let"})');
