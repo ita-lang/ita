@@ -58,8 +58,34 @@ jobs:
       - name: Materializar + validar o pin (pin-dart.sh)
         run: bash tools/pin-dart.sh
 
+      # Compila o `itac` AOT (binario nativo) UMA vez e exporta ITA_ITAC_BIN +
+      # ITA_COMPILER_LIB pros passos seguintes (via $GITHUB_ENV). Todo runner que
+      # compila .tu passa a usar o binario no lugar do JIT (`dart itac.dart`):
+      # ~250x por invocacao -> a suite inteira cai de minutos p/ segundos
+      # (ex.: conformancia 76 arquivos: ~76 s -> ~1,5 s). O binario (~10 MB,
+      # platform-specific) e gitignored (build/) -> rebuildado a cada run.
+      # ITA_COMPILER_LIB e necessario porque sob AOT o Platform.script aponta pro
+      # binario: sem ele, o codegen nao acha compiler/lib/toml e emitiria um
+      # .dill diferente do JIT p/ programas que usam Toml.
+      - name: Build do itac AOT
+        run: |
+          set -euo pipefail
+          VER="${{ steps.pin.outputs.ver }}"
+          export ITA_DART_BIN="$PWD/.dart-sdk/$VER/dart-sdk/bin/dart"
+          bash tools/build-itac.sh "$PWD/build/itac"
+          echo "ITA_ITAC_BIN=$PWD/build/itac" >> "$GITHUB_ENV"
+          echo "ITA_COMPILER_LIB=$PWD/compiler/lib" >> "$GITHUB_ENV"
+
+      # Guarda de compile-time: compila um conjunto fixo de exemplos N vezes com
+      # o AOT e FALHA se a mediana passar do limite (0,5 s/arquivo). Pega uma
+      # regressao grave -- volta pro JIT (~1-9 s) ou blow-up O(n^2) no pipeline --
+      # antes do merge. Racional do limite documentado no proprio script.
+      - name: Benchmark de compile-time (guard)
+        run: bash compiler/test/bench/compile_bench.sh
+
       # Suite de examples: 48 programas .tu (exclui os 2 modulos sem main;
       # os 5 servers/listeners sao compile-only). Sai !=0 em qualquer regressao.
+      # Compila cada example via o itac AOT (ITA_ITAC_BIN, do passo acima).
       - name: Suite de examples
         run: bash .claude/skills/ita-test/test.sh examples
 
@@ -110,10 +136,20 @@ jobs:
           export ITA_PACKAGES="$PWD/compiler/.dart_tool/package_config.json"
           export ITA_ITAC="$PWD/compiler/bin/itac.dart"
           export ITA_STDLIB="$RUNNER_TEMP/stdlib"
+          # itac check via AOT (ITA_ITAC_BIN, do passo "Build do itac AOT");
+          # fallback JIT se ausente. Mesmo resultado, so + rapido.
+          if [ -n "${ITA_ITAC_BIN:-}" ] && [ -x "$ITA_ITAC_BIN" ]; then
+            CHECK=( "$ITA_ITAC_BIN" )
+          else
+            CHECK=( "$ITA_DART_BIN" --packages="$ITA_PACKAGES" "$ITA_ITAC" )
+          fi
           echo "== 1. compila: itac check nos 12 modulos =="
           for m in async cache collections config datetime event iter log math server text validate; do
             echo "-- check $m.tu"
-            "$ITA_DART_BIN" --packages="$ITA_PACKAGES" "$ITA_ITAC" check "$RUNNER_TEMP/stdlib/$m.tu"
+            "${CHECK[@]}" check "$RUNNER_TEMP/stdlib/$m.tu"
           done
+          # run_runtime.sh vive no repo stdlib (irmao); ele proprio decide como
+          # invoca o compilador. Se respeitar ITA_ITAC_BIN, herda o AOT; senao
+          # cai no JIT. Fora do escopo deste repo ajusta-lo -- ver Reporte.
           echo "== 2. roda: run + golden (run_runtime.sh) =="
           bash "$RUNNER_TEMP/stdlib/test/run_runtime.sh"
