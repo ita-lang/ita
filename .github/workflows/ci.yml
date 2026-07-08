@@ -81,6 +81,21 @@ jobs:
           export ITA_PACKAGES="$PWD/compiler/.dart_tool/package_config.json"
           bash compiler/test/conformance/run_conformance.sh
 
+      # Paridade VM x Node (oracle JS): o MESMO .dill roda na Dart VM e compila
+      # para JS (dart2js -> Node). A saida da VM e' o ORACLE; cada example e'
+      # classificado (MATCH > NUM > MISMATCH > NODE_ERR > DART2JS_CRASH) e
+      # reconciliado com o snapshot versionado expected.txt. Sai !=0 se QUALQUER
+      # example PIORAR de status (regressao de codegen do alvo JS); so avisa se
+      # melhorar. Node ja vem preinstalado no runner macos-14.
+      - name: Paridade VM×Node (oracle JS)
+        run: |
+          set -euo pipefail
+          VER="${{ steps.pin.outputs.ver }}"
+          export ITA_DART_BIN="$PWD/.dart-sdk/$VER/dart-sdk/bin/dart"
+          export ITA_PLATFORM_DILL="$PWD/.dart-sdk/$VER/dart-sdk/lib/_internal/vm_platform.dill"
+          export ITA_PACKAGES="$PWD/compiler/.dart_tool/package_config.json"
+          bash compiler/test/js_parity/run_js_parity.sh
+
       # Regressao da stdlib (repo irmao ita-lang/stdlib): garante que os 12
       # modulos continuem (1) COMPILANDO (`itac check`) e (2) RODANDO
       # (run + golden via stdlib/test/run_runtime.sh) com o compilador deste
