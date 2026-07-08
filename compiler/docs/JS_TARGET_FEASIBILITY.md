@@ -108,9 +108,74 @@ Provar o `.dill`→JS end-to-end com um programa puro:
 6. **Alvo web vs. Node** — `dart2js_platform` (browser) vs. `dart2js_server_platform.dill` (Node,
    também presente); decide o que é suportado.
 
+---
+
+## Spike (2026-07-08) — resultado empírico
+
+O spike rodou o pipeline de verdade e **corrigiu o otimismo deste estudo**. Veredito: **PARCIAL** —
+o mecanismo funciona, mas "viável já para o subconjunto puro-computacional" era **falso**.
+
+**O mecanismo funciona (provado byte-a-byte).** A "incógnita da flag de entrada-dill" era um
+não-problema: o `dart compile js` **aceita o `.dill` como entry point posicional** e pula o CFE.
+Comando que funcionou:
+```bash
+dart compile js --server-mode -O4 -o out.js  programa.dill
+node out.js   # saída idêntica à VM em -O0 e -O4, browser e server-mode
+```
+`hello.tu` deu match byte-a-byte (32 KB `-O4`, 10,7 KB gzip).
+
+**Mas a cobertura é baixa:** dos 18 exemplos com `main` que rodam limpo na VM, **só 5 (28%)** geram
+JS idêntico. E **nenhuma** das falhas é um dos 2 bloqueios que este estudo previa. Surgiram **3
+classes novas**:
+
+| Classe | O que é | Casos | Natureza |
+|--------|---------|:----:|----------|
+| **A — números** | `Float` de valor inteiro imprime `3.0` na VM, `3` no JS (JS tem um só `number`) | 8 | **decisão de linguagem** (formatação numérica própria do Itá) |
+| **B — Kernel estrito** | dart2js **rejeita** `.dill` que a VM tolera: `Unexpected variable index` em `StringConcatenation` (registro de escopo/índice de variável sub-especificado) | 4 | **débito de codegen = Fase 4 (semântica)** |
+| **C — RTI generics** | JS compila mas crasha: type-args chegam `undefined` (a VM reifica generics; o RTI do dart2js exige threading) | 1 | codegen threading de type-args |
+
+**Os bloqueios previstos NÃO eram os reais:**
+- **#1 plataforma / crash #50313 — DISSOLVIDO.** O `.dill` nasce sobre `vm_platform` e **re-linka
+  limpo** contra a plataforma web por canonical name (os 5 matches provam). O crash de `modern` é
+  idêntico em browser e server → é conteúdo do `.dill`, não plataforma.
+- **#2 libs VM-only — não exercido** (fixtures puros não tocam File/Http/actors). Segue no M5.
+
+**O achado que reposiciona o M4:** o dart2js é um **consumidor estrito de Kernel** que pega o débito
+de codegen que a **Dart VM leniente mascara**. Logo, **o alvo JS é um *test oracle* da Fase 4** — os
+bloqueios reais (B e C) são exatamente o trabalho de codegen tipado/semântica que já é P0. JS "de
+graça" só vale para o sub-subconjunto sem generics e sem `Float`-de-valor-inteiro.
+
+**Próximo passo:** atacar a **Classe B** (crash `Unexpected variable index`, o mais determinístico) +
+um **golden-runner VM×Node** no CI como oracle. A Classe A é decisão de spec (formatação numérica);
+a C acopla-se à B.
+
+---
+
+## Estudo do backend JS alternativo (Deno/Oxc/SWC) — 2026-07-08
+
+Avaliado a pedido do dono: vale um backend JS **próprio** (via Oxc/SWC/Deno) em vez de dart2js?
+**Veredito: NÃO.** O motivo não é lealdade ao Dart — é que **Oxc/SWC não resolvem o problema difícil**.
+
+- **Oxc/SWC são JS-in → JS-out.** O codegen deles só **formata uma AST que já é de JS**; não geram
+  JS a partir de AST arbitrária (a do Itá). Todo o lowering Itá→JS + o runtime Itá-em-JS continuaria
+  100% por sua conta — que é o que o dart2js faz de graça reusando o `.dill`.
+- **Premissas imprecisas:** Deno usa **SWC** (não Oxc, não Rolldown); `deno bundle` (voltou no 2.4)
+  usa **esbuild**; `deno compile` gera binário **~45–55 MB** vs. os **~4,8 MB** do `dart compile exe`
+  que o Itá **já tem** (~10× maior); "JSX" é confusão — o alvo é **JS** (JSX é sintaxe de UI/React).
+- **As 3 arquiteturas de "backend próprio":** só a **(a) em Dart puro** (codegen emite JS direto)
+  respeita "zero node_modules" — e mesmo ela reimplementa o dart2js. As variantes com Deno/Oxc
+  (dois-processos ou FFI) adicionam linguagem + toolchain ao build **sem tocar no trabalho difícil**.
+- **Deno tem papel legítimo — mas só na periferia:** playground web rodando o JS da Rota A (é V8, roda
+  de graça), LSP, bundling do output, site de docs. **Nunca no codegen core.**
+- **Plano B** (só se a Rota A morrer tecnicamente): um emitter JS **em Dart puro** — ainda sem
+  Oxc/SWC/Deno, porque tendo a AST de JS, imprimir é a parte fácil.
+
+---
+
 ## Fontes
 
 - [dart compile](https://dart.dev/tools/dart-compile)
+- [Deno 2.4 — deno bundle via esbuild](https://deno.com/blog/v2.4) · [deno compile](https://docs.deno.com/runtime/reference/cli/compile/) · [deno_ast usa SWC](https://github.com/denoland/deno_ast) · [Oxc #6854 — codegen JS-side atrás](https://github.com/oxc-project/oxc/discussions/6854)
 - [dart2js #55048 — dart:io compila mas estoura no web](https://github.com/dart-lang/sdk/issues/55048)
 - [#47261 — remover dart:io do web](https://github.com/dart-lang/sdk/issues/47261)
 - [#50313 — crash dart2js + platform dill](https://github.com/dart-lang/sdk/issues/50313)
