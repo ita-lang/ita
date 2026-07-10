@@ -240,6 +240,7 @@ class CodeGenerator {
   late k.Class _streamClass;
   late k.Procedure _streamFirstGetter;
   k.Procedure? _callActorHelper; // gerado sob demanda
+  k.Procedure? _fmtFloatHelper; // formata Float com `.0` (paridade VM x JS)
 
   // URI do módulo
   final _fileUri = Uri.parse('file:///ita/main.tu');
@@ -1149,18 +1150,37 @@ class CodeGenerator {
       for (var i = 0; i < fieldNames.length; i++) {
         if (i > 0) parts.add(k.StringLiteral(', '));
         parts.add(k.StringLiteral('${fieldNames[i]}: '));
-        parts.add(k.DynamicInvocation(
-          k.DynamicAccessKind.Dynamic,
-          k.InstanceGet(
-            k.InstanceAccessKind.Instance,
-            k.ThisExpression(),
-            _memberName(fieldNames[i]),
-            resultType: const k.DynamicType(),
-            interfaceTarget: cls.fields.firstWhere((f) => f.name.text == fieldNames[i]),
-          ),
-          k.Name('toString'),
-          k.Arguments([]),
-        ));
+        final field = cls.fields.firstWhere((f) => f.name.text == fieldNames[i]);
+        // Campo Float → força `.0` (paridade VM x JS). Campo genérico/dynamic
+        // (ex.: `value` de Result<T>) fica no `.toString()` nativo (limitação).
+        if (_isDoubleType(field.type)) {
+          _ensureFmtFloatHelper();
+          parts.add(k.StaticInvocation(
+            _fmtFloatHelper!,
+            k.Arguments([
+              k.InstanceGet(
+                k.InstanceAccessKind.Instance,
+                k.ThisExpression(),
+                _memberName(fieldNames[i]),
+                resultType: field.type,
+                interfaceTarget: field,
+              ),
+            ]),
+          ));
+        } else {
+          parts.add(k.DynamicInvocation(
+            k.DynamicAccessKind.Dynamic,
+            k.InstanceGet(
+              k.InstanceAccessKind.Instance,
+              k.ThisExpression(),
+              _memberName(fieldNames[i]),
+              resultType: const k.DynamicType(),
+              interfaceTarget: field,
+            ),
+            k.Name('toString'),
+            k.Arguments([]),
+          ));
+        }
       }
       parts.add(k.StringLiteral(')'));
       body = k.StringConcatenation(parts);
@@ -3292,9 +3312,13 @@ class CodeGenerator {
             [const k.DynamicType()], const k.DynamicType(), k.Nullability.nonNullable),
           interfaceTarget: _coreTypes.objectEquals));
       case TokenType.plus:
-        // Concatenação de strings — converte para StringConcatenation
+        // Concatenação de strings — converte para StringConcatenation.
+        // Operandos Float são formatados com `.0` (paridade VM x JS).
         if (_isStringExpr(expr.left) || _isStringExpr(expr.right)) {
-          return k.StringConcatenation([left, right]);
+          return k.StringConcatenation([
+            _fmtFloatIfStatic(left, source: expr.left),
+            _fmtFloatIfStatic(right, source: expr.right),
+          ]);
         }
         return _dynamicOp(left, '+', right);
       case TokenType.starStar:
@@ -3371,6 +3395,130 @@ class CodeGenerator {
     return false;
   }
 
+  // ============================================================
+  // Formatação de Float com `.0` (paridade VM x JS/dart2js)
+  // ============================================================
+  //
+  // Um `Float` de valor inteiro imprime `3.0` na Dart VM, mas `3` no dart2js
+  // (o JS tem só `number`, sem distinção int/double). Para o MESMO .dill rodar
+  // idêntico nos dois alvos, roteamos os pontos de STRINGIFICAÇÃO de valores
+  // cujo tipo estático é Float por um helper que FORÇA a parte decimal. É
+  // dirigido pelo TIPO ESTÁTICO (nunca por runtime `is double`): só toca em
+  // Float — Int/String/struct passam intactos. Casos sem tipo estático
+  // (ex.: Float dentro de List/Map genérico, campo `value` de Result<Float>
+  // genérico) ficam como limitação conhecida.
+
+  /// Sintetiza `static String ita_fmt_float(double d)`:
+  /// ```dart
+  /// if (d.isNaN || d.isInfinite) return d.toString();          // NaN/Inf nativo
+  /// if (d == d.truncateToDouble() && d.abs() < 1e21) {         // inteiro finito
+  ///   return '${d.toInt()}.0';                                  // 3.0 em VM e JS
+  /// }
+  /// return d.toString();                                        // 3.14 -> "3.14"
+  /// ```
+  /// O guard `d.abs() < 1e21` evita estourar int64 no `.toInt()` de doubles
+  /// gigantes (cai no `toString` nativo). Na VM a saída é BYTE-IDÊNTICA ao
+  /// `.toString()` antigo (que já dava "3.0"); no JS passa de "3" para "3.0".
+  void _ensureFmtFloatHelper() {
+    if (_fmtFloatHelper != null) return;
+
+    final dParam = k.VariableDeclaration('d',
+        type: _coreTypes.doubleNonNullableRawType, isFinal: true);
+
+    k.Expression dGet() => k.VariableGet(dParam);
+    k.Expression dGetter(String name) =>
+        k.DynamicGet(k.DynamicAccessKind.Dynamic, dGet(), k.Name(name));
+    k.Expression dCall(String name) => k.DynamicInvocation(
+        k.DynamicAccessKind.Dynamic, dGet(), k.Name(name), k.Arguments([]));
+    k.Expression dToStr() => dCall('toString');
+
+    // if (d.isNaN || d.isInfinite) return d.toString();
+    final guardNaN = k.IfStatement(
+        k.LogicalExpression(dGetter('isNaN'),
+            k.LogicalExpressionOperator.OR, dGetter('isInfinite')),
+        k.ReturnStatement(dToStr()),
+        null);
+
+    // if (d == d.truncateToDouble() && d.abs() < 1e21) return '${d.toInt()}.0';
+    final isIntegral = k.EqualsCall(dGet(), dCall('truncateToDouble'),
+        functionType: k.FunctionType([const k.DynamicType()],
+            const k.DynamicType(), k.Nullability.nonNullable),
+        interfaceTarget: _coreTypes.objectEquals);
+    final inRange = _dynamicOp(dCall('abs'), '<', k.DoubleLiteral(1e21));
+    final guardInt = k.IfStatement(
+        k.LogicalExpression(
+            isIntegral, k.LogicalExpressionOperator.AND, inRange),
+        k.ReturnStatement(
+            k.StringConcatenation([dCall('toInt'), k.StringLiteral('.0')])),
+        null);
+
+    _fmtFloatHelper = k.Procedure(
+      k.Name('ita_fmt_float'),
+      k.ProcedureKind.Method,
+      k.FunctionNode(
+        k.Block([guardNaN, guardInt, k.ReturnStatement(dToStr())]),
+        positionalParameters: [dParam],
+        returnType: _coreTypes.stringNonNullableRawType,
+      ),
+      isStatic: true,
+      fileUri: _fileUri,
+    );
+    _library.addProcedure(_fmtFloatHelper!);
+  }
+
+  /// `t` é `double` não-anulável (o tipo de um `Float` do Itá)?
+  bool _isDoubleType(k.DartType t) =>
+      t is k.InterfaceType &&
+      t.classNode == _coreTypes.doubleClass &&
+      t.nullability != k.Nullability.nullable;
+
+  /// O tipo estático (Kernel) da expressão JÁ COMPILADA é `double`? Cobre os
+  /// sítios onde não há AST na side-table da semântica (ex.: interpolação, que
+  /// é re-parseada em codegen): variáveis/campos/retornos tipados `double`.
+  bool _kernelIsDouble(k.Expression e) => switch (e) {
+        k.DoubleLiteral _ => true,
+        k.VariableGet g => _isDoubleType(g.variable.type),
+        k.InstanceGet g => _isDoubleType(g.resultType),
+        k.StaticInvocation i => _isDoubleType(i.target.function.returnType),
+        k.InstanceInvocation i => _isDoubleType(i.functionType.returnType),
+        _ => false,
+      };
+
+  /// A expressão-fonte (AST) é estaticamente Float? Combina a fase semântica
+  /// (`typeOf`) com um resolvedor de retorno de MÉTODO que a semântica atual
+  /// não modela (ex.: `p.magnitude()` de uma extension): usa `_varTypes` +
+  /// `_methods` para achar o tipo de retorno declarado do método.
+  bool _astIsFloat(ast.Expression e) {
+    if (_analysis?.typeOf(e) is sem.FloatType) return true;
+    return _methodCallReturnsDouble(e);
+  }
+
+  /// `recv.metodo(...)` cujo retorno declarado é `double` (via `_methods`).
+  bool _methodCallReturnsDouble(ast.Expression e) {
+    if (e is! ast.CallExpr) return false;
+    final callee = e.callee;
+    if (callee is! ast.MemberExpr) return false;
+    final obj = callee.object;
+    if (obj is! ast.IdentifierExpr) return false;
+    final typeName = obj.name == 'self' ? _currentTypeName : _varTypes[obj.name];
+    if (typeName == null) return false;
+    final proc = _methods[typeName]?[callee.member];
+    if (proc == null) return false;
+    return _isDoubleType(proc.function.returnType);
+  }
+
+  /// Roteia [compiled] pelo `ita_fmt_float` quando o valor é estaticamente
+  /// Float (por [source] AST ou pelo tipo Kernel de [compiled]); caso contrário
+  /// devolve [compiled] intacto. Um Float atravessa exatamente UM sítio de
+  /// stringificação, então não há dupla formatação.
+  k.Expression _fmtFloatIfStatic(k.Expression compiled, {ast.Expression? source}) {
+    final isFloat =
+        (source != null && _astIsFloat(source)) || _kernelIsDouble(compiled);
+    if (!isFloat) return compiled;
+    _ensureFmtFloatHelper();
+    return k.StaticInvocation(_fmtFloatHelper!, k.Arguments([compiled]));
+  }
+
   String _binaryOpName(TokenType type) => switch (type) {
     TokenType.plus => '+',
     TokenType.minus => '-',
@@ -3414,29 +3562,37 @@ class CodeGenerator {
   k.Expression? _compileBuiltinCall(String name, List<ast.Argument> args) {
     final compiledArgs = args.map((a) => _compileExpr(a.value)).toList();
 
+    // Argumentos de saída com Float formatado (`.0`) — paridade VM x JS. Cada
+    // arg é roteado pelo helper sse seu tipo estático é Float; senão, intacto.
+    List<k.Expression> outArgs() => [
+          for (var i = 0; i < compiledArgs.length; i++)
+            _fmtFloatIfStatic(compiledArgs[i], source: args[i].value)
+        ];
+
     switch (name) {
       // === Output ===
       case 'print':
         return k.StaticInvocation.byReference(_printProcedure.reference,
-          k.Arguments(compiledArgs));
+          k.Arguments(outArgs()));
 
       case 'println':
         // stdout.writeln(value)
+        final w = outArgs();
         return k.DynamicInvocation(k.DynamicAccessKind.Dynamic,
           k.StaticGet(_stdoutGetter), k.Name('writeln'),
-          k.Arguments(compiledArgs.isEmpty ? [k.StringLiteral('')] : compiledArgs));
+          k.Arguments(w.isEmpty ? [k.StringLiteral('')] : w));
 
       case 'eprint':
         // stderr.write(value)
         return k.DynamicInvocation(k.DynamicAccessKind.Dynamic,
           k.StaticGet(_stderrGetter), k.Name('write'),
-          k.Arguments(compiledArgs));
+          k.Arguments(outArgs()));
 
       case 'eprintln':
         // stderr.writeln(value)
         return k.DynamicInvocation(k.DynamicAccessKind.Dynamic,
           k.StaticGet(_stderrGetter), k.Name('writeln'),
-          k.Arguments(compiledArgs));
+          k.Arguments(outArgs()));
 
       // === Input: scanf ===
       case 'scanf':
@@ -10918,7 +11074,10 @@ class CodeGenerator {
         // Compilar expressão de interpolação
         final compiled = _compileInterpolationExpr(source);
         if (compiled != null) {
-          parts.add(compiled);
+          // A fonte da interpolação é RE-PARSEADA aqui (não está na side-table
+          // da semântica), então a detecção de Float usa o tipo Kernel da
+          // expressão compilada (var/campo/retorno `double`).
+          parts.add(_fmtFloatIfStatic(compiled));
         }
       }
     }
