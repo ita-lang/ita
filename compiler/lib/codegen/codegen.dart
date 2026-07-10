@@ -199,9 +199,6 @@ class CodeGenerator {
   late k.Class _wsTransformerClass;
   late k.Procedure _wsUpgrade;
   late k.Procedure _wsIsUpgradeRequest;
-  late k.Class _uint8ListClass;
-  late k.Procedure _uint8ListFactory;
-  late k.Procedure _uint8ListFromList;
   late k.Class _byteDataClass;
   late k.Procedure _byteDataView;
   late k.Procedure _byteDataSublistView;
@@ -509,14 +506,14 @@ class CodeGenerator {
     // Uri class
     _uriClass = dartCore.classes.firstWhere((c) => c.name == 'Uri');
 
-    // dart:typed_data — Uint8List, ByteData
+    // dart:typed_data — ByteData (Uint8List é alocado via _allocU8/_u8FromList).
+    // NÃO resolvemos os factories `Uint8List::•` / `Uint8List.fromList`: são
+    // *redirecting factories* (external na VM, redirecting p/ NativeUint8List no
+    // dart2js) e emiti-los como StaticInvocation crua faz o dart2js crashar. A
+    // alocação de Uint8List passa por `_allocU8`/`_u8FromList` (base64Decode) —
+    // ver o bloco "Alocação de Uint8List compatível com dart2js" (fix G1).
     final dartTyped = platform.libraries.firstWhere(
       (lib) => lib.importUri.toString() == 'dart:typed_data');
-    _uint8ListClass = dartTyped.classes.firstWhere((c) => c.name == 'Uint8List');
-    _uint8ListFactory = _uint8ListClass.procedures.firstWhere(
-      (p) => p.isFactory && p.name.text == '');
-    _uint8ListFromList = _uint8ListClass.procedures.firstWhere(
-      (p) => p.isFactory && p.name.text == 'fromList');
     _byteDataClass = dartTyped.classes.firstWhere((c) => c.name == 'ByteData');
     _byteDataView = _byteDataClass.procedures.firstWhere(
       (p) => p.isFactory && p.name.text == 'view');
@@ -7829,7 +7826,7 @@ class CodeGenerator {
     // return Result.ok(value: [_st, Uint8List.fromList(_acc)])
     final response = k.ListLiteral([
       k.VariableGet(statusVar),
-      k.StaticInvocation(_uint8ListFromList, k.Arguments([k.VariableGet(accVar)])),
+      _u8FromList(k.VariableGet(accVar)),
     ], typeArgument: const k.DynamicType());
     final returnOk = k.ReturnStatement(k.ConstructorInvocation(
       _constructors['Result_ok']!,
@@ -8212,15 +8209,109 @@ class CodeGenerator {
   }
 
   // ============================================================
+  // Alocação de Uint8List compatível com dart2js (Fase 4, fix G1)
+  // ============================================================
+  //
+  // PROBLEMA: `Uint8List(n)` e `Uint8List.fromList(l)` são *redirecting
+  // factories* — no `vm_platform.dill` são `external` (nativos), mas no
+  // `dart2js_platform.dill` redirecionam para `NativeUint8List` (web-only). O
+  // itac emite Kernel contra a plataforma da VM, então serializa uma
+  // `StaticInvocation` do factory `Uint8List::•`. A VM resolve isso no load
+  // (external → nativo). O dart2js, ao linkar o .dill contra SUA plataforma,
+  // encontra o factory redirecting e tenta compilá-lo como membro real →
+  // crash em `ClosureDataBuilder.createClosureEntities` (o CFE, na compilação
+  // web, LOWERA a invocação p/ `NativeUint8List::•(n)` no call site; um .dill
+  // já serializado pela VM não passou por esse lowering). Não podemos emitir o
+  // alvo web (`NativeUint8List`) sem quebrar a VM, e não existe factory de
+  // alocação de typed-data que seja NÃO-redirecting em AMBAS as plataformas.
+  //
+  // SOLUÇÃO: alocar via `base64Decode(...)`, que é um método comum (com corpo)
+  // nas duas plataformas — a alocação interna do Uint8List acontece DENTRO do
+  // corpo da SDK (compilado da plataforma web pelo dart2js, com o lowering
+  // correto), nunca numa invocação crua de factory redirecting no .dill do app.
+  // `base64Decode('A' * ceil(n/3)*4)` decodifica ceil(n/3)*3 bytes ZERADOS
+  // ('A' = sexteto 0); `.sublist(0, n)` corta p/ o tamanho exato e devolve um
+  // Uint8List REAL, modificável e byte-idêntico ao de `Uint8List(n)`. Como o
+  // resultado continua sendo um Uint8List de verdade, ByteData.sublistView e
+  // todo o resto do módulo seguem inalterados → ZERO regressão na VM.
+
+  k.Procedure? _allocU8Helper;
+  k.Procedure? _u8FromListHelper;
+
+  /// Helper (lazy) `ita_allocU8(int n) -> Uint8List`: aloca um Uint8List de `n`
+  /// bytes zerados por um caminho que o dart2js aceita (ver bloco acima).
+  ///   return base64Decode('A' * (((n + 2) ~/ 3) * 4)).sublist(0, n);
+  void _ensureAllocU8Helper() {
+    if (_allocU8Helper != null) return;
+    final n = k.VariableDeclaration('n', type: const k.DynamicType(), isFinal: true);
+    // (((n + 2) ~/ 3) * 4)
+    final b64len = _dynamicOp(
+      _dynamicOp(_dynamicOp(k.VariableGet(n), '+', k.IntLiteral(2)), '~/', k.IntLiteral(3)),
+      '*', k.IntLiteral(4));
+    // 'A' * b64len
+    final b64str = _dynamicOp(k.StringLiteral('A'), '*', b64len);
+    // base64Decode(b64str).sublist(0, n)
+    final decoded = k.StaticInvocation(_base64DecodeFn, k.Arguments([b64str]));
+    final body = k.ReturnStatement(k.DynamicInvocation(
+      k.DynamicAccessKind.Dynamic, decoded, k.Name('sublist'),
+      k.Arguments([k.IntLiteral(0), k.VariableGet(n)])));
+    _allocU8Helper = k.Procedure(
+      k.Name('ita_allocU8'), k.ProcedureKind.Method,
+      k.FunctionNode(body,
+        positionalParameters: [n], returnType: const k.DynamicType()),
+      isStatic: true, fileUri: _fileUri);
+    _library.addProcedure(_allocU8Helper!);
+  }
+
+  /// Helper (lazy) `ita_u8FromList(src) -> Uint8List`: equivalente exato de
+  /// `Uint8List.fromList(src)` (aloca zerado + setRange, com truncagem a byte
+  /// idêntica — é a própria impl da SDK), mas sem a factory redirecting.
+  void _ensureU8FromListHelper() {
+    if (_u8FromListHelper != null) return;
+    _ensureAllocU8Helper();
+    final src = k.VariableDeclaration('src', type: const k.DynamicType(), isFinal: true);
+    final len = k.DynamicGet(k.DynamicAccessKind.Dynamic, k.VariableGet(src), k.Name('length'));
+    final buf = k.VariableDeclaration('_buf',
+      initializer: k.StaticInvocation(_allocU8Helper!, k.Arguments([len])),
+      type: const k.DynamicType(), isFinal: true);
+    final setRange = k.ExpressionStatement(k.DynamicInvocation(
+      k.DynamicAccessKind.Dynamic, k.VariableGet(buf), k.Name('setRange'),
+      k.Arguments([k.IntLiteral(0),
+        k.DynamicGet(k.DynamicAccessKind.Dynamic, k.VariableGet(src), k.Name('length')),
+        k.VariableGet(src)])));
+    final body = k.Block([buf, setRange, k.ReturnStatement(k.VariableGet(buf))]);
+    _u8FromListHelper = k.Procedure(
+      k.Name('ita_u8FromList'), k.ProcedureKind.Method,
+      k.FunctionNode(body,
+        positionalParameters: [src], returnType: const k.DynamicType()),
+      isStatic: true, fileUri: _fileUri);
+    _library.addProcedure(_u8FromListHelper!);
+  }
+
+  /// `Uint8List(len)` compatível com dart2js. Use no lugar de
+  /// `k.StaticInvocation(_uint8ListFactory, ...)`.
+  k.Expression _allocU8(k.Expression len) {
+    _ensureAllocU8Helper();
+    return k.StaticInvocation(_allocU8Helper!, k.Arguments([len]));
+  }
+
+  /// `Uint8List.fromList(list)` compatível com dart2js. Use no lugar de
+  /// `k.StaticInvocation(_uint8ListFromList, ...)`.
+  k.Expression _u8FromList(k.Expression list) {
+    _ensureU8FromListHelper();
+    return k.StaticInvocation(_u8FromListHelper!, k.Arguments([list]));
+  }
+
+  // ============================================================
   // Buffer Module (dart:typed_data — Uint8List, ByteData)
   // ============================================================
 
   k.Expression _compileBufferCall(String method, List<k.Expression> args) {
     switch (method) {
       case 'alloc':
-        // Buffer.alloc(size) → Uint8List(size)
+        // Buffer.alloc(size) → Uint8List(size)  (via _allocU8 p/ dart2js)
         if (args.isNotEmpty) {
-          return k.StaticInvocation(_uint8ListFactory, k.Arguments([args[0]]));
+          return _allocU8(args[0]);
         }
         return k.NullLiteral();
 
@@ -8231,8 +8322,8 @@ class CodeGenerator {
           final src = k.VariableDeclaration('_src', initializer: args[0],
             type: const k.DynamicType(), isFinal: true);
           final buf = k.VariableDeclaration('_buf',
-            initializer: k.StaticInvocation(_uint8ListFactory, k.Arguments([
-              k.DynamicGet(k.DynamicAccessKind.Dynamic, k.VariableGet(src), k.Name('length'))])),
+            initializer: _allocU8(
+              k.DynamicGet(k.DynamicAccessKind.Dynamic, k.VariableGet(src), k.Name('length'))),
             type: const k.DynamicType(), isFinal: true);
           final idx = k.VariableDeclaration('_bi',
             initializer: k.IntLiteral(0), type: const k.DynamicType(), isFinal: false);
@@ -8258,8 +8349,8 @@ class CodeGenerator {
       case 'fromString':
         // Buffer.fromString("hello") → Uint8List.fromList(string.codeUnits)
         if (args.isNotEmpty) {
-          return k.StaticInvocation(_uint8ListFromList, k.Arguments([
-            k.DynamicGet(k.DynamicAccessKind.Dynamic, args[0], k.Name('codeUnits'))]));
+          return _u8FromList(
+            k.DynamicGet(k.DynamicAccessKind.Dynamic, args[0], k.Name('codeUnits')));
         }
         return k.NullLiteral();
 
@@ -8310,11 +8401,11 @@ class CodeGenerator {
           final bVar = k.VariableDeclaration('_bb', initializer: args[1],
             type: const k.DynamicType(), isFinal: true);
           final newBuf = k.VariableDeclaration('_bc',
-            initializer: k.StaticInvocation(_uint8ListFactory, k.Arguments([
+            initializer: _allocU8(
               k.DynamicInvocation(k.DynamicAccessKind.Dynamic,
                 k.DynamicGet(k.DynamicAccessKind.Dynamic, k.VariableGet(aVar), k.Name('length')),
                 k.Name('+'), k.Arguments([
-                  k.DynamicGet(k.DynamicAccessKind.Dynamic, k.VariableGet(bVar), k.Name('length'))]))])),
+                  k.DynamicGet(k.DynamicAccessKind.Dynamic, k.VariableGet(bVar), k.Name('length'))]))),
             type: const k.DynamicType(), isFinal: true);
 
           return k.BlockExpression(k.Block([aVar, bVar, newBuf,
