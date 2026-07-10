@@ -9757,6 +9757,24 @@ class CodeGenerator {
     return _compileExpr(argValue);
   }
 
+  /// Type-args de um `ConstructorInvocation`, com a ARIDADE dos type-params da
+  /// classe do [ctor], preenchidos com `dynamic` (G3, Fase 4).
+  ///
+  /// Um construtor de classe genérica (ex.: `Pair<A, B>`) DEVE carregar `types`
+  /// com um argumento por type-param. A Dart VM reifica generics e TOLERA a
+  /// lista vazia; o dart2js NÃO: ele indexa os type-args em
+  /// `SimpleDartTypeSubstitutionVisitor.substituteTypeVariableType` e crasha com
+  /// `RangeError (length): Invalid value: Valid value range is empty: 0` quando a
+  /// aridade é > 0 mas a lista está vazia. Preenchemos com `DynamicType` (Tier 1:
+  /// bem-formado e satisfaz a aridade; o RTI concreto é um follow-up). Classes
+  /// não-genéricas (aridade 0 — inclui todos os enum variants atuais) devolvem
+  /// lista vazia → `ConstructorInvocation` byte-idêntico ao anterior.
+  List<k.DartType> _ctorTypeArgs(k.Constructor ctor) {
+    final n = ctor.enclosingClass?.typeParameters.length ?? 0;
+    if (n == 0) return const <k.DartType>[];
+    return List<k.DartType>.filled(n, const k.DynamicType());
+  }
+
   k.Expression _compileCall(ast.CallExpr expr) {
     final callee = expr.callee;
 
@@ -9790,7 +9808,7 @@ class CodeGenerator {
 
       return k.ConstructorInvocation(
         ctor,
-        k.Arguments(positional, named: named),
+        k.Arguments(positional, named: named, types: _ctorTypeArgs(ctor)),
       );
     }
 
@@ -9892,7 +9910,8 @@ class CodeGenerator {
             positional.add(_compileExpr(arg.value));
           }
         }
-        return k.ConstructorInvocation(ctor, k.Arguments(positional, named: named));
+        return k.ConstructorInvocation(
+          ctor, k.Arguments(positional, named: named, types: _ctorTypeArgs(ctor)));
       }
     }
 
@@ -10107,7 +10126,8 @@ class CodeGenerator {
           // Retorna um "thunk" que pode ser chamado ou usado direto
           // Se o variant não tem params, instancia direto
           if (_enumVariantFields[variantCls]?.isEmpty ?? true) {
-            return k.ConstructorInvocation(ctor, k.Arguments.empty());
+            return k.ConstructorInvocation(
+              ctor, k.Arguments([], types: _ctorTypeArgs(ctor)));
           }
           // Com params — será construído quando chamado em _compileCall
           // Aqui retorna null literal como placeholder (não deve ser usado diretamente)
@@ -10156,7 +10176,8 @@ class CodeGenerator {
     final ctor = _constructors['${enumName}_$variant']!;
 
     if (args.isEmpty && (_enumVariantFields[variantCls]?.isEmpty ?? true)) {
-      return k.ConstructorInvocation(ctor, k.Arguments.empty());
+      return k.ConstructorInvocation(
+        ctor, k.Arguments([], types: _ctorTypeArgs(ctor)));
     }
 
     final fieldNames = _enumVariantFields[variantCls] ?? [];
@@ -10170,7 +10191,8 @@ class CodeGenerator {
         named.add(k.NamedExpression(fieldNames[i], _compileExpr(arg.value)));
       }
     }
-    return k.ConstructorInvocation(ctor, k.Arguments([], named: named));
+    return k.ConstructorInvocation(
+      ctor, k.Arguments([], named: named, types: _ctorTypeArgs(ctor)));
   }
 
   /// Extrai nome do enum a partir de um TypeAnnotation.
@@ -10469,7 +10491,8 @@ class CodeGenerator {
       }
 
       return k.Let(tmp,
-        k.ConstructorInvocation(ctor, k.Arguments([], named: named)));
+        k.ConstructorInvocation(
+          ctor, k.Arguments([], named: named, types: _ctorTypeArgs(ctor))));
     }
 
     // Fallback: retorna source

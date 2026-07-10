@@ -21,7 +21,7 @@ example MATCH
 extensions NUM
 fixes NUM
 functional NUM
-generics DART2JS_CRASH
+generics NUM
 hello MATCH
 isolate_proof DART2JS_CRASH
 modern NUM
