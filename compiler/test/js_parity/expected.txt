@@ -5,15 +5,15 @@
 #
 # <exemplo> <STATUS>
 async_real DART2JS_CRASH
-bits DART2JS_CRASH
-bmp DART2JS_CRASH
+bits MISMATCH
+bmp NODE_ERR
 break_continue MATCH
-buffer DART2JS_CRASH
-bytes DART2JS_CRASH
-cbor DART2JS_CRASH
+buffer NODE_ERR
+bytes MATCH
+cbor NODE_ERR
 closure_fix MATCH
 concurrency DART2JS_CRASH
-crc32 DART2JS_CRASH
+crc32 MATCH
 csv NODE_ERR
 enum_inference MATCH
 errors NUM
@@ -26,14 +26,14 @@ hello MATCH
 isolate_proof DART2JS_CRASH
 modern MATCH
 modules MATCH
-msgpack DART2JS_CRASH
+msgpack NODE_ERR
 parallel DART2JS_CRASH
-png DART2JS_CRASH
+png NODE_ERR
 polish MATCH
-reader DART2JS_CRASH
-reader_le DART2JS_CRASH
+reader MATCH
+reader_le MATCH
 streams MISMATCH
-tar DART2JS_CRASH
+tar NODE_ERR
 types MATCH
 url_env NODE_ERR
-wav DART2JS_CRASH
+wav NODE_ERR
