@@ -199,9 +199,6 @@ class CodeGenerator {
   late k.Class _wsTransformerClass;
   late k.Procedure _wsUpgrade;
   late k.Procedure _wsIsUpgradeRequest;
-  late k.Class _uint8ListClass;
-  late k.Procedure _uint8ListFactory;
-  late k.Procedure _uint8ListFromList;
   late k.Class _byteDataClass;
   late k.Procedure _byteDataView;
   late k.Procedure _byteDataSublistView;
@@ -240,6 +237,7 @@ class CodeGenerator {
   late k.Class _streamClass;
   late k.Procedure _streamFirstGetter;
   k.Procedure? _callActorHelper; // gerado sob demanda
+  k.Procedure? _fmtFloatHelper; // formata Float com `.0` (paridade VM x JS)
 
   // URI do módulo
   final _fileUri = Uri.parse('file:///ita/main.tu');
@@ -509,14 +507,14 @@ class CodeGenerator {
     // Uri class
     _uriClass = dartCore.classes.firstWhere((c) => c.name == 'Uri');
 
-    // dart:typed_data — Uint8List, ByteData
+    // dart:typed_data — ByteData (Uint8List é alocado via _allocU8/_u8FromList).
+    // NÃO resolvemos os factories `Uint8List::•` / `Uint8List.fromList`: são
+    // *redirecting factories* (external na VM, redirecting p/ NativeUint8List no
+    // dart2js) e emiti-los como StaticInvocation crua faz o dart2js crashar. A
+    // alocação de Uint8List passa por `_allocU8`/`_u8FromList` (base64Decode) —
+    // ver o bloco "Alocação de Uint8List compatível com dart2js" (fix G1).
     final dartTyped = platform.libraries.firstWhere(
       (lib) => lib.importUri.toString() == 'dart:typed_data');
-    _uint8ListClass = dartTyped.classes.firstWhere((c) => c.name == 'Uint8List');
-    _uint8ListFactory = _uint8ListClass.procedures.firstWhere(
-      (p) => p.isFactory && p.name.text == '');
-    _uint8ListFromList = _uint8ListClass.procedures.firstWhere(
-      (p) => p.isFactory && p.name.text == 'fromList');
     _byteDataClass = dartTyped.classes.firstWhere((c) => c.name == 'ByteData');
     _byteDataView = _byteDataClass.procedures.firstWhere(
       (p) => p.isFactory && p.name.text == 'view');
@@ -1149,18 +1147,37 @@ class CodeGenerator {
       for (var i = 0; i < fieldNames.length; i++) {
         if (i > 0) parts.add(k.StringLiteral(', '));
         parts.add(k.StringLiteral('${fieldNames[i]}: '));
-        parts.add(k.DynamicInvocation(
-          k.DynamicAccessKind.Dynamic,
-          k.InstanceGet(
-            k.InstanceAccessKind.Instance,
-            k.ThisExpression(),
-            _memberName(fieldNames[i]),
-            resultType: const k.DynamicType(),
-            interfaceTarget: cls.fields.firstWhere((f) => f.name.text == fieldNames[i]),
-          ),
-          k.Name('toString'),
-          k.Arguments([]),
-        ));
+        final field = cls.fields.firstWhere((f) => f.name.text == fieldNames[i]);
+        // Campo Float → força `.0` (paridade VM x JS). Campo genérico/dynamic
+        // (ex.: `value` de Result<T>) fica no `.toString()` nativo (limitação).
+        if (_isDoubleType(field.type)) {
+          _ensureFmtFloatHelper();
+          parts.add(k.StaticInvocation(
+            _fmtFloatHelper!,
+            k.Arguments([
+              k.InstanceGet(
+                k.InstanceAccessKind.Instance,
+                k.ThisExpression(),
+                _memberName(fieldNames[i]),
+                resultType: field.type,
+                interfaceTarget: field,
+              ),
+            ]),
+          ));
+        } else {
+          parts.add(k.DynamicInvocation(
+            k.DynamicAccessKind.Dynamic,
+            k.InstanceGet(
+              k.InstanceAccessKind.Instance,
+              k.ThisExpression(),
+              _memberName(fieldNames[i]),
+              resultType: const k.DynamicType(),
+              interfaceTarget: field,
+            ),
+            k.Name('toString'),
+            k.Arguments([]),
+          ));
+        }
       }
       parts.add(k.StringLiteral(')'));
       body = k.StringConcatenation(parts);
@@ -3292,9 +3309,13 @@ class CodeGenerator {
             [const k.DynamicType()], const k.DynamicType(), k.Nullability.nonNullable),
           interfaceTarget: _coreTypes.objectEquals));
       case TokenType.plus:
-        // Concatenação de strings — converte para StringConcatenation
+        // Concatenação de strings — converte para StringConcatenation.
+        // Operandos Float são formatados com `.0` (paridade VM x JS).
         if (_isStringExpr(expr.left) || _isStringExpr(expr.right)) {
-          return k.StringConcatenation([left, right]);
+          return k.StringConcatenation([
+            _fmtFloatIfStatic(left, source: expr.left),
+            _fmtFloatIfStatic(right, source: expr.right),
+          ]);
         }
         return _dynamicOp(left, '+', right);
       case TokenType.starStar:
@@ -3371,6 +3392,130 @@ class CodeGenerator {
     return false;
   }
 
+  // ============================================================
+  // Formatação de Float com `.0` (paridade VM x JS/dart2js)
+  // ============================================================
+  //
+  // Um `Float` de valor inteiro imprime `3.0` na Dart VM, mas `3` no dart2js
+  // (o JS tem só `number`, sem distinção int/double). Para o MESMO .dill rodar
+  // idêntico nos dois alvos, roteamos os pontos de STRINGIFICAÇÃO de valores
+  // cujo tipo estático é Float por um helper que FORÇA a parte decimal. É
+  // dirigido pelo TIPO ESTÁTICO (nunca por runtime `is double`): só toca em
+  // Float — Int/String/struct passam intactos. Casos sem tipo estático
+  // (ex.: Float dentro de List/Map genérico, campo `value` de Result<Float>
+  // genérico) ficam como limitação conhecida.
+
+  /// Sintetiza `static String ita_fmt_float(double d)`:
+  /// ```dart
+  /// if (d.isNaN || d.isInfinite) return d.toString();          // NaN/Inf nativo
+  /// if (d == d.truncateToDouble() && d.abs() < 1e21) {         // inteiro finito
+  ///   return '${d.toInt()}.0';                                  // 3.0 em VM e JS
+  /// }
+  /// return d.toString();                                        // 3.14 -> "3.14"
+  /// ```
+  /// O guard `d.abs() < 1e21` evita estourar int64 no `.toInt()` de doubles
+  /// gigantes (cai no `toString` nativo). Na VM a saída é BYTE-IDÊNTICA ao
+  /// `.toString()` antigo (que já dava "3.0"); no JS passa de "3" para "3.0".
+  void _ensureFmtFloatHelper() {
+    if (_fmtFloatHelper != null) return;
+
+    final dParam = k.VariableDeclaration('d',
+        type: _coreTypes.doubleNonNullableRawType, isFinal: true);
+
+    k.Expression dGet() => k.VariableGet(dParam);
+    k.Expression dGetter(String name) =>
+        k.DynamicGet(k.DynamicAccessKind.Dynamic, dGet(), k.Name(name));
+    k.Expression dCall(String name) => k.DynamicInvocation(
+        k.DynamicAccessKind.Dynamic, dGet(), k.Name(name), k.Arguments([]));
+    k.Expression dToStr() => dCall('toString');
+
+    // if (d.isNaN || d.isInfinite) return d.toString();
+    final guardNaN = k.IfStatement(
+        k.LogicalExpression(dGetter('isNaN'),
+            k.LogicalExpressionOperator.OR, dGetter('isInfinite')),
+        k.ReturnStatement(dToStr()),
+        null);
+
+    // if (d == d.truncateToDouble() && d.abs() < 1e21) return '${d.toInt()}.0';
+    final isIntegral = k.EqualsCall(dGet(), dCall('truncateToDouble'),
+        functionType: k.FunctionType([const k.DynamicType()],
+            const k.DynamicType(), k.Nullability.nonNullable),
+        interfaceTarget: _coreTypes.objectEquals);
+    final inRange = _dynamicOp(dCall('abs'), '<', k.DoubleLiteral(1e21));
+    final guardInt = k.IfStatement(
+        k.LogicalExpression(
+            isIntegral, k.LogicalExpressionOperator.AND, inRange),
+        k.ReturnStatement(
+            k.StringConcatenation([dCall('toInt'), k.StringLiteral('.0')])),
+        null);
+
+    _fmtFloatHelper = k.Procedure(
+      k.Name('ita_fmt_float'),
+      k.ProcedureKind.Method,
+      k.FunctionNode(
+        k.Block([guardNaN, guardInt, k.ReturnStatement(dToStr())]),
+        positionalParameters: [dParam],
+        returnType: _coreTypes.stringNonNullableRawType,
+      ),
+      isStatic: true,
+      fileUri: _fileUri,
+    );
+    _library.addProcedure(_fmtFloatHelper!);
+  }
+
+  /// `t` é `double` não-anulável (o tipo de um `Float` do Itá)?
+  bool _isDoubleType(k.DartType t) =>
+      t is k.InterfaceType &&
+      t.classNode == _coreTypes.doubleClass &&
+      t.nullability != k.Nullability.nullable;
+
+  /// O tipo estático (Kernel) da expressão JÁ COMPILADA é `double`? Cobre os
+  /// sítios onde não há AST na side-table da semântica (ex.: interpolação, que
+  /// é re-parseada em codegen): variáveis/campos/retornos tipados `double`.
+  bool _kernelIsDouble(k.Expression e) => switch (e) {
+        k.DoubleLiteral _ => true,
+        k.VariableGet g => _isDoubleType(g.variable.type),
+        k.InstanceGet g => _isDoubleType(g.resultType),
+        k.StaticInvocation i => _isDoubleType(i.target.function.returnType),
+        k.InstanceInvocation i => _isDoubleType(i.functionType.returnType),
+        _ => false,
+      };
+
+  /// A expressão-fonte (AST) é estaticamente Float? Combina a fase semântica
+  /// (`typeOf`) com um resolvedor de retorno de MÉTODO que a semântica atual
+  /// não modela (ex.: `p.magnitude()` de uma extension): usa `_varTypes` +
+  /// `_methods` para achar o tipo de retorno declarado do método.
+  bool _astIsFloat(ast.Expression e) {
+    if (_analysis?.typeOf(e) is sem.FloatType) return true;
+    return _methodCallReturnsDouble(e);
+  }
+
+  /// `recv.metodo(...)` cujo retorno declarado é `double` (via `_methods`).
+  bool _methodCallReturnsDouble(ast.Expression e) {
+    if (e is! ast.CallExpr) return false;
+    final callee = e.callee;
+    if (callee is! ast.MemberExpr) return false;
+    final obj = callee.object;
+    if (obj is! ast.IdentifierExpr) return false;
+    final typeName = obj.name == 'self' ? _currentTypeName : _varTypes[obj.name];
+    if (typeName == null) return false;
+    final proc = _methods[typeName]?[callee.member];
+    if (proc == null) return false;
+    return _isDoubleType(proc.function.returnType);
+  }
+
+  /// Roteia [compiled] pelo `ita_fmt_float` quando o valor é estaticamente
+  /// Float (por [source] AST ou pelo tipo Kernel de [compiled]); caso contrário
+  /// devolve [compiled] intacto. Um Float atravessa exatamente UM sítio de
+  /// stringificação, então não há dupla formatação.
+  k.Expression _fmtFloatIfStatic(k.Expression compiled, {ast.Expression? source}) {
+    final isFloat =
+        (source != null && _astIsFloat(source)) || _kernelIsDouble(compiled);
+    if (!isFloat) return compiled;
+    _ensureFmtFloatHelper();
+    return k.StaticInvocation(_fmtFloatHelper!, k.Arguments([compiled]));
+  }
+
   String _binaryOpName(TokenType type) => switch (type) {
     TokenType.plus => '+',
     TokenType.minus => '-',
@@ -3414,29 +3559,37 @@ class CodeGenerator {
   k.Expression? _compileBuiltinCall(String name, List<ast.Argument> args) {
     final compiledArgs = args.map((a) => _compileExpr(a.value)).toList();
 
+    // Argumentos de saída com Float formatado (`.0`) — paridade VM x JS. Cada
+    // arg é roteado pelo helper sse seu tipo estático é Float; senão, intacto.
+    List<k.Expression> outArgs() => [
+          for (var i = 0; i < compiledArgs.length; i++)
+            _fmtFloatIfStatic(compiledArgs[i], source: args[i].value)
+        ];
+
     switch (name) {
       // === Output ===
       case 'print':
         return k.StaticInvocation.byReference(_printProcedure.reference,
-          k.Arguments(compiledArgs));
+          k.Arguments(outArgs()));
 
       case 'println':
         // stdout.writeln(value)
+        final w = outArgs();
         return k.DynamicInvocation(k.DynamicAccessKind.Dynamic,
           k.StaticGet(_stdoutGetter), k.Name('writeln'),
-          k.Arguments(compiledArgs.isEmpty ? [k.StringLiteral('')] : compiledArgs));
+          k.Arguments(w.isEmpty ? [k.StringLiteral('')] : w));
 
       case 'eprint':
         // stderr.write(value)
         return k.DynamicInvocation(k.DynamicAccessKind.Dynamic,
           k.StaticGet(_stderrGetter), k.Name('write'),
-          k.Arguments(compiledArgs));
+          k.Arguments(outArgs()));
 
       case 'eprintln':
         // stderr.writeln(value)
         return k.DynamicInvocation(k.DynamicAccessKind.Dynamic,
           k.StaticGet(_stderrGetter), k.Name('writeln'),
-          k.Arguments(compiledArgs));
+          k.Arguments(outArgs()));
 
       // === Input: scanf ===
       case 'scanf':
@@ -7829,7 +7982,7 @@ class CodeGenerator {
     // return Result.ok(value: [_st, Uint8List.fromList(_acc)])
     final response = k.ListLiteral([
       k.VariableGet(statusVar),
-      k.StaticInvocation(_uint8ListFromList, k.Arguments([k.VariableGet(accVar)])),
+      _u8FromList(k.VariableGet(accVar)),
     ], typeArgument: const k.DynamicType());
     final returnOk = k.ReturnStatement(k.ConstructorInvocation(
       _constructors['Result_ok']!,
@@ -8212,15 +8365,109 @@ class CodeGenerator {
   }
 
   // ============================================================
+  // Alocação de Uint8List compatível com dart2js (Fase 4, fix G1)
+  // ============================================================
+  //
+  // PROBLEMA: `Uint8List(n)` e `Uint8List.fromList(l)` são *redirecting
+  // factories* — no `vm_platform.dill` são `external` (nativos), mas no
+  // `dart2js_platform.dill` redirecionam para `NativeUint8List` (web-only). O
+  // itac emite Kernel contra a plataforma da VM, então serializa uma
+  // `StaticInvocation` do factory `Uint8List::•`. A VM resolve isso no load
+  // (external → nativo). O dart2js, ao linkar o .dill contra SUA plataforma,
+  // encontra o factory redirecting e tenta compilá-lo como membro real →
+  // crash em `ClosureDataBuilder.createClosureEntities` (o CFE, na compilação
+  // web, LOWERA a invocação p/ `NativeUint8List::•(n)` no call site; um .dill
+  // já serializado pela VM não passou por esse lowering). Não podemos emitir o
+  // alvo web (`NativeUint8List`) sem quebrar a VM, e não existe factory de
+  // alocação de typed-data que seja NÃO-redirecting em AMBAS as plataformas.
+  //
+  // SOLUÇÃO: alocar via `base64Decode(...)`, que é um método comum (com corpo)
+  // nas duas plataformas — a alocação interna do Uint8List acontece DENTRO do
+  // corpo da SDK (compilado da plataforma web pelo dart2js, com o lowering
+  // correto), nunca numa invocação crua de factory redirecting no .dill do app.
+  // `base64Decode('A' * ceil(n/3)*4)` decodifica ceil(n/3)*3 bytes ZERADOS
+  // ('A' = sexteto 0); `.sublist(0, n)` corta p/ o tamanho exato e devolve um
+  // Uint8List REAL, modificável e byte-idêntico ao de `Uint8List(n)`. Como o
+  // resultado continua sendo um Uint8List de verdade, ByteData.sublistView e
+  // todo o resto do módulo seguem inalterados → ZERO regressão na VM.
+
+  k.Procedure? _allocU8Helper;
+  k.Procedure? _u8FromListHelper;
+
+  /// Helper (lazy) `ita_allocU8(int n) -> Uint8List`: aloca um Uint8List de `n`
+  /// bytes zerados por um caminho que o dart2js aceita (ver bloco acima).
+  ///   return base64Decode('A' * (((n + 2) ~/ 3) * 4)).sublist(0, n);
+  void _ensureAllocU8Helper() {
+    if (_allocU8Helper != null) return;
+    final n = k.VariableDeclaration('n', type: const k.DynamicType(), isFinal: true);
+    // (((n + 2) ~/ 3) * 4)
+    final b64len = _dynamicOp(
+      _dynamicOp(_dynamicOp(k.VariableGet(n), '+', k.IntLiteral(2)), '~/', k.IntLiteral(3)),
+      '*', k.IntLiteral(4));
+    // 'A' * b64len
+    final b64str = _dynamicOp(k.StringLiteral('A'), '*', b64len);
+    // base64Decode(b64str).sublist(0, n)
+    final decoded = k.StaticInvocation(_base64DecodeFn, k.Arguments([b64str]));
+    final body = k.ReturnStatement(k.DynamicInvocation(
+      k.DynamicAccessKind.Dynamic, decoded, k.Name('sublist'),
+      k.Arguments([k.IntLiteral(0), k.VariableGet(n)])));
+    _allocU8Helper = k.Procedure(
+      k.Name('ita_allocU8'), k.ProcedureKind.Method,
+      k.FunctionNode(body,
+        positionalParameters: [n], returnType: const k.DynamicType()),
+      isStatic: true, fileUri: _fileUri);
+    _library.addProcedure(_allocU8Helper!);
+  }
+
+  /// Helper (lazy) `ita_u8FromList(src) -> Uint8List`: equivalente exato de
+  /// `Uint8List.fromList(src)` (aloca zerado + setRange, com truncagem a byte
+  /// idêntica — é a própria impl da SDK), mas sem a factory redirecting.
+  void _ensureU8FromListHelper() {
+    if (_u8FromListHelper != null) return;
+    _ensureAllocU8Helper();
+    final src = k.VariableDeclaration('src', type: const k.DynamicType(), isFinal: true);
+    final len = k.DynamicGet(k.DynamicAccessKind.Dynamic, k.VariableGet(src), k.Name('length'));
+    final buf = k.VariableDeclaration('_buf',
+      initializer: k.StaticInvocation(_allocU8Helper!, k.Arguments([len])),
+      type: const k.DynamicType(), isFinal: true);
+    final setRange = k.ExpressionStatement(k.DynamicInvocation(
+      k.DynamicAccessKind.Dynamic, k.VariableGet(buf), k.Name('setRange'),
+      k.Arguments([k.IntLiteral(0),
+        k.DynamicGet(k.DynamicAccessKind.Dynamic, k.VariableGet(src), k.Name('length')),
+        k.VariableGet(src)])));
+    final body = k.Block([buf, setRange, k.ReturnStatement(k.VariableGet(buf))]);
+    _u8FromListHelper = k.Procedure(
+      k.Name('ita_u8FromList'), k.ProcedureKind.Method,
+      k.FunctionNode(body,
+        positionalParameters: [src], returnType: const k.DynamicType()),
+      isStatic: true, fileUri: _fileUri);
+    _library.addProcedure(_u8FromListHelper!);
+  }
+
+  /// `Uint8List(len)` compatível com dart2js. Use no lugar de
+  /// `k.StaticInvocation(_uint8ListFactory, ...)`.
+  k.Expression _allocU8(k.Expression len) {
+    _ensureAllocU8Helper();
+    return k.StaticInvocation(_allocU8Helper!, k.Arguments([len]));
+  }
+
+  /// `Uint8List.fromList(list)` compatível com dart2js. Use no lugar de
+  /// `k.StaticInvocation(_uint8ListFromList, ...)`.
+  k.Expression _u8FromList(k.Expression list) {
+    _ensureU8FromListHelper();
+    return k.StaticInvocation(_u8FromListHelper!, k.Arguments([list]));
+  }
+
+  // ============================================================
   // Buffer Module (dart:typed_data — Uint8List, ByteData)
   // ============================================================
 
   k.Expression _compileBufferCall(String method, List<k.Expression> args) {
     switch (method) {
       case 'alloc':
-        // Buffer.alloc(size) → Uint8List(size)
+        // Buffer.alloc(size) → Uint8List(size)  (via _allocU8 p/ dart2js)
         if (args.isNotEmpty) {
-          return k.StaticInvocation(_uint8ListFactory, k.Arguments([args[0]]));
+          return _allocU8(args[0]);
         }
         return k.NullLiteral();
 
@@ -8231,8 +8478,8 @@ class CodeGenerator {
           final src = k.VariableDeclaration('_src', initializer: args[0],
             type: const k.DynamicType(), isFinal: true);
           final buf = k.VariableDeclaration('_buf',
-            initializer: k.StaticInvocation(_uint8ListFactory, k.Arguments([
-              k.DynamicGet(k.DynamicAccessKind.Dynamic, k.VariableGet(src), k.Name('length'))])),
+            initializer: _allocU8(
+              k.DynamicGet(k.DynamicAccessKind.Dynamic, k.VariableGet(src), k.Name('length'))),
             type: const k.DynamicType(), isFinal: true);
           final idx = k.VariableDeclaration('_bi',
             initializer: k.IntLiteral(0), type: const k.DynamicType(), isFinal: false);
@@ -8258,8 +8505,8 @@ class CodeGenerator {
       case 'fromString':
         // Buffer.fromString("hello") → Uint8List.fromList(string.codeUnits)
         if (args.isNotEmpty) {
-          return k.StaticInvocation(_uint8ListFromList, k.Arguments([
-            k.DynamicGet(k.DynamicAccessKind.Dynamic, args[0], k.Name('codeUnits'))]));
+          return _u8FromList(
+            k.DynamicGet(k.DynamicAccessKind.Dynamic, args[0], k.Name('codeUnits')));
         }
         return k.NullLiteral();
 
@@ -8310,11 +8557,11 @@ class CodeGenerator {
           final bVar = k.VariableDeclaration('_bb', initializer: args[1],
             type: const k.DynamicType(), isFinal: true);
           final newBuf = k.VariableDeclaration('_bc',
-            initializer: k.StaticInvocation(_uint8ListFactory, k.Arguments([
+            initializer: _allocU8(
               k.DynamicInvocation(k.DynamicAccessKind.Dynamic,
                 k.DynamicGet(k.DynamicAccessKind.Dynamic, k.VariableGet(aVar), k.Name('length')),
                 k.Name('+'), k.Arguments([
-                  k.DynamicGet(k.DynamicAccessKind.Dynamic, k.VariableGet(bVar), k.Name('length'))]))])),
+                  k.DynamicGet(k.DynamicAccessKind.Dynamic, k.VariableGet(bVar), k.Name('length'))]))),
             type: const k.DynamicType(), isFinal: true);
 
           return k.BlockExpression(k.Block([aVar, bVar, newBuf,
@@ -10941,7 +11188,10 @@ class CodeGenerator {
         // Compilar expressão de interpolação
         final compiled = _compileInterpolationExpr(source);
         if (compiled != null) {
-          parts.add(compiled);
+          // A fonte da interpolação é RE-PARSEADA aqui (não está na side-table
+          // da semântica), então a detecção de Float usa o tipo Kernel da
+          // expressão compilada (var/campo/retorno `double`).
+          parts.add(_fmtFloatIfStatic(compiled));
         }
       }
     }
