@@ -159,6 +159,15 @@ class TypeChecker {
     for (final a in e.args) {
       _infer(a.value, scope);
     }
+    // `x.unwrapOr(default)` — Result<T>/Option<T> → T. A semântica não modela
+    // Result/Option, mas o resultado tem O MESMO tipo do valor default, que
+    // carrega essa informação. Habilita, p.ex., `.0` em Float (paridade VM×JS).
+    if (e.callee is ast.MemberExpr &&
+        (e.callee as ast.MemberExpr).member == 'unwrapOr' &&
+        e.args.length == 1) {
+      final defT = _infer(e.args.first.value, scope);
+      if (defT is! UnknownType) return defT;
+    }
     if (e.callee is ast.IdentifierExpr) {
       final sym = _userTypeSymbol(calleeType, scope);
       if (sym != null &&
