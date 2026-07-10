@@ -81,7 +81,14 @@ else
 fi
 EX_DIR="${ITA_JS_PARITY_EXAMPLES:-$REPO_ROOT/examples}"
 MANIFEST="$SCRIPT_DIR/expected.txt"
-TIMEOUT="${ITA_JS_PARITY_TIMEOUT:-20}"
+# Watchdog (s) por run de VM/Node. Default 60 (era 20): sob o SWEEP paralelo N
+# runs de dart2js/VM competem por CPU e um run que sozinho leva ~5s pode levar
+# 2-3x mais -> um teto de 20s viraria timeout espurio e MUDARIA a classificacao
+# (o invariante "paralelo == sequencial" quebraria). 60s da folga sem afrouxar a
+# rede: os unicos programas que "penduram" de verdade (servers/loops) sao
+# excluidos ESTATICAMENTE antes de rodar (COMPILE_ONLY), entao nenhum exemplo do
+# conjunto chega perto do teto -- subir 20->60 nao altera nenhum status gravado.
+TIMEOUT="${ITA_JS_PARITY_TIMEOUT:-60}"
 
 MODE="check"
 for a in "$@"; do
@@ -229,9 +236,52 @@ echo "${B}=== oracle de paridade VM x Node (dart2js) ===${X} ${D}modo: $MODE, ti
 echo "${D}$("$ITA_DART_BIN" --version 2>&1) | node $(node --version)${X}"
 echo
 
+# --- pool de paralelismo do SWEEP ------------------------------------------
+# Cada exemplo e' classificado por um worker independente. classify() ja isola
+# TODO o seu I/O em $WORK/$name.* (dill, vm1/vm2, js, node, *.log) -> rodar
+# varios em paralelo NAO cria corrida por arquivo. O worker so acrescenta um
+# passo: grava o token em $WORK/$name.status. A AGREGACAO (phase B) le esses
+# .status em ORDEM DE GLOB e reconstroi RESULTS + as linhas por-exemplo
+# EXATAMENTE como a versao sequencial -> saida/classificacao/reconciliacao
+# byte-a-byte identicas; o paralelismo so muda a velocidade, nunca o resultado.
+# N = nucleos da maquina, cap em NPROC_CAP (protege RAM e o watchdog). Override
+# manual: ITA_JS_PARITY_JOBS (medir speedup, ou limitar em maquina fraca).
+_detect_ncpu() {
+  local n; n="$( (sysctl -n hw.ncpu 2>/dev/null || nproc 2>/dev/null) | head -1 )"
+  case "${n:-}" in ''|*[!0-9]*) n=4 ;; esac
+  printf '%s' "$n"
+}
+NPROC_CAP=8
+NPROC="${ITA_JS_PARITY_JOBS:-$(_detect_ncpu)}"
+case "$NPROC" in ''|*[!0-9]*) NPROC=4 ;; esac
+[ "$NPROC" -lt 1 ] && NPROC=1
+[ "$NPROC" -gt "$NPROC_CAP" ] && NPROC="$NPROC_CAP"
+
+# classify UM exemplo e persiste o token (equivalente ao st="$(classify ..)").
+classify_worker() { printf '%s\n' "$(classify "$1")" > "$WORK/$1.status"; }
+
+# phase A: dispatch com pool "throttled". O bash 3.2 do runner macos-14 nao tem
+# `wait -n`, entao seguramos o pool contando `jobs -pr` (jobs em execucao) e
+# cedendo a CPU com um sleep curto ate abrir uma vaga. Como classify() usa
+# run_guarded (background+watchdog) internamente, o cap N limita o nº de
+# classify concorrentes -> nao estoura processos nem RAM. `wait` drena tudo.
+echo "[js_parity] SWEEP paralelo: pool de $NPROC worker(s) (cores=$(_detect_ncpu), cap=$NPROC_CAP, timeout ${TIMEOUT}s)" >&2
 for tu in "$EX_DIR"/*.tu; do
   name="$(basename "$tu" .tu)"
-  st="$(classify "$name")"
+  while [ "$(jobs -pr | wc -l | tr -d ' ')" -ge "$NPROC" ]; do sleep 0.05; done
+  classify_worker "$name" &
+done
+wait
+
+# phase B: agregacao SEQUENCIAL e DETERMINISTICA (ordem de glob = a mesma do
+# sequencial) -> RESULTS e o log por-exemplo saem identicos a versao serial.
+for tu in "$EX_DIR"/*.tu; do
+  name="$(basename "$tu" .tu)"
+  st=""; [ -s "$WORK/$name.status" ] && IFS= read -r st < "$WORK/$name.status"
+  if [ -z "$st" ]; then
+    echo "${R}FATAL:${X} worker nao produziu status para '$name' (bug de paralelismo)" >&2
+    exit 3
+  fi
   printf '%s %s\n' "$name" "$st" >> "$RESULTS"
   if is_status "$st"; then
     printf "  %-16s ${C}%s${X}\n" "$name" "$st"
