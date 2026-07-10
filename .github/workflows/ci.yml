@@ -20,6 +20,12 @@ on:
   pull_request:
     branches: [main]
   workflow_dispatch:
+  # Nightly (07:00 UTC): roda a suite COMPLETA — inclui o oracle JS mesmo sem
+  # mudança de codegen. Pega drift EXTERNO que um PR de codegen-limpo não cobre:
+  # bump do Node preinstalado no runner, regressão latente do dart2js do SDK
+  # pinado, flutuação de ambiente. É a rede de segurança do "pular nos PRs".
+  schedule:
+    - cron: '0 7 * * *'
 
 # Cancela runs obsoletos do mesmo ref quando chega um push novo.
 concurrency:
@@ -34,6 +40,12 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v7
+        with:
+          # História completa: o passo "Escopo do oracle JS" compara a base do PR
+          # com o merge commit (HEAD) via `git diff` pra decidir se roda o oracle.
+          # O checkout shallow (default fetch-depth:1) não teria o commit base, e
+          # o diff falharia. Usar HEAD (não head.sha) cobre PRs de fork também.
+          fetch-depth: 0
 
       - name: Ler dart-sdk.pin
         id: pin
@@ -107,13 +119,61 @@ jobs:
           export ITA_PACKAGES="$PWD/compiler/.dart_tool/package_config.json"
           bash compiler/test/conformance/run_conformance.sh
 
+      # Escopo do oracle JS: o dart2js dos ~33 exemplos e' DE LONGE o passo mais
+      # caro do CI (~11 min de ~13). Seu resultado so muda quando muda o CODEGEN,
+      # o parser/semantic/lexer, o proprio runner de paridade, ou os exemplos.
+      # Entao so rodamos o oracle quando faz sentido:
+      #   - schedule (nightly)  -> sempre (pega drift externo: Node/dart2js);
+      #   - workflow_dispatch   -> sempre (disparo manual = quero validar tudo);
+      #   - push no main        -> sempre (gate do que entra na branch protegida);
+      #   - pull_request        -> so se o diff base..HEAD tocar paths de paridade.
+      # PR que nao toca esses paths -> oracle PULADO -> CI de PR cai p/ ~2 min.
+      # Comparamos base.sha (parent do merge commit, presente com fetch-depth:0)
+      # contra HEAD (o merge ref ja com as mudancas do PR) -> funciona p/ PR de
+      # fork tambem (nao depende do head.sha do fork estar fetchado).
+      - name: Escopo do oracle JS (decide se roda)
+        id: oracle_scope
+        run: |
+          set -euo pipefail
+          # Paths cujo conteudo pode alterar a saida VM/JS de qualquer exemplo.
+          PATTERNS='^(compiler/lib/codegen/|compiler/lib/parser/|compiler/lib/semantic/|compiler/lib/lexer/|compiler/test/js_parity/|examples/)'
+          run_it=false; reason=""
+          case "${{ github.event_name }}" in
+            schedule)          run_it=true;  reason="nightly (schedule)" ;;
+            workflow_dispatch) run_it=true;  reason="disparo manual (workflow_dispatch)" ;;
+            push)
+              if [ "${{ github.ref }}" = "refs/heads/main" ]; then
+                run_it=true;  reason="push no main (branch protegida)"
+              else
+                run_it=true;  reason="push fora do main -> roda por seguranca"
+              fi ;;
+            pull_request)
+              base="${{ github.event.pull_request.base.sha }}"
+              if git diff --name-only "$base" HEAD | grep -Eq "$PATTERNS"; then
+                run_it=true;  reason="PR toca codegen/parser/semantic/lexer/js_parity/examples"
+              else
+                run_it=false; reason="PR nao toca paths de paridade"
+              fi ;;
+            *) run_it=true;  reason="evento '${{ github.event_name }}' nao mapeado -> roda por seguranca" ;;
+          esac
+          echo "run=$run_it" >> "$GITHUB_OUTPUT"
+          if [ "$run_it" = "true" ]; then
+            echo "::notice title=oracle JS::sera executado — $reason"
+          else
+            echo "::notice title=oracle JS::oracle pulado: nenhuma mudança de codegen ($reason)"
+          fi
+
       # Paridade VM x Node (oracle JS): o MESMO .dill roda na Dart VM e compila
       # para JS (dart2js -> Node). A saida da VM e' o ORACLE; cada example e'
       # classificado (MATCH > NUM > MISMATCH > NODE_ERR > DART2JS_CRASH) e
       # reconciliado com o snapshot versionado expected.txt. Sai !=0 se QUALQUER
       # example PIORAR de status (regressao de codegen do alvo JS); so avisa se
-      # melhorar. Node ja vem preinstalado no runner macos-14.
+      # melhorar. Node ja vem preinstalado no runner macos-14. Usa o itac AOT
+      # (ITA_ITAC_BIN, exportado no passo "Build do itac AOT" via GITHUB_ENV) pro
+      # lado .tu->.dill; o dart2js/VM usam o `dart` real. So roda quando o passo
+      # "Escopo do oracle JS" acima decidiu que vale a pena (if abaixo).
       - name: Paridade VM×Node (oracle JS)
+        if: steps.oracle_scope.outputs.run == 'true'
         run: |
           set -euo pipefail
           VER="${{ steps.pin.outputs.ver }}"
