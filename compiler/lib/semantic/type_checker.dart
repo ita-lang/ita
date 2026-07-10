@@ -68,6 +68,7 @@ class TypeChecker {
       ast.CopyWithExpr e => _inferCopyWith(e, scope),
       ast.EnumAccessExpr e => _inferEnumAccess(e, scope),
       ast.MatchExpr e => _inferMatch(e, scope),
+      ast.WhereExpr e => _inferWhere(e, scope),
       // Demais expressões: fora do escopo desta fatia. Ainda assim visitamos os
       // filhos conhecidos (para popular a side-table) e devolvemos Unknown.
       _ => _inferFallback(expr, scope),
@@ -262,6 +263,23 @@ class TypeChecker {
     _checkExhaustiveness(e, subjType, scope);
 
     return (!mixed && common != null) ? common : const UnknownType();
+  }
+
+  /// `E where { bindings }` — o tipo do resultado é o tipo de `E` avaliado com
+  /// os `bindings` visíveis. Espelha o lowering do codegen (`_compileWhere`):
+  /// abre um escopo-filho, registra cada binding NA ORDEM (para um poder
+  /// referenciar o anterior) e infere o corpo nesse escopo, devolvendo esse
+  /// tipo. Propagar o tipo aqui é o que faz a divisão Float dentro do where
+  /// escolher `/` em vez de `~/` e o `.0` do Float aparecer na paridade VM×JS.
+  ///
+  /// REDE DE SEGURANÇA (zero annotations): se a expressão-corpo não for
+  /// inferível, `_infer` já devolve UnknownType — nunca quebramos.
+  ResolvedType _inferWhere(ast.WhereExpr e, Scope scope) {
+    final whereScope = scope.child();
+    for (final binding in e.bindings) {
+      _checkStmt(binding, whereScope);
+    }
+    return _infer(e.body, whereScope);
   }
 
   /// Introduz no [armScope] os bindings que um pattern captura, tipando-os.
