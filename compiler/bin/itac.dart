@@ -17,6 +17,7 @@
 //   $ itac run hello.tu          # Compila e executa
 //   $ itac run --watch hello.tu  # Watch mode + hot reload
 //   $ itac build                  # Compila o projeto (le ita.toml)
+//   $ itac build --target=js      # Compila para JavaScript (Node)
 //   $ itac test                   # Roda testes em test/
 //   $ itac init --name myapp      # Cria novo projeto
 //   $ itac add pkg --git url      # Adiciona dependencia
@@ -724,6 +725,11 @@ void cmdCheck(List<String> args, {required String platformDill}) {
 }
 
 void cmdBuild(List<String> args, {required String dartBin, required String platformDill}) {
+  // -- Alvo de build: --target=<v> ou --target <v> (default: dill) --
+  // dill = Dart Kernel (.dill) p/ a Dart VM. js = encadeia `dart compile js`
+  // sobre o .dill p/ gerar JS de Node (--server-mode).
+  final target = _parseTarget(args);
+
   final config = readConfig();
   final entry = config['entry'] ?? 'src/main.tu';
   final output = config['output'] ?? 'build/';
@@ -735,6 +741,39 @@ void cmdBuild(List<String> args, {required String dartBin, required String platf
   final outputFile = '$output$name.dill';
   ensurePlatformDill(platformDill);
   compile(entry, outputFile, platformDill);
+
+  // -- Alvo js: transpila o .dill p/ JavaScript via `dart compile js` --
+  if (target == 'js') {
+    final jsFile = '$output$name.js';
+    final result = Process.runSync(
+      dartBin,
+      ['compile', 'js', '--server-mode', '-o', jsFile, outputFile],
+    );
+    stdout.write(result.stdout);
+    stderr.write(result.stderr);
+    if (result.exitCode != 0) exit(result.exitCode);
+    final jsSize = File(jsFile).lengthSync();
+    print('\nDone! $jsFile ($jsSize bytes)');
+  }
+}
+
+/// Extrai o valor de `--target=<v>` ou `--target <v>` de [args].
+/// Aceita `dill` (default) e `js`. Valor invalido: erro claro + exit(1).
+String _parseTarget(List<String> args) {
+  var target = 'dill';
+  for (var i = 0; i < args.length; i++) {
+    final a = args[i];
+    if (a.startsWith('--target=')) {
+      target = a.substring('--target='.length);
+    } else if (a == '--target' && i + 1 < args.length) {
+      target = args[++i];
+    }
+  }
+  if (target != 'dill' && target != 'js') {
+    print('Error: unknown build target "$target" (expected: dill, js)');
+    exit(1);
+  }
+  return target;
 }
 
 Future<void> cmdRun(List<String> args, {required String dartBin, required String platformDill}) async {
@@ -1362,6 +1401,7 @@ itac — Ita Compiler & Package Manager
 Commands:
   init [--name name]     Create new Ita project
   build                  Compile project (reads ita.toml)
+  build --target=js      Compile to JavaScript (Node, via dart compile js)
   run [file.tu]         Compile and run
   run --watch [file.tu] Watch mode + hot reload
   fmt [file.tu]         Format source code
